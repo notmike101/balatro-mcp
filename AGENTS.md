@@ -6,7 +6,7 @@ This repository maintains the Rust MCP server, backend, Lovely bridge, and rules
 
 - `src/main.rs` starts the stdio MCP server.
 - `src/tools.rs` defines the MCP server, tools, resources, and handlers.
-- `src/backend/` contains policy, observation, IPC, runtime safety, and replay logic.
+- `src/backend/` contains policy, scoring, observation, IPC, runtime safety, replay, and Rust-owned state logic.
 - `mod/codex_agent.lua` and `mod/lovely.toml` define the Lovely bridge.
 - `tools/balatro-info-db/` is the vendored Node.js rules database.
 
@@ -26,6 +26,8 @@ There are no Python entrypoints or Python subprocesses. Runtime files and the Ba
 - Mutations require exactly one Balatro process, a fresh bridge observation, the expected bridge version, and seed `2K9H9HN`.
 - Runtime startup is external. `ensure_runtime` verifies state and never launches Balatro.
 - Use the exact current `decision_id` and legal `action_id` for every action.
+- Treat `exact_score` and `estimated_score` separately; unsupported effects must remain visible in `unsupported_effects`.
+- Strategy, lessons, estimation feedback, current-run state, and event history are Rust-owned MCP capabilities backed by `agent/rust_state.db`.
 - Preserve hidden-card sanitization and never expose arbitrary filesystem contents.
 
 ## Validation

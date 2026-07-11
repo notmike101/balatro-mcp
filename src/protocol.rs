@@ -38,6 +38,7 @@ pub fn envelope(ok: bool, data: Value, code: &str, message: &str) -> Value {
         .cloned()
         .unwrap_or_else(|| json!([]));
     let mut answer = Map::new();
+    answer.insert("schema".into(), json!("balatro-mcp/envelope/v3"));
     answer.insert("ok".into(), Value::Bool(ok));
     answer.insert("state".into(), state);
     answer.insert("decision_id".into(), decision_id);

@@ -1,6 +1,8 @@
 use serde_json::{Value, json};
 use std::sync::LazyLock;
 
+use super::scoring::score_hand;
+
 static EMPTY_VEC: [Value; 0] = [];
 static EMPTY_MAP: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(serde_json::Map::new);
 
@@ -135,7 +137,7 @@ pub fn build_policy_state(
             "best_play_estimated_score": best_play_estimated, "best_play_clears_blind": best_play_clears,
             "best_play_surplus": best_play_surplus, "estimated_best_plays_needed": estimated_plays_needed,
         },
-        "slots": { "jokers": extract_slots(jokers_array), "consumeables": extract_slots(consumables_array) },
+        "slots": { "jokers": extract_slots(jokers_array), "consumables": extract_slots(consumables_array) },
         "legal_actions": legal_actions, "hand_analysis": hand_analysis,
         "decision_checks": decision_checks,
         "most_played_poker_hand": run.get("most_played_poker_hand").and_then(|m| m.as_str()).unwrap_or("High Card"),
@@ -329,7 +331,7 @@ fn generate_legal_actions(
     consumables_array: &[Value],
     play_limit: usize,
     discard_limit: usize,
-    _target_limit: usize,
+    target_limit: usize,
 ) -> Vec<Value> {
     let mut actions = Vec::new();
     let state = observation
@@ -367,6 +369,15 @@ fn generate_legal_actions(
             }
         }
         "SELECTING_HAND" | "BLIND_SELECT" => {
+            if state == "BLIND_SELECT" {
+                if let Some(choices) = run.get("blind_choices").and_then(Value::as_object) {
+                    for (name, choice) in choices {
+                        if choice.get("state").and_then(Value::as_str) == Some("Select") {
+                            actions.push(json!({"action_id":format!("select_{}", name.to_ascii_lowercase()),"action":"select_blind","blind":name,"reason":format!("select {} blind", name)}));
+                        }
+                    }
+                }
+            }
             let hands_left = run.get("hands_left").and_then(|h| h.as_i64()).unwrap_or(0) as usize;
             if hands_left > 0 && hand_count > 0 {
                 for pc in 1..=std::cmp::min(hand_count, play_limit) {
@@ -380,7 +391,8 @@ fn generate_legal_actions(
                         })
                         .collect();
                     if !ids.is_empty() {
-                        actions.push(json!({ "action_id": format!("play_{}", ids.join("_")), "action": "play", "card_ids": ids, "reason": format!("play {} cards ({} hands left)", pc, hands_left) }));
+                        let score = score_hand(observation, Some(&(0..pc).collect::<Vec<_>>()));
+                        actions.push(json!({ "action_id": format!("play_{}", ids.join("_")), "action": "play", "card_ids": ids, "estimated_score": score.estimated_score, "score_quality": score.estimate_quality, "reason": format!("play {} cards ({} hands left)", pc, hands_left) }));
                     }
                 }
             }
@@ -420,15 +432,63 @@ fn generate_legal_actions(
                     }
                 }
             }
-            if consumable_open > 0 {
-                for (i, c) in consumables_array.iter().enumerate() {
+            if consumable_open > 0 || joker_open > 0 {
+                let shop_cards = observation
+                    .pointer("/areas/shop")
+                    .and_then(Value::as_array)
+                    .or_else(|| observation.pointer("/shop/cards").and_then(Value::as_array))
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&EMPTY_VEC);
+                for (i, c) in shop_cards.iter().enumerate() {
                     if let Some(name) = c.get("name").and_then(|n| n.as_str()) {
                         actions.push(json!({ "action_id": format!("buy_consumable_{}", i), "action": "buy_card", "card_index": i, "reason": format!("buy {} (slot available)", name) }));
                     }
                 }
             }
+            if run.get("reroll_cost").and_then(Value::as_i64).unwrap_or(0) > 0 {
+                actions.push(json!({"action_id":"reroll_shop","action":"reroll","reason":"reroll shop only when economy and score pressure justify it"}));
+            }
+        }
+        "TAROT_PACK" | "PLANET_PACK" | "SPECTRAL_PACK" | "STANDARD_PACK" | "BUFFOON_PACK" => {
+            let choices = observation
+                .pointer("/areas/pack")
+                .and_then(Value::as_array)
+                .or_else(|| observation.pointer("/pack/cards").and_then(Value::as_array))
+                .map(|v| v.as_slice())
+                .unwrap_or(&EMPTY_VEC);
+            for (index, card) in choices.iter().enumerate().take(target_limit.max(1)) {
+                actions.push(json!({"action_id":format!("pack_{}", index),"action":"choose_pack","card_index":index,"name":card.get("name")}));
+            }
         }
         _ => {}
+    }
+
+    for (index, card) in consumables_array.iter().enumerate() {
+        let name = card
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("consumable");
+        actions.push(json!({"action_id":format!("use_consumable_{}", index),"action":"use_consumable","card_index":index,"target_limit":target_limit,"reason":format!("evaluate {} before advancing", name)}));
+        actions.push(json!({"action_id":format!("sell_consumable_{}", index),"action":"sell_card","area":"consumables","card_index":index,"reason":format!("sell {} if no useful target exists", name)}));
+    }
+    for (index, joker) in jokers_array.iter().enumerate() {
+        actions.push(json!({"action_id":format!("sell_joker_{}", index),"action":"sell_card","area":"jokers","card_index":index,"reason":format!("sell {} when required", joker.get("name").and_then(Value::as_str).unwrap_or("Joker"))}));
+    }
+    if !matches!(
+        state,
+        "MENU"
+            | "SELECTING_HAND"
+            | "BLIND_SELECT"
+            | "SHOP"
+            | "TAROT_PACK"
+            | "PLANET_PACK"
+            | "SPECTRAL_PACK"
+            | "STANDARD_PACK"
+            | "BUFFOON_PACK"
+    ) {
+        for transition in SAFE_TRANSITION_ACTIONS {
+            actions.push(json!({"action_id":transition,"action":"safe_transition","transition":transition,"reason":"confirmed non-strategic transition"}));
+        }
     }
 
     if joker_count > 1 {
@@ -458,7 +518,7 @@ fn build_decision_checks(
     consumables_array: &[Value],
     run: &serde_json::Map<String, Value>,
     _areas: &serde_json::Map<String, Value>,
-    _legal_actions: &[Value],
+    legal_actions: &[Value],
 ) -> Value {
     let joker_count = jokers_array.len();
     let state = observation
@@ -488,6 +548,26 @@ fn build_decision_checks(
                 .map(|name| json!({ "name": name, "type": c.get("type") }))
         })
         .collect();
+    let use_actions: Vec<Value> = legal_actions
+        .iter()
+        .filter(|action| action.get("action").and_then(Value::as_str) == Some("use_consumable"))
+        .cloned()
+        .collect();
+    let sell_actions: Vec<Value> = legal_actions
+        .iter()
+        .filter(|action| action.get("action").and_then(Value::as_str) == Some("sell_card"))
+        .cloned()
+        .collect();
+    let pack_actions: Vec<Value> = legal_actions
+        .iter()
+        .filter(|action| action.get("action").and_then(Value::as_str) == Some("choose_pack"))
+        .cloned()
+        .collect();
+    let reroll_actions: Vec<Value> = legal_actions
+        .iter()
+        .filter(|action| action.get("action").and_then(Value::as_str) == Some("reroll"))
+        .cloned()
+        .collect();
     let in_shop = state == "SHOP";
     let mut shop_data = serde_json::Map::new();
     shop_data.insert("required".into(), json!(in_shop));
@@ -506,10 +586,10 @@ fn build_decision_checks(
     let is_boss = !boss.is_empty() || !boss_effect.is_empty();
     json!({
         "ordering": { "required_before_close_play": joker_count > 1, "hand_order": hand_order, "joker_order": joker_order, "move_card_actions": move_card_actions, "move_joker_actions": move_joker_actions, "instruction": "Evaluate hand and Joker trigger order when a scoring effect can depend on sequence; do not move cards by default, but do not dismiss legal reorder actions.", "estimate_caveat": "Play estimates may not model every ordering interaction; verify relevant ordering when margin is tight." },
-        "consumables": { "required": !owned_consumables.is_empty(), "owned": owned_consumables, "shop_purchase_actions": Vec::<Value>::new(), "instruction": "Evaluate every owned use/sell action and every shop consumable purchase before exiting or advancing." },
+        "consumables": { "required": !owned_consumables.is_empty(), "owned": owned_consumables, "use_actions": use_actions, "sell_actions": sell_actions, "shop_purchase_actions": legal_actions.iter().filter(|action| action.get("action").and_then(Value::as_str) == Some("buy_card")).cloned().collect::<Vec<_>>(), "instruction": "Evaluate every owned use/sell action and every shop consumable purchase before exiting or advancing." },
         "shop": shop_data,
-        "slots": { "required": true, "jokers": joker_slots, "consumeables": consumable_slots, "instruction": "Track joker and consumable slot counts (count/limit/open) across all purchases; do not buy if no slots remain without a voucher or other expansion." },
-        "boss_debuff": { "required": is_boss, "current_blind": { "boss": is_boss, "name": blind.get("name").and_then(|n| n.as_str()), "effect": Some(boss_effect), "disabled": blind.get("disabled").and_then(|d| d.as_str()) }, "upcoming_boss": { "state": blind.get("state").and_then(|s| s.as_str()).unwrap_or("Upcoming") }, "debuffed_cards": Vec::<Value>::new(), "debuffed_jokers": Vec::<Value>::new(), "reroll_actions": Vec::<Value>::new(), "select_actions": Vec::<Value>::new(), "instruction": "Before selecting or playing a Boss Blind, inspect its live effect, lookup_rule details, debuffed cards/Jokers, and legal boss-reroll actions." },
+        "slots": { "required": true, "jokers": joker_slots, "consumables": consumable_slots, "instruction": "Track joker and consumable slot counts (count/limit/open) across all purchases; do not buy if no slots remain without a voucher or other expansion." },
+        "boss_debuff": { "required": is_boss, "current_blind": { "boss": is_boss, "name": blind.get("name").and_then(|n| n.as_str()), "effect": Some(boss_effect), "disabled": blind.get("disabled").and_then(|d| d.as_str()) }, "upcoming_boss": { "state": blind.get("state").and_then(|s| s.as_str()).unwrap_or("Upcoming") }, "debuffed_cards": observation.pointer("/areas/debuffed_cards").cloned().unwrap_or_else(|| json!([])), "debuffed_jokers": observation.pointer("/areas/debuffed_jokers").cloned().unwrap_or_else(|| json!([])), "reroll_actions": reroll_actions, "select_actions": pack_actions, "instruction": "Before selecting or playing a Boss Blind, inspect its live effect, lookup_rule details, debuffed cards/Jokers, and legal boss-reroll actions." },
     })
 }
 
@@ -590,6 +670,7 @@ mod tests {
         assert_eq!(menu["legal_actions"][0]["action"], "ui_click");
         let mut shop_observation = observation("SHOP");
         shop_observation["run"]["consumable_slots"] = json!(2);
+        shop_observation["areas"]["shop"] = json!([{"name":"Planet"}]);
         let shop = build_policy_state(&shop_observation, 40, 40, 60);
         assert!(
             shop["legal_actions"]
@@ -600,7 +681,13 @@ mod tests {
         );
         let empty = build_policy_state(&json!({}), 0, 0, 0);
         assert_eq!(empty["game"]["state"], "");
-        assert!(empty["legal_actions"].as_array().unwrap().is_empty());
+        assert!(
+            empty["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["action"] == "safe_transition")
+        );
     }
 
     #[test]
@@ -615,5 +702,48 @@ mod tests {
         obs["run"]["joker_slots"] = json!(1);
         let state = build_policy_state(&obs, 40, 40, 60);
         assert_eq!(state["slots"]["jokers"]["open"], 0);
+    }
+
+    #[test]
+    fn policy_state_emits_pack_blind_use_sell_and_safe_actions() {
+        let mut pack = observation("TAROT_PACK");
+        pack["areas"]["pack"] = json!([{"name":"The Tower"}]);
+        let actions = build_policy_state(&pack, 40, 40, 60)["legal_actions"].clone();
+        assert!(
+            actions
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["action"] == "choose_pack")
+        );
+
+        let mut blind = observation("BLIND_SELECT");
+        blind["run"]["blind_choices"] = json!({"Small":{"state":"Select"}});
+        let actions = build_policy_state(&blind, 40, 40, 60)["legal_actions"].clone();
+        assert!(
+            actions
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["action"] == "select_blind")
+        );
+
+        let mut game_over = observation("GAME_OVER");
+        game_over["areas"]["jokers"] = json!([{"name":"Joker"}]);
+        let actions = build_policy_state(&game_over, 40, 40, 60)["legal_actions"].clone();
+        assert!(
+            actions
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["action"] == "sell_card" && a["area"] == "jokers")
+        );
+        assert!(
+            actions
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["action"] == "safe_transition")
+        );
     }
 }

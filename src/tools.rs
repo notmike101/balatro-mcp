@@ -7,6 +7,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{process::Command, sync::Mutex, time::timeout};
 
@@ -15,6 +16,8 @@ use crate::backend::{
     policy::{SAFE_TRANSITION_ACTIONS, build_policy_state},
     replay::ReplayDB,
     runtime::{self, balatro_processes, observation_age},
+    scoring::score_hand,
+    state::StateDB,
 };
 use crate::guide::{GUIDE_TOPICS, guide};
 use crate::models::*;
@@ -25,6 +28,80 @@ use crate::protocol::{
 use std::sync::LazyLock;
 static EMPTY_BRIDGE: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(serde_json::Map::new);
 
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Null => "null".into(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => serde_json::to_string(value).unwrap_or_default(),
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::Object(values) => {
+            let mut keys: Vec<_> = values.keys().collect();
+            keys.sort();
+            format!(
+                "{{{}}}",
+                keys.iter()
+                    .map(|key| format!(
+                        "{}:{}",
+                        serde_json::to_string(*key).unwrap_or_default(),
+                        canonical_json(&values[*key])
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+    }
+}
+
+fn digest(prefix: &str, value: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(prefix.as_bytes());
+    hasher.update(canonical_json(value).as_bytes());
+    format!("{}-{:x}", prefix, hasher.finalize())
+}
+
+fn decision_id_for(observation: &Value) -> String {
+    digest("d3", observation)
+}
+fn observation_id_for(observation: &Value) -> String {
+    digest("o3", observation)
+}
+
+fn active_directives(rules: &Value, observation: &Value) -> Value {
+    let values = rules
+        .get("rules")
+        .and_then(Value::as_array)
+        .map(|rules| {
+            rules
+                .iter()
+                .filter(|rule| {
+                    if rule.get("active").and_then(Value::as_bool) == Some(false) {
+                        return false;
+                    }
+                    rule.get("conditions")
+                        .and_then(Value::as_object)
+                        .map(|conditions| {
+                            conditions.iter().all(|(key, expected)| {
+                                observation.pointer(key).or_else(|| observation.get(key))
+                                    == Some(expected)
+                            })
+                        })
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Value::Array(values)
+}
+
 #[derive(Clone)]
 pub struct Server {
     pub root: PathBuf,
@@ -32,6 +109,7 @@ pub struct Server {
     pub ipc: IpcPaths,
     pub mutations: Arc<Mutex<()>>,
     pub replay_db: Arc<Mutex<ReplayDB>>,
+    pub state_db: Arc<Mutex<StateDB>>,
     pub tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
 }
 
@@ -42,12 +120,14 @@ impl Server {
             .unwrap_or_else(|| root.clone());
         let ipc = IpcPaths::new(&runtime_root);
         let replay_db = Arc::new(Mutex::new(ReplayDB::new(&runtime_root)));
+        let state_db = Arc::new(Mutex::new(StateDB::new(&runtime_root)));
         Ok(Self {
             root,
             runtime_root,
             ipc,
             mutations: Arc::new(Mutex::new(())),
             replay_db,
+            state_db,
             tool_router: Self::tool_router(),
         })
     }
@@ -59,7 +139,33 @@ impl Server {
 
     async fn policy(&self, limit: u32) -> Result<Value, String> {
         let observation = self.read_observation()?;
-        let state = build_policy_state(&observation, limit as usize, 40, 60);
+        let mut state = build_policy_state(&observation, limit as usize, 40, 60);
+        let decision_id = decision_id_for(&observation);
+        let observation_id = observation_id_for(&observation);
+        let score = serde_json::to_value(score_hand(&observation, None)).unwrap_or(Value::Null);
+        let directives = self
+            .state_db
+            .lock()
+            .await
+            .strategy()
+            .unwrap_or_else(|_| json!({"rules":[]}));
+        if let Some(object) = state.as_object_mut() {
+            object.insert("schema".into(), json!("balatro-mcp/policy/v3"));
+            object.insert("decision_id".into(), json!(decision_id));
+            object.insert("observation_id".into(), json!(observation_id));
+            object.insert(
+                "active_directives".into(),
+                active_directives(&directives, &observation),
+            );
+            object.insert("score_analysis".into(), score.clone());
+            object.insert(
+                "estimate_quality".into(),
+                score
+                    .get("estimate_quality")
+                    .cloned()
+                    .unwrap_or_else(|| json!("partial")),
+            );
+        }
         Ok(state)
     }
 
@@ -370,6 +476,15 @@ impl Server {
         if let Err(problem) = self.preflight().await {
             return to_tool_result(problem);
         }
+        let current = self.policy(40).await.unwrap_or(Value::Null);
+        if current.get("decision_id").and_then(Value::as_str) != Some(params.decision_id.as_str()) {
+            return to_tool_result(envelope(
+                false,
+                current,
+                "stale_decision",
+                "decision_id does not match the current observation",
+            ));
+        }
         let settle = params.settle_timeout.clamp(1.0, 30.0);
         match execute_policy_action(
             &self.ipc,
@@ -470,7 +585,16 @@ impl Server {
         Parameters(params): Parameters<CheckpointParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         match checkpoint_internal(&self.ipc, &params.kind) {
-            Ok(data) => to_tool_result(envelope(true, data, "", "")),
+            Ok(data) => {
+                if let Ok(observation) = self.read_observation() {
+                    let _ = self
+                        .state_db
+                        .lock()
+                        .await
+                        .checkpoint(&observation, &params.kind);
+                }
+                to_tool_result(envelope(true, data, "", ""))
+            }
             Err(e) => to_tool_result(envelope(false, Value::Null, "checkpoint_failed", &e)),
         }
     }
@@ -777,6 +901,196 @@ impl Server {
             }
         }
     }
+
+    #[tool(
+        description = "Score selected hand cards using the live poker-hand contract and explicit estimate metadata."
+    )]
+    async fn score_hand(
+        &self,
+        Parameters(params): Parameters<ScoreParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        match self.read_observation() {
+            Ok(observation) => to_tool_result(envelope(
+                true,
+                serde_json::to_value(score_hand(
+                    &observation,
+                    if params.card_indices.is_empty() {
+                        None
+                    } else {
+                        Some(params.card_indices.as_slice())
+                    },
+                ))
+                .unwrap_or(Value::Null),
+                "",
+                "",
+            )),
+            Err(error) => to_tool_result(envelope(false, Value::Null, "score_failed", &error)),
+        }
+    }
+
+    #[tool(description = "Return the canonical live poker-hand values contract.")]
+    async fn hand_values(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        match self.read_observation() {
+            Ok(observation) => to_tool_result(envelope(
+                true,
+                observation
+                    .get("poker_hands")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "",
+                "",
+            )),
+            Err(error) => {
+                to_tool_result(envelope(false, Value::Null, "hand_values_failed", &error))
+            }
+        }
+    }
+
+    #[tool(description = "Read Rust-owned strategy rules and directives.")]
+    async fn strategy_state(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        match self.state_db.lock().await.strategy() {
+            Ok(data) => to_tool_result(envelope(true, data, "", "")),
+            Err(error) => to_tool_result(envelope(false, Value::Null, "strategy_failed", &error)),
+        }
+    }
+
+    #[tool(description = "Add a Rust-owned conditioned strategy rule.")]
+    async fn strategy_add_rule(
+        &self,
+        Parameters(params): Parameters<StrategyRuleParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if params.id.is_empty() || params.directive.is_empty() {
+            return to_tool_result(envelope(
+                false,
+                Value::Null,
+                "invalid_arguments",
+                "id and directive are required",
+            ));
+        }
+        match self.state_db.lock().await.add_rule(
+            &params.id,
+            &params.kind,
+            &params.conditions,
+            &params.directive,
+            params.absolute,
+        ) {
+            Ok(data) => to_tool_result(envelope(true, data, "", "")),
+            Err(error) => {
+                to_tool_result(envelope(false, Value::Null, "strategy_rule_failed", &error))
+            }
+        }
+    }
+
+    #[tool(description = "Record evidence for a Rust-owned strategy rule.")]
+    async fn strategy_record_evidence(
+        &self,
+        Parameters(params): Parameters<StrategyEvidenceParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        match self.state_db.lock().await.record_evidence(
+            &params.rule_id,
+            &params.outcome,
+            &params.event_id,
+            &params.note,
+        ) {
+            Ok(data) => to_tool_result(envelope(true, data, "", "")),
+            Err(error) => to_tool_result(envelope(
+                false,
+                Value::Null,
+                "strategy_evidence_failed",
+                &error,
+            )),
+        }
+    }
+
+    #[tool(description = "Store a structured strategy lesson.")]
+    async fn lesson_add(
+        &self,
+        Parameters(params): Parameters<LessonParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        match self.state_db.lock().await.add_lesson(
+            &params.category,
+            &params.lesson,
+            &params.source,
+            params.confidence,
+        ) {
+            Ok(data) => to_tool_result(envelope(true, data, "", "")),
+            Err(error) => to_tool_result(envelope(false, Value::Null, "lesson_failed", &error)),
+        }
+    }
+
+    #[tool(description = "Record an actual score against an earlier estimate.")]
+    async fn estimation_record(
+        &self,
+        Parameters(params): Parameters<EstimateParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        match self.state_db.lock().await.record_estimate(
+            &params.hand_type,
+            params.estimated,
+            params.actual,
+            &params.context,
+        ) {
+            Ok(data) => to_tool_result(envelope(true, data, "", "")),
+            Err(error) => to_tool_result(envelope(false, Value::Null, "estimation_failed", &error)),
+        }
+    }
+
+    #[tool(description = "Summarize recorded scoring-estimation errors.")]
+    async fn estimation_report(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        match self.state_db.lock().await.estimation_report() {
+            Ok(data) => to_tool_result(envelope(true, data, "", "")),
+            Err(error) => to_tool_result(envelope(
+                false,
+                Value::Null,
+                "estimation_report_failed",
+                &error,
+            )),
+        }
+    }
+
+    #[tool(description = "Persist the current observation into Rust-owned current-run state.")]
+    async fn run_state(
+        &self,
+        Parameters(params): Parameters<StateParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if params.kind == "read" {
+            return match self.state_db.lock().await.current_run() {
+                Ok(data) => to_tool_result(envelope(true, data, "", "")),
+                Err(error) => {
+                    to_tool_result(envelope(false, Value::Null, "run_state_failed", &error))
+                }
+            };
+        }
+        match self.read_observation() {
+            Ok(observation) => match self
+                .state_db
+                .lock()
+                .await
+                .checkpoint(&observation, &params.kind)
+            {
+                Ok(data) => to_tool_result(envelope(true, data, "", "")),
+                Err(error) => {
+                    to_tool_result(envelope(false, Value::Null, "run_state_failed", &error))
+                }
+            },
+            Err(error) => {
+                to_tool_result(envelope(false, Value::Null, "observation_failed", &error))
+            }
+        }
+    }
+
+    #[tool(description = "Read recent Rust-owned run events.")]
+    async fn event_history(
+        &self,
+        Parameters(params): Parameters<StateParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        match self.state_db.lock().await.events(params.limit) {
+            Ok(data) => to_tool_result(envelope(true, data, "", "")),
+            Err(error) => {
+                to_tool_result(envelope(false, Value::Null, "event_history_failed", &error))
+            }
+        }
+    }
+
     #[tool(
         description = "Read a capped latest Lovely log tail and bridge health. Never returns arbitrary files."
     )]
@@ -1006,5 +1320,95 @@ mod tests {
         let info = <Server as rmcp::ServerHandler>::get_info(&server);
         assert!(info.capabilities.tools.is_some());
         assert!(info.capabilities.resources.is_some());
+    }
+
+    #[tokio::test]
+    async fn new_state_and_scoring_tools_have_structured_paths() {
+        let (_dir, server) = server();
+        assert!(
+            server
+                .score_hand(Parameters(ScoreParams {
+                    card_indices: vec![]
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(server.hand_values().await.is_ok());
+        assert!(server.strategy_state().await.is_ok());
+        assert!(
+            server
+                .strategy_add_rule(Parameters(StrategyRuleParams {
+                    id: "r1".into(),
+                    kind: "test".into(),
+                    conditions: json!({}),
+                    directive: "test".into(),
+                    absolute: false
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .strategy_record_evidence(Parameters(StrategyEvidenceParams {
+                    rule_id: "r1".into(),
+                    outcome: "success".into(),
+                    event_id: "e1".into(),
+                    note: "test".into()
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .lesson_add(Parameters(LessonParams {
+                    category: "test".into(),
+                    lesson: "lesson".into(),
+                    source: "unit".into(),
+                    confidence: 0.8
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .estimation_record(Parameters(EstimateParams {
+                    hand_type: "Pair".into(),
+                    estimated: 10,
+                    actual: 12,
+                    context: json!({})
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(server.estimation_report().await.is_ok());
+        assert!(
+            server
+                .run_state(Parameters(StateParams {
+                    kind: "read".into(),
+                    limit: 10
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .event_history(Parameters(StateParams {
+                    kind: "events".into(),
+                    limit: 10
+                }))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn decision_ids_are_stable_and_observation_sensitive() {
+        let first = json!({"b":1,"a":[true]});
+        let reordered = json!({"a":[true],"b":1});
+        assert_eq!(decision_id_for(&first), decision_id_for(&reordered));
+        assert_ne!(
+            decision_id_for(&first),
+            decision_id_for(&json!({"b":2,"a":[true]}))
+        );
     }
 }

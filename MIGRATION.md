@@ -1,6 +1,6 @@
 # Rust Migration
 
-The Python runtime has been removed. The Rust MCP server owns policy state, scoring estimates, decision checks, IPC, runtime safety, observation handling, and SQLite replay logging.
+The Python runtime has been removed. The Rust MCP server owns policy state, exact/estimated scoring, action generation, decision checks, IPC, runtime safety, observation handling, strategy state, lessons, estimation feedback, and SQLite replay logging.
 
 ## Backend modules
 
@@ -9,6 +9,8 @@ The Python runtime has been removed. The Rust MCP server owns policy state, scor
 - `src/backend/runtime.rs` — process, seed, bridge, and observation safety checks.
 - `src/backend/observation.rs` — compact observation views.
 - `src/backend/replay.rs` — SQLite replay storage and formatting.
+- `src/backend/scoring.rs` — typed hand classification, live-contract scoring, modifiers, and estimate metadata.
+- `src/backend/state.rs` — fresh Rust-owned current-run, event, strategy, lesson, and estimation storage.
 
 ## Server behavior
 
@@ -16,6 +18,7 @@ The Python runtime has been removed. The Rust MCP server owns policy state, scor
 - Rules routes invoke the vendored Node.js information database.
 - Runtime startup is external; `ensure_runtime` verifies process safety and never launches the game.
 - No Python subprocesses or capability files are used.
+- The public contract is `balatro-mcp/envelope/v3` and `balatro-mcp/policy/v3`.
 
 ## Validation
 

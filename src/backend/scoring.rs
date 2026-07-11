@@ -1,0 +1,347 @@
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoreResult {
+    pub hand_name: String,
+    pub hand_key: String,
+    pub scoring_cards: Vec<usize>,
+    pub chips: i64,
+    pub mult: i64,
+    pub x_mult: f64,
+    pub exact_score: Option<i64>,
+    pub estimated_score: i64,
+    pub estimate_quality: String,
+    pub unsupported_effects: Vec<String>,
+    pub contributions: Vec<Value>,
+}
+
+fn rank_value(rank: &str) -> Option<u8> {
+    match rank.to_ascii_uppercase().as_str() {
+        "A" | "ACE" => Some(14),
+        "K" | "KING" => Some(13),
+        "Q" | "QUEEN" => Some(12),
+        "J" | "JACK" => Some(11),
+        "T" | "10" => Some(10),
+        value => value.parse().ok().filter(|v: &u8| (2..=14).contains(v)),
+    }
+}
+
+fn card_rank(card: &Value) -> Option<u8> {
+    card.pointer("/base/rank")
+        .or_else(|| card.get("rank"))
+        .and_then(Value::as_str)
+        .and_then(rank_value)
+}
+
+fn card_suit(card: &Value) -> Option<String> {
+    card.pointer("/base/suit")
+        .or_else(|| card.get("suit"))
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .or_else(|| {
+            card.get("suits")
+                .and_then(Value::as_array)
+                .and_then(|suits| suits.first())
+                .and_then(|suit| suit.get("key").or_else(|| suit.get("name")))
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase)
+        })
+}
+
+fn text_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|v| {
+            v.get("name")
+                .or_else(|| v.get("text"))
+                .or_else(|| v.get("key"))
+        })
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| value.get(key).and_then(Value::as_str).map(str::to_owned))
+}
+
+fn straight(ranks: &[u8]) -> bool {
+    let mut values = ranks.to_vec();
+    values.sort_unstable();
+    values.dedup();
+    if values.len() < 5 {
+        return false;
+    }
+    values.windows(5).any(|window| window[4] - window[0] == 4)
+        || values.contains(&14)
+            && values.contains(&2)
+            && values.contains(&3)
+            && values.contains(&4)
+            && values.contains(&5)
+}
+
+pub fn classify_hand(cards: &[Value]) -> String {
+    let ranks: Vec<u8> = cards.iter().filter_map(card_rank).collect();
+    let suits: Vec<String> = cards.iter().filter_map(card_suit).collect();
+    let mut counts = HashMap::<u8, usize>::new();
+    for rank in &ranks {
+        *counts.entry(*rank).or_default() += 1;
+    }
+    let mut groups: Vec<usize> = counts.values().copied().collect();
+    groups.sort_unstable_by(|a, b| b.cmp(a));
+    let flush = suits.len() >= 5 && suits.iter().all(|suit| suit == &suits[0]);
+    let straight = straight(&ranks);
+    match (flush, straight, groups.as_slice()) {
+        (true, true, _) => "Straight Flush",
+        (_, _, [5, ..]) => "Five of a Kind",
+        (_, _, [4, ..]) => "Four of a Kind",
+        (_, _, [3, 2, ..]) => "Full House",
+        (true, _, _) => "Flush",
+        (_, true, _) => "Straight",
+        (_, _, [3, ..]) => "Three of a Kind",
+        (_, _, [2, 2, ..]) => "Two Pair",
+        (_, _, [2, ..]) => "Pair",
+        _ => "High Card",
+    }
+    .to_owned()
+}
+
+fn hand_value(contract: &Value, hand: &str) -> Option<(i64, i64)> {
+    let values = contract.get("values").unwrap_or(contract);
+    let entry = values.get(hand).or_else(|| values.get("High Card"))?;
+    Some((entry.get("chips")?.as_i64()?, entry.get("mult")?.as_i64()?))
+}
+
+fn add_modifier(result: &mut ScoreResult, card: &Value, index: usize) {
+    if let Some(edition) = text_field(card, "edition") {
+        match edition.to_ascii_lowercase().as_str() {
+            "foil" => {
+                result.chips += 50;
+                result
+                    .contributions
+                    .push(json!({"source": "card", "index": index, "effect": "foil", "chips": 50}));
+            }
+            "holographic" | "holo" => {
+                result.mult += 10;
+                result.contributions.push(
+                    json!({"source": "card", "index": index, "effect": "holographic", "mult": 10}),
+                );
+            }
+            "polychrome" => {
+                result.x_mult *= 1.5;
+                result.contributions.push(json!({"source": "card", "index": index, "effect": "polychrome", "x_mult": 1.5}));
+            }
+            "negative" => {}
+            other => result
+                .unsupported_effects
+                .push(format!("card edition: {other}")),
+        }
+    }
+    if let Some(enhancement) = text_field(card, "enhancement") {
+        match enhancement.to_ascii_lowercase().as_str() {
+            "bonus" => result.chips += 30,
+            "mult" => result.mult += 4,
+            "glass" => result.x_mult *= 2.0,
+            "steel" => result.x_mult *= 1.5,
+            "wild" | "stone" | "gold" | "lucky" => {}
+            other => result
+                .unsupported_effects
+                .push(format!("card enhancement: {other}")),
+        }
+    }
+}
+
+pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreResult {
+    let hand = observation
+        .pointer("/areas/hand")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let indices: Vec<usize> = card_indices
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| (0..hand.len()).collect());
+    let cards: Vec<Value> = indices
+        .iter()
+        .filter_map(|index| hand.get(*index).cloned())
+        .collect();
+    let hand_name = classify_hand(&cards);
+    let contract = observation.get("poker_hands").unwrap_or(&Value::Null);
+    let base = hand_value(contract, &hand_name);
+    let (base_chips, mut mult) = base.unwrap_or((5, 1));
+    let mut result = ScoreResult {
+        hand_key: hand_name.clone(),
+        hand_name,
+        scoring_cards: indices,
+        chips: base_chips,
+        mult,
+        x_mult: 1.0,
+        exact_score: None,
+        estimated_score: 0,
+        estimate_quality: "estimate".into(),
+        unsupported_effects: Vec::new(),
+        contributions: Vec::new(),
+    };
+    for (position, card) in cards.iter().enumerate() {
+        if let Some(rank) = card_rank(card) {
+            result.chips += i64::from(rank.min(10));
+        }
+        let original_index = result.scoring_cards[position];
+        add_modifier(&mut result, card, original_index);
+    }
+    let mut chips = result.chips;
+    if let Some(jokers) = observation
+        .pointer("/areas/jokers")
+        .and_then(Value::as_array)
+    {
+        for joker in jokers {
+            if let Some(ability) = joker.get("ability").and_then(Value::as_object) {
+                let name = joker.get("name").and_then(Value::as_str).unwrap_or("joker");
+                let mut known = false;
+                if let Some(value) = ability.get("chips").and_then(Value::as_i64) {
+                    chips += value;
+                    known = true;
+                }
+                if let Some(value) = ability.get("mult").and_then(Value::as_i64) {
+                    mult += value;
+                    known = true;
+                }
+                if let Some(value) = ability.get("x_mult").and_then(Value::as_f64) {
+                    result.x_mult *= value;
+                    known = true;
+                }
+                let center_key = joker
+                    .get("center_key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let normalized_name = name.to_ascii_lowercase();
+                let is = |key: &str, label: &str| center_key == key || normalized_name == label;
+                if is("j_banner", "banner") {
+                    let extra = ability
+                        .get("extra")
+                        .and_then(Value::as_i64)
+                        .or_else(|| joker.pointer("/config/extra").and_then(Value::as_i64))
+                        .unwrap_or(0);
+                    let discards = observation
+                        .pointer("/run/discards_left")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    chips += extra * discards;
+                    known = true;
+                } else if is("j_raised_fist", "raised fist") {
+                    if let Some(min_rank) = hand.iter().filter_map(card_rank).min() {
+                        mult += i64::from(min_rank) * 2;
+                    }
+                    known = true;
+                } else if is("j_mystic_summit", "mystic summit") {
+                    if observation
+                        .pointer("/run/discards_left")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0)
+                        == 0
+                    {
+                        mult += 15;
+                    }
+                    known = true;
+                } else if is("j_hanging_chad", "hanging chad") {
+                    let extra = ability
+                        .get("extra")
+                        .and_then(Value::as_i64)
+                        .or_else(|| joker.pointer("/config/extra").and_then(Value::as_i64))
+                        .unwrap_or(0);
+                    let nominal = hand
+                        .first()
+                        .and_then(|card| card.pointer("/base/nominal"))
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    chips += extra * nominal;
+                    known = true;
+                } else if is("j_vampire", "vampire") {
+                    let x = ability
+                        .get("x_mult")
+                        .and_then(Value::as_f64)
+                        .or_else(|| joker.pointer("/config/Xmult").and_then(Value::as_f64))
+                        .unwrap_or(1.0);
+                    result.x_mult *= x.max(1.0);
+                    known = true;
+                } else if is("j_triboulet", "triboulet") {
+                    let faces = hand
+                        .iter()
+                        .filter_map(card_rank)
+                        .filter(|rank| *rank == 12 || *rank == 13)
+                        .count();
+                    result.x_mult *= 2f64.powi(faces as i32);
+                    known = true;
+                }
+                if !known && !ability.is_empty() {
+                    result.unsupported_effects.push(name.to_owned());
+                }
+            }
+        }
+    }
+    result.chips = chips;
+    result.mult = mult;
+    result.estimated_score = ((chips as f64) * (mult as f64) * result.x_mult).round() as i64;
+    if base.is_some() && result.unsupported_effects.is_empty() {
+        result.exact_score = Some(result.estimated_score);
+        result.estimate_quality = "exact_contract_plus_supported_modifiers".into();
+    } else if base.is_some() {
+        result.estimate_quality = "partial_contract".into();
+    } else {
+        result
+            .unsupported_effects
+            .push("missing poker_hands contract".into());
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn card(rank: &str, suit: &str) -> Value {
+        json!({"base":{"rank":rank,"suit":suit},"suits":[{"key":suit}]})
+    }
+
+    #[test]
+    fn classifies_core_poker_hands() {
+        assert_eq!(classify_hand(&[card("A", "H"), card("A", "S")]), "Pair");
+        assert_eq!(
+            classify_hand(&[
+                card("A", "H"),
+                card("A", "S"),
+                card("K", "D"),
+                card("K", "C")
+            ]),
+            "Two Pair"
+        );
+        assert_eq!(
+            classify_hand(&[
+                card("2", "H"),
+                card("3", "H"),
+                card("4", "H"),
+                card("5", "H"),
+                card("6", "H")
+            ]),
+            "Straight Flush"
+        );
+    }
+
+    #[test]
+    fn scores_contract_and_supported_modifiers() {
+        let observation = json!({"areas":{"hand":[{"base":{"rank":"A","suit":"H"},"suits":[{"key":"H"}],"edition":"Foil"}]},"poker_hands":{"values":{"High Card":{"chips":10,"mult":2}}}});
+        let result = score_hand(&observation, None);
+        assert_eq!(result.chips, 70);
+        assert_eq!(result.exact_score, Some(140));
+    }
+
+    #[test]
+    fn scores_known_joker_effects_without_marking_them_unsupported() {
+        let observation = json!({
+            "run":{"discards_left":0},
+            "areas":{"hand":[card("Q","H"),card("Q","S")],"jokers":[{"name":"Mystic Summit","ability":{}}]},
+            "poker_hands":{"values":{"Pair":{"chips":10,"mult":2}}}
+        });
+        let result = score_hand(&observation, None);
+        assert_eq!(result.mult, 17);
+        assert!(result.unsupported_effects.is_empty());
+    }
+}

@@ -151,6 +151,62 @@ pub fn log_lines() -> u32 {
     120
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct ScoreParams {
+    #[serde(default)]
+    pub card_indices: Vec<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct StateParams {
+    #[serde(default = "checkpoint_kind")]
+    pub kind: String,
+    #[serde(default = "log_lines")]
+    pub limit: u32,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct StrategyRuleParams {
+    pub id: String,
+    pub kind: String,
+    pub conditions: serde_json::Value,
+    pub directive: String,
+    #[serde(default)]
+    pub absolute: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct StrategyEvidenceParams {
+    pub rule_id: String,
+    pub outcome: String,
+    pub event_id: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct LessonParams {
+    pub category: String,
+    pub lesson: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default = "default_confidence")]
+    pub confidence: f64,
+}
+
+pub fn default_confidence() -> f64 {
+    0.5
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct EstimateParams {
+    pub hand_type: String,
+    pub estimated: i64,
+    pub actual: i64,
+    #[serde(default)]
+    pub context: serde_json::Value,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
