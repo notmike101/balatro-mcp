@@ -182,7 +182,7 @@ impl Server {
         Ok(state)
     }
 
-    async fn status(&self) -> Result<Value, String> {
+    async fn status(&self) -> Value {
         let processes = self
             .process_override
             .lock()
@@ -228,7 +228,7 @@ impl Server {
                 runtime::EXPECTED_BRIDGE_VERSION
             ));
         }
-        Ok(json!({
+        json!({
             "schema": "balatro-agent-status/v2.0",
             "safe_for_mutation": problems.is_empty(),
             "problems": problems,
@@ -240,11 +240,11 @@ impl Server {
                 "observation_seq": bridge.get("observation_seq"),
             },
             "seed": seed,
-        }))
+        })
     }
 
     pub async fn ensure_runtime_impl(&self) -> Result<Value, String> {
-        let status = self.status().await?;
+        let status = self.status().await;
         let count = status
             .get("processes")
             .and_then(Value::as_array)
@@ -262,77 +262,75 @@ impl Server {
     }
 
     pub async fn preflight(&self) -> Result<Value, Value> {
-        match self.status().await {
-            Ok(status) => {
-                let count = status
-                    .get("processes")
-                    .and_then(Value::as_array)
-                    .map_or(0, Vec::len);
-                if count != 1 {
-                    return Err(envelope(
-                        false,
-                        status,
-                        "process_count",
-                        "exactly one Balatro.exe process required",
-                    ));
-                }
-                if let Some(seed) = status.get("seed").and_then(Value::as_str)
-                    && seed != SEED
-                {
-                    return Err(envelope(
-                        false,
-                        status,
-                        "wrong_seed",
-                        "wrong seed; required 2K9H9HN",
-                    ));
-                }
-                if !status
-                    .get("safe_for_mutation")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    return Err(envelope(
-                        false,
-                        status,
-                        "unsafe_runtime",
-                        "runtime is not safe for mutation",
-                    ));
-                }
-                let observation = match self.read_observation() {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return Err(envelope(false, status, "observation_unavailable", &error));
-                    }
-                };
-                let processes = status
-                    .get("processes")
-                    .and_then(Value::as_array)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                let age = status
-                    .get("observation_age_seconds")
-                    .and_then(Value::as_f64);
-                if let Err(error) = runtime::validate_runtime(&observation, processes, age) {
-                    return Err(envelope(
-                        false,
-                        status,
-                        "unsafe_runtime",
-                        &error.to_string(),
-                    ));
-                }
-                if let Err(error) =
-                    runtime::guard_command(&json!({"action": "policy_step"}), &observation)
-                {
-                    return Err(envelope(
-                        false,
-                        status,
-                        "unsafe_runtime",
-                        &error.to_string(),
-                    ));
-                }
-                Ok(status)
+        {
+            let status = self.status().await;
+            let count = status
+                .get("processes")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            if count != 1 {
+                return Err(envelope(
+                    false,
+                    status,
+                    "process_count",
+                    "exactly one Balatro.exe process required",
+                ));
             }
-            Err(error) => Err(envelope(false, Value::Null, "status_failed", &error)),
+            if let Some(seed) = status.get("seed").and_then(Value::as_str)
+                && seed != SEED
+            {
+                return Err(envelope(
+                    false,
+                    status,
+                    "wrong_seed",
+                    "wrong seed; required 2K9H9HN",
+                ));
+            }
+            if !status
+                .get("safe_for_mutation")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Err(envelope(
+                    false,
+                    status,
+                    "unsafe_runtime",
+                    "runtime is not safe for mutation",
+                ));
+            }
+            let observation = match self.read_observation() {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(envelope(false, status, "observation_unavailable", &error));
+                }
+            };
+            let processes = status
+                .get("processes")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let age = status
+                .get("observation_age_seconds")
+                .and_then(Value::as_f64);
+            if let Err(error) = runtime::validate_runtime(&observation, processes, age) {
+                return Err(envelope(
+                    false,
+                    status,
+                    "unsafe_runtime",
+                    &error.to_string(),
+                ));
+            }
+            if let Err(error) =
+                runtime::guard_command(&json!({"action": "policy_step"}), &observation)
+            {
+                return Err(envelope(
+                    false,
+                    status,
+                    "unsafe_runtime",
+                    &error.to_string(),
+                ));
+            }
+            Ok(status)
         }
     }
 
@@ -420,28 +418,24 @@ impl Server {
 impl Server {
     #[tool(description = "Check process count, seed, bridge freshness, and resumable-save safety.")]
     async fn game_status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        match self.status().await {
-            Ok(data) => {
-                let process_count = data
-                    .get("processes")
-                    .and_then(Value::as_array)
-                    .map_or(0, Vec::len);
-                let valid_seed = data
-                    .get("seed")
-                    .and_then(Value::as_str)
-                    .is_none_or(|seed| seed == SEED);
-                if process_count == 1 && valid_seed {
-                    to_tool_result(envelope(true, data, "", ""))
-                } else {
-                    to_tool_result(envelope(
-                        false,
-                        data,
-                        "preflight",
-                        "Balatro runtime preflight failed",
-                    ))
-                }
-            }
-            Err(e) => to_tool_result(envelope(false, Value::Null, "status_failed", &e)),
+        let data = self.status().await;
+        let process_count = data
+            .get("processes")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let valid_seed = data
+            .get("seed")
+            .and_then(Value::as_str)
+            .is_none_or(|seed| seed == SEED);
+        if process_count == 1 && valid_seed {
+            to_tool_result(envelope(true, data, "", ""))
+        } else {
+            to_tool_result(envelope(
+                false,
+                data,
+                "preflight",
+                "Balatro runtime preflight failed",
+            ))
         }
     }
 
@@ -536,10 +530,20 @@ impl Server {
             ));
         }
         let settle = params.settle_timeout.clamp(1.0, 30.0);
+        let selected = current
+            .get("legal_actions")
+            .and_then(Value::as_array)
+            .and_then(|actions| {
+                actions.iter().find(|action| {
+                    action.get("action_id").and_then(Value::as_str)
+                        == Some(params.action_id.as_str())
+                })
+            });
         match execute_policy_action(
             &self.ipc,
             &params.action_id,
             &params.decision_id,
+            selected,
             30,
             15,
             60,
@@ -1143,9 +1147,7 @@ impl Server {
         Parameters(params): Parameters<RuntimeParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let mut data = self.diagnostic(params.lines);
-        if let Ok(status) = self.status().await {
-            data["status"] = sanitize(status);
-        }
+        data["status"] = sanitize(self.status().await);
         to_tool_result(envelope(true, data, "", ""))
     }
 }
@@ -1435,6 +1437,43 @@ mod tests {
         let info = <Server as rmcp::ServerHandler>::get_info(&server);
         assert!(info.capabilities.tools.is_some());
         assert!(info.capabilities.resources.is_some());
+        let registered: std::collections::HashSet<_> = Server::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+        for expected in [
+            "game_status",
+            "ensure_runtime",
+            "observe",
+            "get_decision",
+            "take_action",
+            "advance_safe",
+            "wait_for_state",
+            "checkpoint",
+            "lookup_rule",
+            "list_rules",
+            "rules_stats",
+            "rules_overview",
+            "query_replays",
+            "log_replay",
+            "score_hand",
+            "hand_values",
+            "strategy_state",
+            "strategy_add_rule",
+            "strategy_record_evidence",
+            "lesson_add",
+            "estimation_record",
+            "estimation_report",
+            "run_state",
+            "event_history",
+            "runtime_diagnostics",
+        ] {
+            assert!(
+                registered.contains(expected),
+                "missing registered tool {expected}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1504,6 +1543,16 @@ mod tests {
                 .is_ok()
         );
         assert!(server.estimation_report().await.is_ok());
+        write_fixture(&server);
+        assert!(
+            server
+                .run_state(Parameters(StateParams {
+                    kind: "broken-checkpoint".into(),
+                    limit: 1
+                }))
+                .await
+                .is_ok()
+        );
         assert!(
             server
                 .run_state(Parameters(StateParams {
@@ -1604,11 +1653,7 @@ mod tests {
                 .is_ok()
         );
 
-        std::fs::write(
-            &server.ipc.response_path,
-            r#"{"id":"checkpoint","ok":true}"#,
-        )
-        .unwrap();
+        std::fs::write(&server.ipc.response_path, r#"{"_decode_error":true}"#).unwrap();
         assert!(
             server
                 .checkpoint(Parameters(CheckpointParams {
@@ -1633,11 +1678,7 @@ mod tests {
         })]);
         assert!(server.game_status().await.is_ok());
         assert!(server.ensure_runtime().await.is_ok());
-        std::fs::write(
-            &server.ipc.response_path,
-            r#"{"id":"policy_step","ok":true}"#,
-        )
-        .unwrap();
+        std::fs::write(&server.ipc.response_path, r#"{"_decode_error":true}"#).unwrap();
         let observation: Value =
             serde_json::from_slice(&std::fs::read(&server.ipc.observation_path).unwrap()).unwrap();
         let decision = decision_id_for(&observation);
@@ -1661,11 +1702,7 @@ mod tests {
                 .await
                 .is_ok()
         );
-        std::fs::write(
-            &server.ipc.response_path,
-            r#"{"id":"safe_transition","ok":true}"#,
-        )
-        .unwrap();
+        std::fs::write(&server.ipc.response_path, r#"{"_decode_error":true}"#).unwrap();
         assert!(
             server
                 .advance_safe(Parameters(AdvanceParams { max_steps: 1 }))
@@ -1874,6 +1911,22 @@ mod tests {
                 .await
                 .is_ok()
         );
+        assert!(
+            server
+                .log_replay(Parameters(ReplayLogParams {
+                    outcome: "clear".into(),
+                    ante: 1,
+                    stake: 1,
+                    blind_key: "x".into(),
+                    jokers: vec![],
+                    steps: vec![],
+                    dollars_start: None,
+                    dollars_end: None,
+                    notes: String::new()
+                }))
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1919,6 +1972,7 @@ mod tests {
     async fn runtime_status_and_preflight_failure_branches_are_exercised() {
         let (_dir, server) = server();
         *server.process_override.lock().await = Some(vec![]);
+        assert!(server.ensure_runtime_impl().await.is_err());
         assert!(server.game_status().await.is_ok());
         assert!(
             server
@@ -1930,6 +1984,7 @@ mod tests {
                 .await
                 .is_ok()
         );
+        assert!(server.preflight().await.is_err());
 
         *server.process_override.lock().await = Some(vec![json!({"pid": 1}), json!({"pid": 2})]);
         assert!(server.ensure_runtime().await.is_ok());
@@ -1974,5 +2029,14 @@ mod tests {
                 .await
                 .is_ok()
         );
+        assert!(server.preflight().await.is_err());
+
+        wrong["bridge"] = json!({"loaded": false, "version": "0.6.0", "session_id": "x"});
+        std::fs::write(
+            &server.ipc.observation_path,
+            serde_json::to_vec(&wrong).unwrap(),
+        )
+        .unwrap();
+        assert!(server.preflight().await.is_err());
     }
 }

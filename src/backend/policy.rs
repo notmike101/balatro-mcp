@@ -392,7 +392,7 @@ fn generate_legal_actions(
                         .collect();
                     if !ids.is_empty() {
                         let score = score_hand(observation, Some(&(0..pc).collect::<Vec<_>>()));
-                        actions.push(json!({ "action_id": format!("play_{}", ids.join("_")), "action": "play", "card_ids": ids, "estimated_score": score.estimated_score, "score_quality": score.estimate_quality, "reason": format!("play {} cards ({} hands left)", pc, hands_left) }));
+                        actions.push(json!({ "action_id": format!("play_{}", ids.join("_")), "action": "play", "card_indices": (1..=pc).collect::<Vec<_>>(), "card_ids": ids, "estimated_score": score.estimated_score, "score_quality": score.estimate_quality, "reason": format!("play {} cards ({} hands left)", pc, hands_left) }));
                     }
                 }
             }
@@ -412,7 +412,7 @@ fn generate_legal_actions(
                         })
                         .collect();
                     if !ids.is_empty() {
-                        actions.push(json!({ "action_id": format!("discard_{}", ids.join("_")), "action": "discard", "card_ids": ids, "reason": format!("discard {} cards ({} discards left)", dc, discards_left) }));
+                        actions.push(json!({ "action_id": format!("discard_{}", ids.join("_")), "action": "discard", "card_indices": (1..=dc).collect::<Vec<_>>(), "card_ids": ids, "reason": format!("discard {} cards ({} discards left)", dc, discards_left) }));
                     }
                 }
             }
@@ -433,15 +433,25 @@ fn generate_legal_actions(
                 }
             }
             if consumable_open > 0 || joker_open > 0 {
-                let shop_cards = observation
-                    .pointer("/areas/shop")
-                    .and_then(Value::as_array)
-                    .or_else(|| observation.pointer("/shop/cards").and_then(Value::as_array))
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&EMPTY_VEC);
-                for (i, c) in shop_cards.iter().enumerate() {
-                    if let Some(name) = c.get("name").and_then(|n| n.as_str()) {
-                        actions.push(json!({ "action_id": format!("buy_consumable_{}", i), "action": "buy_card", "card_index": i, "reason": format!("buy {} (slot available)", name) }));
+                let shop_areas = [
+                    ("shop_jokers", "/areas/shop_jokers", joker_open > 0),
+                    ("shop_vouchers", "/areas/shop_vouchers", true),
+                    ("shop_booster", "/areas/shop_booster", true),
+                    ("consumeables", "/areas/shop", consumable_open > 0),
+                ];
+                for (area, pointer, slot_available) in shop_areas {
+                    if !slot_available {
+                        continue;
+                    }
+                    let cards = observation
+                        .pointer(pointer)
+                        .and_then(Value::as_array)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&EMPTY_VEC);
+                    for (i, c) in cards.iter().enumerate() {
+                        if let Some(name) = c.get("name").and_then(|n| n.as_str()) {
+                            actions.push(json!({ "action_id": format!("buy_{}_{}", area, i), "action": "buy_card", "area": area, "card_index": i + 1, "card_id": c.get("instance_id"), "reason": format!("buy {} (slot available)", name) }));
+                        }
                     }
                 }
             }
@@ -468,11 +478,11 @@ fn generate_legal_actions(
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or("consumable");
-        actions.push(json!({"action_id":format!("use_consumable_{}", index),"action":"use_consumable","card_index":index,"target_limit":target_limit,"reason":format!("evaluate {} before advancing", name)}));
-        actions.push(json!({"action_id":format!("sell_consumable_{}", index),"action":"sell_card","area":"consumables","card_index":index,"reason":format!("sell {} if no useful target exists", name)}));
+        actions.push(json!({"action_id":format!("use_consumable_{}", index + 1),"action":"use_consumable","card_index":index + 1,"target_limit":target_limit,"reason":format!("evaluate {} before advancing", name)}));
+        actions.push(json!({"action_id":format!("sell_consumable_{}", index + 1),"action":"sell_card","area":"consumeables","card_index":index + 1,"reason":format!("sell {} if no useful target exists", name)}));
     }
     for (index, joker) in jokers_array.iter().enumerate() {
-        actions.push(json!({"action_id":format!("sell_joker_{}", index),"action":"sell_card","area":"jokers","card_index":index,"reason":format!("sell {} when required", joker.get("name").and_then(Value::as_str).unwrap_or("Joker"))}));
+        actions.push(json!({"action_id":format!("sell_joker_{}", index + 1),"action":"sell_card","area":"jokers","card_index":index + 1,"reason":format!("sell {} when required", joker.get("name").and_then(Value::as_str).unwrap_or("Joker"))}));
     }
     if !matches!(
         state,
@@ -495,7 +505,7 @@ fn generate_legal_actions(
         for i in 0..joker_count {
             for j in 0..joker_count {
                 if i != j {
-                    actions.push(json!({ "action_id": format!("move_joker_{}_to_{}", i, j), "action": "move_joker", "from_index": i, "to_index": j, "reason": "reorder joker trigger sequence" }));
+                    actions.push(json!({ "action_id": format!("move_joker_{}_to_{}", i + 1, j + 1), "action": "move_joker", "from_index": i + 1, "to_index": j + 1, "reason": "reorder joker trigger sequence" }));
                 }
             }
         }
@@ -504,7 +514,7 @@ fn generate_legal_actions(
         for i in 0..hand_count {
             for j in 0..hand_count {
                 if i != j {
-                    actions.push(json!({ "action_id": format!("move_card_{}_to_{}", i, j), "action": "move_card", "from_index": i, "to_index": j, "reason": "reorder hand for play" }));
+                    actions.push(json!({ "action_id": format!("move_card_{}_to_{}", i + 1, j + 1), "action": "move_card", "from_index": i + 1, "to_index": j + 1, "reason": "reorder hand for play" }));
                 }
             }
         }
@@ -535,7 +545,7 @@ fn build_decision_checks(
             for j in 0..joker_count {
                 if i != j {
                     joker_order.push(json!({ "from": i, "to": j }));
-                    move_joker_actions.push(json!({ "action_id": format!("move_joker_{}_to_{}", i, j), "action": "move_joker", "from_index": i, "to_index": j }));
+                    move_joker_actions.push(json!({ "action_id": format!("move_joker_{}_to_{}", i + 1, j + 1), "action": "move_joker", "from_index": i + 1, "to_index": j + 1 }));
                 }
             }
         }
@@ -830,6 +840,16 @@ mod tests {
         }
         assert_eq!(estimate_best_play(&json!({"areas":{"hand":[]}})), 5);
         assert_eq!(estimate_best_play_raw(&[], &json!({})), 5);
+        assert_eq!(analyze_hands(&[], &json!({})), json!({}));
+        assert!(
+            analyze_hands(
+                &[json!({"base":{"rank":"A"},"suits":[{"key":"H"}]})],
+                &json!({"values":{"High Card":{"chips":7,"mult":3}}})
+            )["best_play"]["estimated_score"]
+                .as_i64()
+                .unwrap()
+                > 0
+        );
     }
 
     #[test]

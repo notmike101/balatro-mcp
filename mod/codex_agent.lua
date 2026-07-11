@@ -1270,7 +1270,7 @@ end
 
 local function command_buy(command, buy_and_use)
     if not G or not G.FUNCS or not G.FUNCS.buy_from_shop then return false, "buy callback unavailable" end
-    local card, _, err = card_from_command(command, "shop_jokers")
+    local card, _, err = card_from_command(command, command.area or "shop_jokers")
     if err then return false, err end
 
     if card.ability and (card.ability.set == "Voucher" or card.ability.set == "Booster") then
@@ -1297,7 +1297,7 @@ end
 
 local function command_sell(command)
     if not G or not G.FUNCS or not G.FUNCS.sell_card then return false, "sell callback unavailable" end
-    local card, _, err = card_from_command(command, "jokers")
+    local card, _, err = card_from_command(command, command.area or "jokers")
     if err then return false, err end
     G.FUNCS.sell_card({config = {ref_table = card, button = "sell_card"}})
     return true, "queued sell"

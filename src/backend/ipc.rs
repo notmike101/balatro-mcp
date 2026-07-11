@@ -140,50 +140,185 @@ pub fn execute_policy_action(
     paths: &IpcPaths,
     action_id: &str,
     decision_id: &str,
+    selected_action: Option<&Value>,
     play_limit: u32,
     discard_limit: u32,
     target_limit: u32,
     settle_timeout: f64,
 ) -> Result<Value, String> {
-    let command = serde_json::json!({
-        "action": "policy_step",
-        "action_id": action_id,
-        "decision_id": decision_id,
-        "play_limit": play_limit,
-        "discard_limit": discard_limit,
-        "target_limit": target_limit,
-        "settle_timeout": settle_timeout,
-    });
+    let mut command = policy_action_command(selected_action, action_id, decision_id)?;
+    let command_id = paths.next_command_id();
+    if let Some(object) = command.as_object_mut() {
+        object.insert("id".into(), serde_json::json!(command_id));
+        object.insert("play_limit".into(), serde_json::json!(play_limit));
+        object.insert("discard_limit".into(), serde_json::json!(discard_limit));
+        object.insert("target_limit".into(), serde_json::json!(target_limit));
+        object.insert("settle_timeout".into(), serde_json::json!(settle_timeout));
+    }
     paths.write_command(&command)?;
     let response = paths
-        .wait_for_response("policy_step", 60.0)?
-        .ok_or("no response from bridge for policy_step")?;
+        .wait_for_response(&command_id, 60.0)?
+        .ok_or("no response from bridge for policy action")?;
     Ok(response)
+}
+
+/// Translate a Rust policy action into the concrete command understood by the
+/// Lovely bridge. The policy action is kept internal and is sanitized before
+/// it crosses the MCP boundary.
+pub fn policy_action_command(
+    selected_action: Option<&Value>,
+    action_id: &str,
+    decision_id: &str,
+) -> Result<Value, String> {
+    let action = selected_action.ok_or_else(|| format!("policy action not found: {action_id}"))?;
+    let kind = action
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or("policy action has no action type")?;
+    let mut command = serde_json::Map::new();
+    command.insert("decision_id".into(), serde_json::json!(decision_id));
+    command.insert("action_id".into(), serde_json::json!(action_id));
+    match kind {
+        "play" | "discard" => {
+            command.insert("action".into(), serde_json::json!(kind));
+            command.insert(
+                "cards".into(),
+                action
+                    .get("card_indices")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+            );
+            command.insert(
+                "card_ids".into(),
+                action
+                    .get("card_ids")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+            );
+        }
+        "select_blind" => {
+            command.insert("action".into(), serde_json::json!("select_blind"));
+            command.insert(
+                "blind_type".into(),
+                action.get("blind").cloned().unwrap_or(Value::Null),
+            );
+        }
+        "ui_click" => {
+            command.insert("action".into(), serde_json::json!("ui_click"));
+            for key in ["ui_id", "button"] {
+                if let Some(value) = action.get(key) {
+                    command.insert(key.into(), value.clone());
+                }
+            }
+        }
+        "buy_card" => {
+            command.insert("action".into(), serde_json::json!("buy"));
+            command.insert(
+                "area".into(),
+                action
+                    .get("area")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!("shop_jokers")),
+            );
+            command.insert(
+                "index".into(),
+                action.get("card_index").cloned().unwrap_or(Value::Null),
+            );
+            if let Some(card_id) = action.get("card_id") {
+                command.insert("card_id".into(), card_id.clone());
+            }
+        }
+        "use_consumable" => {
+            command.insert("action".into(), serde_json::json!("use"));
+            command.insert("area".into(), serde_json::json!("consumeables"));
+            command.insert(
+                "index".into(),
+                action.get("card_index").cloned().unwrap_or(Value::Null),
+            );
+            if let Some(targets) = action.get("targets") {
+                command.insert("targets".into(), targets.clone());
+            }
+        }
+        "sell_card" => {
+            command.insert("action".into(), serde_json::json!("sell"));
+            command.insert(
+                "area".into(),
+                action
+                    .get("area")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!("jokers")),
+            );
+            command.insert(
+                "index".into(),
+                action.get("card_index").cloned().unwrap_or(Value::Null),
+            );
+        }
+        "move_card" | "move_joker" => {
+            command.insert("action".into(), serde_json::json!(kind));
+            for key in ["area", "from_index", "to_index", "card_id"] {
+                if let Some(value) = action.get(key) {
+                    command.insert(key.into(), value.clone());
+                }
+            }
+        }
+        "reroll" => {
+            command.insert("action".into(), serde_json::json!("reroll_shop"));
+        }
+        "choose_pack" => {
+            command.insert("action".into(), serde_json::json!("use"));
+            command.insert("area".into(), serde_json::json!("pack_cards"));
+            command.insert(
+                "index".into(),
+                action.get("card_index").cloned().unwrap_or(Value::Null),
+            );
+        }
+        "safe_transition" => {
+            command.insert(
+                "action".into(),
+                action.get("transition").cloned().unwrap_or(Value::Null),
+            );
+        }
+        "resume_run" => {
+            command.insert("action".into(), serde_json::json!("start_run"));
+        }
+        _ => return Err(format!("unsupported policy action type: {kind}")),
+    };
+    Ok(Value::Object(command))
 }
 
 /// Execute a safe transition action (skip_tutorial, cash_out, etc.) via the Lua bridge.
 pub fn advance_safe_internal(paths: &IpcPaths, action: &str, steps: u32) -> Result<Value, String> {
+    let command_id = paths.next_command_id();
     let command = serde_json::json!({
+        "id": command_id,
         "action": "safe_transition",
         "transition": action,
         "max_steps": steps,
     });
     paths.write_command(&command)?;
     let response = paths
-        .wait_for_response("safe_transition", 60.0)?
+        .wait_for_response(
+            command.get("id").and_then(Value::as_str).unwrap_or(""),
+            60.0,
+        )?
         .ok_or("no response from bridge for safe_transition")?;
     Ok(response)
 }
 
 /// Persist the current observation into a checkpoint file.
 pub fn checkpoint_internal(paths: &IpcPaths, kind: &str) -> Result<Value, String> {
+    let command_id = paths.next_command_id();
     let command = serde_json::json!({
+        "id": command_id,
         "action": "checkpoint",
         "kind": kind,
     });
     paths.write_command(&command)?;
     let response = paths
-        .wait_for_response("checkpoint", 30.0)?
+        .wait_for_response(
+            command.get("id").and_then(Value::as_str).unwrap_or(""),
+            30.0,
+        )?
         .ok_or("no response from bridge for checkpoint")?;
     Ok(response)
 }
@@ -197,13 +332,15 @@ pub fn advance_safe_with_discovery(
     steps: u32,
 ) -> Result<Value, String> {
     for action in safe_actions {
+        let command_id = paths.next_command_id();
         let cmd = serde_json::json!({
+            "id": command_id,
             "action": "safe_transition",
             "transition": *action,
             "max_steps": steps,
         });
         paths.write_command(&cmd)?;
-        let response = paths.wait_for_response(*action, 30.0)?;
+        let response = paths.wait_for_response(&command_id, 30.0)?;
         if response.is_some() {
             return Ok(response.unwrap_or(Value::Null));
         }
@@ -295,14 +432,62 @@ mod tests {
     #[test]
     fn command_helpers_use_expected_bridge_ids() {
         let (ipc, _dir) = paths();
-        std::fs::write(&ipc.response_path, r#"{"id":"policy_step","ok":true}"#).unwrap();
-        assert!(super::execute_policy_action(&ipc, "play", "d", 1, 2, 3, 0.1).is_ok());
-        std::fs::write(&ipc.response_path, r#"{"id":"safe_transition","ok":true}"#).unwrap();
+        std::fs::write(&ipc.response_path, r#"{"_decode_error":true}"#).unwrap();
+        let action =
+            json!({"action_id":"play_1","action":"play","card_indices":[1],"card_ids":["1"]});
+        assert!(
+            super::execute_policy_action(&ipc, "play_1", "d", Some(&action), 1, 2, 3, 0.1).is_ok()
+        );
+        std::fs::write(&ipc.response_path, r#"{"_decode_error":true}"#).unwrap();
         assert!(super::advance_safe_internal(&ipc, "cash_out", 2).is_ok());
-        std::fs::write(&ipc.response_path, r#"{"id":"checkpoint","ok":true}"#).unwrap();
+        std::fs::write(&ipc.response_path, r#"{"_decode_error":true}"#).unwrap();
         assert!(super::checkpoint_internal(&ipc, "manual").is_ok());
-        std::fs::write(&ipc.response_path, r#"{"id":"first","ok":true}"#).unwrap();
+        std::fs::write(&ipc.response_path, r#"{"_decode_error":true}"#).unwrap();
         assert!(super::advance_safe_with_discovery(&ipc, &["first", "second"], 1).is_ok());
         assert!(super::advance_safe_with_discovery(&ipc, &[], 1).is_err());
+    }
+
+    #[test]
+    fn policy_actions_translate_to_live_bridge_commands() {
+        let cases = [
+            (json!({"action":"discard","card_indices":[1]}), "discard"),
+            (
+                json!({"action":"select_blind","blind":"Boss"}),
+                "select_blind",
+            ),
+            (
+                json!({"action":"ui_click","ui_id":"cash_out_button"}),
+                "ui_click",
+            ),
+            (
+                json!({"action":"buy_card","area":"shop_jokers","card_index":1}),
+                "buy",
+            ),
+            (json!({"action":"use_consumable","card_index":1}), "use"),
+            (
+                json!({"action":"sell_card","area":"consumeables","card_index":1}),
+                "sell",
+            ),
+            (
+                json!({"action":"move_joker","from_index":1,"to_index":2}),
+                "move_joker",
+            ),
+            (json!({"action":"reroll"}), "reroll_shop"),
+            (json!({"action":"choose_pack","card_index":1}), "use"),
+            (
+                json!({"action":"safe_transition","transition":"cash_out"}),
+                "cash_out",
+            ),
+            (json!({"action":"resume_run"}), "start_run"),
+        ];
+        for (action, expected) in cases {
+            let command = super::policy_action_command(Some(&action), "id", "decision").unwrap();
+            assert_eq!(command["action"], expected);
+            assert_eq!(command["decision_id"], "decision");
+        }
+        assert!(super::policy_action_command(None, "id", "decision").is_err());
+        assert!(
+            super::policy_action_command(Some(&json!({"action":"unknown"})), "id", "d").is_err()
+        );
     }
 }
