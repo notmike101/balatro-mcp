@@ -38,3 +38,144 @@ pub fn guide(topic: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guide_topics_contains_all_expected() {
+        assert!(GUIDE_TOPICS.contains(&"core"));
+        assert!(GUIDE_TOPICS.contains(&"hands"));
+        assert!(GUIDE_TOPICS.contains(&"actions"));
+        assert!(GUIDE_TOPICS.contains(&"economy"));
+        assert!(GUIDE_TOPICS.contains(&"blinds"));
+        assert!(GUIDE_TOPICS.contains(&"jokers"));
+        assert!(GUIDE_TOPICS.contains(&"cards"));
+        assert!(GUIDE_TOPICS.contains(&"consumables"));
+        assert_eq!(GUIDE_TOPICS.len(), 8);
+    }
+
+    #[test]
+    fn guide_returns_text_for_core() {
+        let text = guide("core").unwrap();
+        assert!(text.contains("Ante 8"));
+        assert!(text.contains("game_status"));
+    }
+
+    #[test]
+    fn guide_aliases_for_core() {
+        assert!(guide("rules").is_some());
+        assert!(guide("ante8").is_some());
+    }
+
+    #[test]
+    fn guide_returns_text_for_hands() {
+        let text = guide("hands").unwrap();
+        assert!(text.contains("Chips"));
+        assert!(text.contains("Mult"));
+    }
+
+    #[test]
+    fn guide_aliases_for_hands() {
+        assert!(guide("scoring").is_some());
+    }
+
+    #[test]
+    fn guide_returns_text_for_actions() {
+        let text = guide("actions").unwrap();
+        assert!(text.contains("discards"));
+    }
+
+    #[test]
+    fn guide_aliases_for_actions() {
+        assert!(guide("discards").is_some());
+    }
+
+    #[test]
+    fn guide_returns_text_for_economy() {
+        let text = guide("economy").unwrap();
+        assert!(text.contains("Joker"));
+        assert!(text.contains("interest"));
+    }
+
+    #[test]
+    fn guide_aliases_for_economy() {
+        assert!(guide("shops").is_some());
+    }
+
+    #[test]
+    fn guide_returns_text_for_blinds() {
+        let text = guide("blinds").unwrap();
+        assert!(text.contains("Boss"));
+        assert!(text.contains("debuffs"));
+    }
+
+    #[test]
+    fn guide_aliases_for_blinds() {
+        assert!(guide("bosses").is_some());
+        assert!(guide("debuffs").is_some());
+    }
+
+    #[test]
+    fn guide_returns_text_for_jokers() {
+        let text = guide("jokers").unwrap();
+        assert!(text.contains("Foil"));
+        assert!(text.contains("Holographic"));
+        assert!(text.contains("Polychrome"));
+    }
+
+    #[test]
+    fn guide_aliases_for_jokers() {
+        assert!(guide("editions").is_some());
+    }
+
+    #[test]
+    fn guide_returns_text_for_cards() {
+        let text = guide("cards").unwrap();
+        assert!(text.contains("enhancement"));
+        assert!(text.contains("Face-down"));
+    }
+
+    #[test]
+    fn guide_aliases_for_cards() {
+        assert!(guide("enhancements").is_some());
+        assert!(guide("seals").is_some());
+    }
+
+    #[test]
+    fn guide_returns_text_for_consumables() {
+        let text = guide("consumables").unwrap();
+        assert!(text.contains("Decks"));
+        assert!(text.contains("Stakes"));
+        assert!(text.contains("Vouchers"));
+    }
+
+    #[test]
+    fn guide_aliases_for_consumables() {
+        assert!(guide("vouchers").is_some());
+        assert!(guide("stakes").is_some());
+        assert!(guide("decks").is_some());
+        assert!(guide("tags").is_some());
+        assert!(guide("progression").is_some());
+    }
+
+    #[test]
+    fn guide_returns_none_for_unknown_topic() {
+        assert!(guide("nonexistent").is_none());
+    }
+
+    #[test]
+    fn guide_is_case_insensitive() {
+        assert_eq!(guide("CORE"), guide("core"));
+        assert_eq!(guide("Hands"), guide("hands"));
+        assert_eq!(guide("JOKERS"), guide("jokers"));
+    }
+
+    #[test]
+    fn guide_case_insensitive_aliases() {
+        assert_eq!(guide("RULES"), guide("rules"));
+        assert_eq!(guide("SCORING"), guide("scoring"));
+    }
+}
