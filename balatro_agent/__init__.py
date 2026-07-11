@@ -1,4 +1,4 @@
-"""Reliable agent-facing control layer for Balatro CodexAutomation."""
+"""Reliable agent-facing control layer for Balatro AgentAutomation."""
 
 SCHEMA_VERSION = "2.0"
 POLICY_SCHEMA = "balatro-codex-policy-state/v2"

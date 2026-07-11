@@ -74,7 +74,7 @@ def validate_runtime(
         raise SafetyError(f"observation stale or missing: age={age}")
     bridge = observation.get("bridge") or {}
     if not bridge.get("loaded"):
-        raise SafetyError("CodexAutomation bridge not loaded")
+        raise SafetyError("AgentAutomation bridge not loaded")
     if require_version and bridge.get("version") != EXPECTED_BRIDGE_VERSION:
         raise SafetyError(
             f"bridge version {bridge.get('version')} loaded; restart Balatro to load {EXPECTED_BRIDGE_VERSION}"

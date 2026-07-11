@@ -1,4 +1,4 @@
--- CodexAutomation: file-backed automation bridge for Balatro.
+-- AgentAutomation: file-backed automation bridge for Balatro.
 -- Loaded by Lovely through lovely.toml by appending this file to main.lua.
 
 CODA = CODA or {}
@@ -22,7 +22,7 @@ CODA.last_hands_played = nil
 CODA._last_hand_num_captured = -1  -- highest hand_num already recorded
 CODA.last_response = CODA.last_response or {
     ok = true,
-    message = "CodexAutomation loaded",
+    message = "AgentAutomation loaded",
     version = CODA.version
 }
 

@@ -80,7 +80,7 @@ def default_strategy() -> dict[str, Any]:
                 "live-values-authoritative",
                 "Use canonical poker_hand_values for exact Run Info hand level, chips, and mult; never substitute static tables when valid values exist.",
                 {},
-                "CodexAutomation poker_hands schema balatro-poker-hand-values/v1",
+                "AgentAutomation poker_hands schema balatro-poker-hand-values/v1",
             ),
         ],
         "run_history": [],
