@@ -39,7 +39,6 @@ pub fn guide(topic: &str) -> Option<&'static str> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

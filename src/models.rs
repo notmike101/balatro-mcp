@@ -151,7 +151,6 @@ pub fn log_lines() -> u32 {
     120
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,4 +408,3 @@ mod tests {
         let _ = schemars::schema_for!(DecisionParams);
     }
 }
-

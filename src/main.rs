@@ -1,7 +1,8 @@
-mod models;
-mod infra;
-mod protocol;
+mod backend;
 mod guide;
+mod infra;
+mod models;
+mod protocol;
 mod tools;
 
 use rmcp::ServiceExt;

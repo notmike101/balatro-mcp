@@ -390,14 +390,5 @@ mod tests {
         assert_eq!(result["hand"], json!(null));
         assert_eq!(result["decision_id"], json!(null));
         assert_eq!(result["legal_actions"], json!(null));
-    }}
-
-
-
-
-
-
-
-
-
-
+    }
+}
