@@ -320,8 +320,7 @@ impl Server {
                     &error.to_string(),
                 ));
             }
-            if let Err(error) =
-                runtime::guard_command(&json!({"action": "policy_step"}), &observation)
+            if let Err(error) = runtime::guard_command(&json!({"action": "observe"}), &observation)
             {
                 return Err(envelope(
                     false,
