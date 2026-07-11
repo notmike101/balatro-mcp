@@ -14,6 +14,11 @@ balatro.rep
 balatro_src
 tools/balatro-info-db/balatro_src/
 tools/balatro-info-db/data/
+agent/policies.db
+.codegraph/
+target/
+legacy-desktop-scripts/
+legacy-desktop-fixes/
 
 # Raw dumps and temp files (hard rule: never commit these)
 temp_commands.json

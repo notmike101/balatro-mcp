@@ -1,6 +1,8 @@
 import json, sqlite3, sys, os
+from pathlib import Path
 
-DB_PATH = os.path.join(os.path.dirname(__file__), 'replays.db')
+RUNTIME_ROOT = os.environ.get('BALATRO_RUNTIME_ROOT', str(Path(__file__).resolve().parent.parent))
+DB_PATH = os.path.join(RUNTIME_ROOT, 'agent', 'replays.db')
 
 def get_db():
     return sqlite3.connect(DB_PATH)

@@ -6,7 +6,11 @@ from pathlib import Path
 from . import ALLOWED_SEED
 
 ROOT = Path(__file__).resolve().parent.parent
-AGENT_DIR = ROOT / "agent"
+# Source code lives in the MCP repository; mutable game session files belong
+# to the separate Balatro runtime directory.  The Rust server sets this value
+# for every private backend child.
+RUNTIME_ROOT = Path(os.environ.get("BALATRO_RUNTIME_ROOT", ROOT))
+AGENT_DIR = RUNTIME_ROOT / "agent"
 STATE_DIR = AGENT_DIR / "state"
 LOG_DIR = AGENT_DIR / "logs"
 CURRENT_RUN_PATH = STATE_DIR / "current_run.json"

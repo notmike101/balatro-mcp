@@ -36,6 +36,7 @@ const INFO_TYPES: &[&str] = &[
 #[derive(Clone)]
 struct Server {
     root: PathBuf,
+    runtime_root: PathBuf,
     capability_file: Arc<PathBuf>,
     capability: Arc<String>,
     mutations: Arc<Mutex<()>>,
@@ -175,8 +176,12 @@ impl Server {
         let file =
             env::temp_dir().join(format!("balatro-mcp-{}-{}.cap", std::process::id(), token));
         fs::write(&file, &token).map_err(|e| format!("cannot create MCP capability: {e}"))?;
+        let runtime_root = env::var_os("BALATRO_RUNTIME_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.clone());
         Ok(Self {
             root,
+            runtime_root,
             capability_file: Arc::new(file),
             capability: Arc::new(token),
             mutations: Arc::new(Mutex::new(())),
@@ -199,6 +204,7 @@ impl Server {
                 "BALATRO_MCP_CAPABILITY_FILE",
                 self.capability_file.as_os_str(),
             )
+            .env("BALATRO_RUNTIME_ROOT", self.runtime_root.as_os_str())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -263,8 +269,8 @@ impl Server {
         if count == 1 {
             return Ok(status);
         }
-        Command::new(self.root.join("Balatro.exe"))
-            .current_dir(&self.root)
+        Command::new(self.runtime_root.join("Balatro.exe"))
+            .current_dir(&self.runtime_root)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

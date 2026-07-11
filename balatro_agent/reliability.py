@@ -26,9 +26,47 @@ from .storage import append_jsonl, atomic_write_json, atomic_write_text, load_js
 # These helpers bridge reliability.py to policies.db so that balatroctl.py
 # strategy-record and strategy-add commands persist to both locations.
 
+def ensure_policy_db() -> None:
+    """Create the small runtime schema needed by a fresh MCP checkout."""
+    POLICIES_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(POLICIES_DB))
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS game_state (
+                run_id TEXT PRIMARY KEY, seed TEXT NOT NULL, ante INTEGER,
+                round_num INTEGER DEFAULT 0, status TEXT, chips_current INTEGER,
+                chips_required INTEGER, hands_left INTEGER, discards_left INTEGER,
+                dollars INTEGER, jokers TEXT, consumeables TEXT,
+                most_played_poker_hand TEXT, blind_key TEXT, blind_on_deck TEXT,
+                updated_at TEXT, last_action TEXT
+            );
+            CREATE TABLE IF NOT EXISTS strategy_rules (
+                id INTEGER PRIMARY KEY, rule_id TEXT NOT NULL UNIQUE,
+                category TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'candidate', confidence REAL DEFAULT 0.5,
+                conditions TEXT, related_rules TEXT, created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS strategy_evidence (
+                id INTEGER PRIMARY KEY, rule_id TEXT NOT NULL, event_id TEXT NOT NULL,
+                outcome TEXT NOT NULL, note TEXT, created_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS lessons (
+                id INTEGER PRIMARY KEY, category TEXT NOT NULL, lesson TEXT NOT NULL,
+                source TEXT, confidence REAL DEFAULT 0.5, related_rules TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
 @contextmanager
 def _db():
     """Context manager for policies.db connections with safe cleanup."""
+    ensure_policy_db()
     conn = sqlite3.connect(str(POLICIES_DB))
     try:
         yield conn
@@ -158,6 +196,7 @@ def load_strategy() -> dict[str, Any]:
     """Load strategy rules from policies.db (source of truth), falling back to default."""
     import sqlite3 as _sq
     try:
+        ensure_policy_db()
         conn = _sq.connect(str(POLICIES_DB))
         c = conn.cursor()
         rules = []

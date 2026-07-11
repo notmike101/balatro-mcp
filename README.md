@@ -6,7 +6,7 @@ This repository intentionally excludes Balatro binaries, saves, Lovely logs, loc
 
 ## Install
 
-1. Clone this repository into your Balatro installation directory.
+1. Clone this repository into a code directory such as `D:\balatro-mcp`. Keep the game installation and its mutable runtime files in a separate directory such as `D:\balatro-desktop`.
 2. Copy `mod/codex_agent.lua` and `mod/lovely.toml` into your Lovely mod directory. Restart the game and use `runtime_diagnostics` to confirm the bridge loaded.
 3. Install Python 3, Node.js 22.5+, and Rust. Build the knowledge database from your own local game source as documented in [`tools/balatro-info-db/README.md`](tools/balatro-info-db/README.md).
 4. Run `cargo build --release`.
@@ -18,7 +18,8 @@ Configure an MCP client:
   "mcpServers": {
     "balatro": {
       "command": "D:\\path\\to\\Balatro\\target\\release\\balatro-mcp.exe",
-      "cwd": "D:\\path\\to\\Balatro"
+      "cwd": "D:\\balatro-mcp",
+      "env": { "BALATRO_RUNTIME_ROOT": "D:\\balatro-desktop" }
     }
   }
 }
