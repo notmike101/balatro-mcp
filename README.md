@@ -18,8 +18,10 @@ Configure an MCP client:
   "mcpServers": {
     "balatro": {
       "command": "D:\\path\\to\\Balatro\\target\\release\\balatro-mcp.exe",
-      "cwd": "D:\\balatro-mcp",
-      "env": { "BALATRO_RUNTIME_ROOT": "D:\\balatro-desktop" }
+      "env": {
+        "BALATRO_MCP_ROOT": "D:\\balatro-mcp",
+        "BALATRO_RUNTIME_ROOT": "D:\\balatro-desktop"
+      }
     }
   }
 }

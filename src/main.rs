@@ -929,16 +929,16 @@ fn guide(topic: &str) -> Option<&'static str> {
             "Evaluate Joker slots, consumable slots, price, interest, and the next blind. Buy one item at a time, then reread decision state.",
         ),
         "blinds" | "bosses" | "debuffs" => Some(
-            "Boss blinds impose special rules and debuffs. Read live blind state and lookup_rule before committing to a plan.",
+            "Boss blinds impose special rules and debuffs. Before selecting or playing one, inspect strategy.decision_checks.boss_debuff, lookup_rule details, debuffed cards/Jokers, score margin, and legal boss-reroll actions.",
         ),
         "jokers" | "editions" => Some(
-            "Jokers affect Chips, Mult, economy, and rules. Foil adds Chips, Holographic adds Mult, Polychrome adds X Mult, Negative adds a Joker slot. Stickers are separate constraints.",
+            "Jokers affect Chips, Mult, economy, and rules. Foil adds Chips, Holographic adds Mult, Polychrome adds X Mult, Negative adds a Joker slot. Stickers are separate constraints. Review decision_checks.ordering and legal move_joker actions when trigger order can matter.",
         ),
         "cards" | "enhancements" | "seals" => Some(
             "Playing cards may have one enhancement, edition, and seal. Face-down card identity is always unknown.",
         ),
         "consumables" | "vouchers" | "stakes" | "decks" | "tags" | "progression" => Some(
-            "Decks, Stakes, Vouchers, Tags, and consumables change run rules and resources. Look up unfamiliar effects before acting.",
+            "Decks, Stakes, Vouchers, Tags, and consumables change run rules and resources. Evaluate every owned and shop consumable through decision_checks.consumables before exiting; look up unfamiliar effects before acting.",
         ),
         _ => None,
     }
@@ -946,7 +946,9 @@ fn guide(topic: &str) -> Option<&'static str> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let root = env::current_dir()?;
+    let root = env::var_os("BALATRO_MCP_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or(env::current_dir()?);
     let server = Server::new(root).map_err(std::io::Error::other)?;
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;

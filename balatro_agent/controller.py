@@ -1407,6 +1407,76 @@ def strategy_context(round_data: dict[str, Any], blind: dict[str, Any], areas: d
     }
 
 
+def decision_checks(
+    round_data: dict[str, Any],
+    blind: dict[str, Any],
+    areas: dict[str, Any],
+    legal_actions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Force decision-time review of effects agents commonly overlook."""
+    def matching(action_name: str, area: str = "") -> list[dict[str, Any]]:
+        return [
+            {"action_id": action.get("id"), "card": action.get("card") or action.get("joker")}
+            for action in legal_actions
+            if action.get("action") == action_name and (not area or action.get("area") == area)
+        ]
+
+    owned_consumables = [compact_card(card) for card in areas.get("consumeables") or []]
+    shop_consumables = [
+        action for action in matching("buy")
+        if str((action.get("card") or {}).get("set") or "") in {"Tarot", "Planet", "Spectral"}
+    ]
+    consumables = []
+    for card in owned_consumables:
+        index = card.get("index")
+        actions = [
+            entry for entry in matching("use", "consumeables") + matching("sell", "consumeables")
+            if (entry.get("card") or {}).get("index") == index
+        ]
+        consumables.append({
+            "card": card,
+            "priority": consumable_priority(card, {"run": round_data}),
+            "legal_actions": actions,
+            "must_evaluate_before_exit": True,
+        })
+
+    choices = round_data.get("blind_choices") or {}
+    boss_choice = choices.get("Boss") or choices.get("boss") or {}
+    current_is_boss = bool(blind.get("boss"))
+    debuffed_cards = [compact_card(card) for card in areas.get("hand") or [] if card.get("debuffed")]
+    debuffed_jokers = [compact_card(card) for card in areas.get("jokers") or [] if card.get("debuffed")]
+    return {
+        "consumables": {
+            "required": bool(owned_consumables or shop_consumables),
+            "instruction": "Evaluate every owned use/sell action and every shop consumable purchase before exiting or advancing.",
+            "owned": consumables,
+            "shop_purchase_actions": shop_consumables,
+        },
+        "ordering": {
+            "required_before_close_play": bool(areas.get("hand") and (areas.get("jokers") or [])),
+            "instruction": "Evaluate hand and Joker trigger order when a scoring effect can depend on sequence; do not move cards by default, but do not dismiss legal reorder actions.",
+            "hand_order": [compact_card(card) for card in areas.get("hand") or []],
+            "joker_order": [compact_card(card) for card in areas.get("jokers") or []],
+            "move_card_actions": matching("move_card"),
+            "move_joker_actions": matching("move_joker"),
+            "estimate_caveat": "Play estimates may not model every ordering interaction; verify relevant ordering when margin is tight.",
+        },
+        "boss_debuff": {
+            "required": current_is_boss or bool(boss_choice),
+            "instruction": "Before selecting or playing a Boss Blind, inspect its live effect, lookup_rule details, debuffed cards/Jokers, and legal boss-reroll actions.",
+            "current_blind": {
+                "name": blind.get("name"), "key": blind.get("key"), "boss": current_is_boss,
+                "effect": blind.get("effect"), "disabled": blind.get("disabled"),
+            },
+            "upcoming_boss": boss_choice,
+            "debuffed_cards": debuffed_cards,
+            "debuffed_jokers": debuffed_jokers,
+            "select_actions": matching("select_blind"),
+            "reroll_actions": matching("reroll_boss"),
+        },
+    }
+
+
 def strategy_card_from_action(action: dict[str, Any]) -> dict[str, Any]:
     card = action.get("card")
     return card if isinstance(card, dict) else {}
@@ -1617,6 +1687,7 @@ def build_policy_state(
         ),
         strategy,
     )
+    strategy["decision_checks"] = decision_checks(round_data, blind, areas, legal_actions)
     return {
         "schema": POLICY_SCHEMA,
         "bridge": data.get("bridge"),

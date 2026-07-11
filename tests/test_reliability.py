@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from balatro_agent import ALLOWED_SEED, POLICY_SCHEMA
-from balatro_agent.controller import build_parser, build_policy_state, classify_cards, cmd_hand_values, score_breakdown
+from balatro_agent.controller import build_parser, build_policy_state, classify_cards, cmd_hand_values, decision_checks, score_breakdown
 from balatro_agent.ipc import to_lua
 from balatro_agent.policy import select_safe_transition
 from balatro_agent.reliability import (
@@ -354,6 +354,30 @@ class ReliabilityTests(unittest.TestCase):
         self.assertTrue(enhanced["decision_id"].startswith("dec-"))
         self.assertEqual(enhanced["legal_actions"][0]["score_kind"], "estimate")
         self.assertEqual(decision_id(enhanced), enhanced["decision_id"])
+
+    def test_decision_checks_require_consumable_order_and_boss_review(self) -> None:
+        areas = {
+            "hand": [{"index": 1, "id": 10, "base": {"name": "Ace", "value": "Ace", "id": 14, "suit": "Spades"}}],
+            "jokers": [{"index": 1, "id": 20, "name": "Joker", "set": "Joker"}],
+            "consumeables": [{"index": 1, "id": 30, "name": "Venus", "set": "Planet"}],
+        }
+        actions = [
+            {"id": "use:venus", "action": "use", "area": "consumeables", "card": {"index": 1, "name": "Venus", "set": "Planet"}},
+            {"id": "move:hand", "action": "move_card", "area": "hand"},
+            {"id": "move:joker", "action": "move_joker"},
+            {"id": "reroll:boss", "action": "reroll_boss"},
+        ]
+        checks = decision_checks(
+            {"most_played_poker_hand": "Pair", "blind_choices": {"Boss": {"name": "The Ox", "key": "bl_ox"}}},
+            {"name": "The Ox", "key": "bl_ox", "boss": True, "effect": "Disable played hand"},
+            areas,
+            actions,
+        )
+        self.assertTrue(checks["consumables"]["required"])
+        self.assertEqual(checks["consumables"]["owned"][0]["legal_actions"][0]["action_id"], "use:venus")
+        self.assertEqual(checks["ordering"]["move_joker_actions"][0]["action_id"], "move:joker")
+        self.assertTrue(checks["boss_debuff"]["required"])
+        self.assertEqual(checks["boss_debuff"]["reroll_actions"][0]["action_id"], "reroll:boss")
 
     def test_replay_reconstructs_same_current_state(self) -> None:
         obs = observation("SHOP")
