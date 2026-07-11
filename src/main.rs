@@ -802,7 +802,20 @@ impl Server {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo { capabilities: ServerCapabilities::builder().enable_tools().enable_resources().build(), server_info: Implementation { name: "balatro".into(), title: Some("Balatro safe gameplay MCP".into()), version: env!("CARGO_PKG_VERSION").into(), description: Some("Rust stdio boundary for safe Balatro gameplay.".into()), icons: None, website_url: None }, instructions: Some("Use only these MCP tools for Balatro. Start with game_status, then get_decision; execute only legal action_id with its decision_id.".into()), ..Default::default() }
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(
+            Implementation::new("balatro", env!("CARGO_PKG_VERSION"))
+                .with_title("Balatro safe gameplay MCP")
+                .with_description("Rust stdio boundary for safe Balatro gameplay."),
+        )
+        .with_instructions(
+            "Use only these MCP tools for Balatro. Start with game_status, then get_decision; execute only legal action_id with its decision_id.",
+        )
     }
     fn list_resources(
         &self,
@@ -836,9 +849,7 @@ impl ServerHandler for Server {
             .strip_prefix("balatro://guide/")
             .unwrap_or("core");
         let result = guide(topic)
-            .map(|text| ReadResourceResult {
-                contents: vec![ResourceContents::text(text, request.uri)],
-            })
+            .map(|text| ReadResourceResult::new(vec![ResourceContents::text(text, request.uri)]))
             .ok_or_else(|| rmcp::ErrorData::invalid_params("unknown guide topic", None));
         std::future::ready(result)
     }
