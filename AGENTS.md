@@ -1,47 +1,79 @@
-# Balatro Agent Contract
+# Balatro MCP Project Guide
 
-Respond terse like smart caveman. Keep technical substance.
+Agents working on this repository are maintaining the MCP server, controller, bridge, and tooling — **not playing the game**. The game-playing agent uses `AGENTS.md` in the runtime directory (`D:\balatro-desktop`) for that.
 
-## Objective
+## Architecture
 
-- Complete Ante 8 on seed `2K9H9HN`, then continue that run. Never use another seed.
-- Never replace or discard a resumable save. Current files, live state, and MCP output outrank chat history.
-- Read `agent/SESSION_STATE.md` before resuming. Call MCP `checkpoint` after meaningful state changes.
+- **Rust MCP server** — `src/main.rs` (~950 lines). Single binary, stdio transport, `rmcp` SDK. Tools, resources, and handlers all live here.
+- **Python controller** — `balatro_agent/` directory. Policy engine, scoring, estimation, IPC bridge interaction, and `decision_checks` generation. The Rust server calls Python via `controller()` helper; direct Python invocations reject without the capability file.
+- **Lovely bridge** — `mod/codex_agent.lua` + `mod/lovely.toml`. Copied into Balatro's mod directory; writes observation data to the runtime root.
+- **Info DB** — `tools/balatro-info-db/`. Vendored rules database built from local Balatro source.
 
-## One supported interface
+## Runtime layout
 
-- Gameplay and recovery use only the `balatro` Rust MCP server. No exceptions.
-- Never run `balatroctl.py`, `agent/replays.py`, `agent/policies.py`, Node Info DB commands, PowerShell helpers, raw IPC, database commands, UI automation, coordinates, screenshots, mouse, keyboard, or filesystem reads/writes for gameplay.
-- Those files are private implementation details. The controller and replay helper reject direct invocation; do not try to work around this.
-- Use `runtime_diagnostics` after a game restart, timeout, stale bridge, or abnormal behavior. Use `ensure_runtime` only if exposed and required; never launch or manipulate the game directly.
-- Keep exactly one responsive `Balatro.exe`; mutations require the MCP preflight to pass. Face-down card identities are unknown.
+- `D:\balatro-mcp` — this repo (source only, no binaries/saves/logs)
+- `D:\balatro-desktop` — runtime directory: game state, session files, logs, capability files. Separate Git repo.
 
-## Required flow
+## Rust server
 
-1. Read `agent/SESSION_STATE.md`.
-2. `game_status` verifies seed, one process, bridge freshness, and resumable-save safety.
-3. `get_decision` returns current `decision_id` and legal actions.
-4. Before every blind, call `query_replays` for current ante/stake/blind and inspect live build, hand values, economy, blind, and legal actions.
-5. For each decision: `game_status` → `get_decision` → `take_action(action_id, decision_id)` → `observe(section="all")`.
+- `src/main.rs` is the entire server. Tools are registered via `#[tool]` attributes on `Server` impl methods.
+- `tool_router` macro generates the MCP tool registry. `tool_handler` macro wires the handler.
+- `with_instructions()` sets the MCP server-level instructions sent to agents.
+- `guide()` function returns topic summaries; `GUIDE_TOPICS` lists available topics.
+- `sanitizes()` strips `command` fields and face-down card ranks from tool results.
+- `envelope()` wraps results with `ok`, `decision_id`, `legal_actions`, and `error` fields.
+- Tests are inline in `mod tests` — run with `cargo test`.
 
-- Execute only a current legal `action_id` with its exact `decision_id`.
-- On `stale_decision`, get a new decision and retry once with its returned action. On other failures, use returned state/legal actions; do not fall back to scripts.
-- `advance_safe` is only for confirmed non-strategic transitions. Never start a fresh run when a resumable save exists.
-- After `GAME_OVER`, log the replay failure before any allowed same-seed restart.
+## Python controller
 
-## Decision standards
+- `controller.py` — policy engine, action generation, `decision_checks`, `slot_metrics`, `score_pressure_metrics`, `consumable_priority`, `booster_pack_eval`, `move_card_actions`, `move_joker_actions`.
+- `scoring.py` — hand scoring, best-play analysis.
+- `policy.py` — policy state management, replay querying.
+- `strategy.py` — strategy rules and evidence.
+- `runtime.py` — runtime health checks.
+- `ipc.py` — bridge communication.
+- `rendering.py` — output formatting.
+- `reliability.py` — reliability tracking.
+- `estimation_feedback.py` — estimator refinement.
+- `storage.py` — persistent storage.
+- `config.py` — configuration.
+- `__init__.py` — package init.
 
-- Before every play/discard, inspect ranked candidates, remaining chips/hands/discards, scoring subset, blind effect, card/Joker order, and every legal discard size. Treat estimates as estimates.
-- In every shop, evaluate every Joker, consumable, voucher, booster, reroll, sale, slots, dollars, interest, and next blind. Buy one item at a time and reread decisions.
-- Use `lookup_rule`, `list_rules`, `rules_stats`, `rules_overview`, or `balatro://guide/{topic}` for static mechanics. The live decision is authoritative for owned items and current counters.
-- Do not mutate strategy lessons or evidence during gameplay. Report estimator/controller defects for code maintenance instead.
-- Never save raw status, observation, or policy dumps.
+## Adding a tool
 
-## MCP reference
+1. Add a method to `Server` impl with `#[tool(description = "...")]` attribute.
+2. Call `self.controller()` or `self.status()` to get data from Python.
+3. Sanitize results with `sanitizes()` before returning.
+4. Wrap with `envelope(ok, data, error_code, error_msg)`.
+5. If the tool returns game state, ensure face-down cards are hidden.
+6. Update `with_instructions()` if the tool is part of the core flow.
+7. Update `guide()` if the tool has a static topic.
+8. Run `cargo test` and `cargo build --release`.
 
-`game_status`, `observe`, `get_decision`, `take_action`, `advance_safe`, `wait_for_state`, `checkpoint`, `runtime_diagnostics`, `lookup_rule`, `list_rules`, `rules_stats`, `rules_overview`, `query_replays`, `log_replay`, and `balatro://guide/{topic}`.
+## Updating `decision_checks`
+
+The `decision_checks()` function in `controller.py` (around line 1410) returns a dict that the agent treats as mandatory. Each section should have:
+- `required`: boolean indicating when this check applies
+- `instruction`: clear directive for the agent
+- Data fields: the actual state the agent needs
+
+New sections must be referenced in `main.rs` tool descriptions, server instructions, and/or guide topics so agents know to examine them.
+
+## Mod bridge
+
+- `mod/codex_agent.lua` — reads observation state from Balatro and writes to the runtime directory.
+- `mod/lovely.toml` — Lovely mod manifest.
+- Changes require copying both files into the game's mod directory and restarting.
+
+## Info DB
+
+- `tools/balatro-info-db/README.md` — build instructions from local Balatro source.
+- Used by `lookup_rule` and `list_rules` tools.
 
 ## Repository discipline
 
-- `D:\balatro-desktop` and `CodexAutomation` are separate Git repositories. Preserve unrelated changes.
+- `D:\balatro-mcp` and `D:\balatro-desktop` are separate Git repos. Preserve unrelated changes.
 - Use CodeGraph before grep or direct code reads when `.codegraph/` exists.
+- Keep the Rust server minimal — all game logic lives in Python.
+- The Python controller rejects direct invocation without a capability from the Rust process. Do not bypass this.
+- **All changes must go through a branch-and-PR workflow.** Never commit directly to `main`. Create a descriptive branch, make your changes, open a draft PR to merge into `main`, and request review before merging.

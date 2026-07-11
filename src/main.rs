@@ -521,7 +521,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Return current decision_id, legal actions, rankings, and strategy analysis."
+        description = "Return current decision_id, legal actions, rankings, and strategy analysis. Examine decision_checks.ordering.hand_order and decision_checks.ordering.joker_order when jokers are present and trigger sequence can affect scoring. Examine decision_checks.consumables when Tarot/Planet/Spectral cards are owned or available in shop; use or sell before exiting or advancing. Examine decision_checks.shop when in SHOP state to track remaining items and indexes after each purchase. Examine decision_checks.slots to verify available joker and consumable slots before buying."
     )]
     async fn get_decision(
         &self,
@@ -839,7 +839,7 @@ impl ServerHandler for Server {
                 .with_description("Rust stdio boundary for safe Balatro gameplay."),
         )
         .with_instructions(
-            "Use only these MCP tools for Balatro. Start with game_status, then get_decision; execute only legal action_id with its decision_id.",
+            "Use only these MCP tools for Balatro. Start with game_status, then get_decision; examine decision_checks.ordering when jokers are present; examine decision_checks.consumables for owned or shop Tarot/Planet/Spectral; examine decision_checks.shop and decision_checks.slots during SHOP state; execute only legal action_id with its decision_id.",
         )
     }
     fn list_resources(
@@ -917,7 +917,7 @@ const GUIDE_TOPICS: &[&str] = &[
 fn guide(topic: &str) -> Option<&'static str> {
     match topic.to_ascii_lowercase().as_str() {
         "core" | "rules" | "ante8" => Some(
-            "Goal: clear Small, Big, and Boss blinds through Ante 8. Agent loop: game_status; query matching replays before each blind; get_decision; lookup unknown effects; take one legal action with current decision_id; observe the new state. Never infer face-down cards.",
+            "Goal: clear Small, Big, and Boss blinds through Ante 8. Agent loop: game_status; query matching replays before each blind; get_decision; examine decision_checks.ordering when jokers are present; examine decision_checks.consumables for owned or shop Tarot/Planet/Spectral; examine decision_checks.shop and decision_checks.slots during SHOP state; lookup unknown effects; take one legal action with current decision_id; observe the new state. Never infer face-down cards.",
         ),
         "hands" | "scoring" => Some(
             "Poker hands score Chips multiplied by Mult. Planet consumables level a named hand. Use live hand_values; controller scores are estimates unless explicitly exact.",
