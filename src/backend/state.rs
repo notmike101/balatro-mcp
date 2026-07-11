@@ -186,6 +186,7 @@ impl StateDB {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use tempfile::tempdir;
@@ -243,5 +244,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.events(500).unwrap()[0]["payload"], Value::Null);
+    }
+
+    #[test]
+    fn database_open_errors_are_returned_by_every_workflow() {
+        let dir = tempdir().unwrap();
+        let bad = dir.path().join("agent/rust_state.db");
+        std::fs::create_dir_all(&bad).unwrap();
+        let db = StateDB::new(dir.path());
+        assert!(db.checkpoint(&json!({}), "x").is_err());
+        assert!(db.current_run().is_err());
+        assert!(db.events(1).is_err());
+        assert!(db.add_rule("x", "x", &json!({}), "x", false).is_err());
+        assert!(db.strategy().is_err());
+        assert!(db.record_evidence("x", "x", "x", "x").is_err());
+        assert!(db.add_lesson("x", "x", "x", 0.5).is_err());
+        assert!(db.record_estimate("x", 1, 2, &json!({})).is_err());
+        assert!(db.estimation_report().is_err());
+
+        let parent_file = dir.path().join("parent-file");
+        std::fs::write(&parent_file, b"not a directory").unwrap();
+        let db = StateDB::new(&parent_file);
+        assert!(db.current_run().is_err());
     }
 }

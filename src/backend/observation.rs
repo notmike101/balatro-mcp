@@ -102,6 +102,7 @@ fn compact_hand_values(data: &Value) -> Value {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use serde_json::json;

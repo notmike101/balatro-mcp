@@ -594,6 +594,7 @@ fn build_decision_checks(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -668,6 +669,20 @@ mod tests {
             60,
         );
         assert_eq!(menu["legal_actions"][0]["action"], "ui_click");
+        let menu_saved = build_policy_state(
+            &json!({"game":{"state":"MENU"},"ready":{"saved_game_present":true}}),
+            40,
+            40,
+            60,
+        );
+        assert_eq!(menu_saved["legal_actions"][0]["action"], "resume_run");
+        let menu_without_ready = build_policy_state(&json!({"game":{"state":"MENU"}}), 40, 40, 60);
+        assert!(
+            menu_without_ready["legal_actions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         let mut shop_observation = observation("SHOP");
         shop_observation["run"]["consumable_slots"] = json!(2);
         shop_observation["areas"]["shop"] = json!([{"name":"Planet"}]);
@@ -678,6 +693,43 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|a| a["action"] == "buy_card")
+        );
+        shop_observation["run"]["joker_slots"] = json!(5);
+        let shop_blinds = build_policy_state(&shop_observation, 40, 40, 60);
+        assert!(
+            shop_blinds["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["ui_id"] == "blind_select_small")
+        );
+        assert!(
+            shop_blinds["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["ui_id"] == "blind_select_big")
+        );
+        let mut blind_without_choices = observation("BLIND_SELECT");
+        blind_without_choices["run"]["blind_choices"] = Value::Null;
+        assert!(
+            build_policy_state(&blind_without_choices, 0, 0, 1)["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["action"] != "select_blind")
+        );
+        let no_ids = json!({
+            "game":{"state":"SELECTING_HAND"},
+            "run":{"hands_left":1,"discards_left":1},
+            "areas":{"hand":[{"base":{"rank":"A"}},{"base":{"rank":"K"}}]}
+        });
+        assert!(
+            build_policy_state(&no_ids, 40, 40, 60)["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["action"] != "play" && a["action"] != "discard")
         );
         let empty = build_policy_state(&json!({}), 0, 0, 0);
         assert_eq!(empty["game"]["state"], "");
@@ -744,6 +796,75 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|a| a["action"] == "safe_transition")
+        );
+    }
+
+    #[test]
+    fn best_hand_classifier_covers_rank_suit_and_fallback_branches() {
+        let cases: Vec<(Vec<(&str, i64)>, Vec<(&str, i64)>, &str)> = vec![
+            (vec![("A", 5)], vec![], "Five of a Kind"),
+            (vec![("A", 4)], vec![("H", 4)], "Flush Five"),
+            (vec![("A", 4)], vec![], "Four of a Kind"),
+            (vec![("A", 3), ("K", 2)], vec![], "Full House"),
+            (vec![("A", 3), ("K", 1)], vec![], "Three of a Kind"),
+            (vec![("A", 2), ("K", 2)], vec![], "Two Pair"),
+            (vec![("A", 2)], vec![], "Pair"),
+            (vec![("A", 1)], vec![("H", 5)], "Flush"),
+            (
+                vec![("A", 1), ("K", 1), ("Q", 1), ("J", 1), ("T", 1)],
+                vec![],
+                "Straight",
+            ),
+            (
+                vec![("A", 1), ("K", 1), ("Q", 1), ("J", 1)],
+                vec![],
+                "Straight",
+            ),
+            (vec![("A", 1), ("K", 1), ("Q", 1)], vec![("H", 3)], "Flush"),
+            (vec![("A", 1)], vec![], "High Card"),
+        ];
+        for (counts, suits, expected) in cases {
+            let counts = counts.into_iter().collect();
+            let suits = suits.into_iter().collect();
+            assert_eq!(determine_best_hand(&counts, &suits), expected);
+        }
+        assert_eq!(estimate_best_play(&json!({"areas":{"hand":[]}})), 5);
+        assert_eq!(estimate_best_play_raw(&[], &json!({})), 5);
+    }
+
+    #[test]
+    fn policy_state_covers_economy_joker_hints_shop_edges_and_limits() {
+        let mut obs = observation("SHOP");
+        obs["run"]["dollars"] = json!(30);
+        obs["run"]["reroll_cost"] = json!(2);
+        obs["run"]["joker_slots"] = json!(5);
+        obs["run"]["consumable_slots"] = json!(2);
+        obs["areas"]["jokers"] = json!([
+            {"ability":{"dollars":1}}, {"ability":{"chips":2}},
+            {"ability":{"mult":3}}, {"ability":{"x_mult":1.5}}
+        ]);
+        obs["areas"]["consumables"] = json!([]);
+        obs["areas"]["shop"] = json!([{"name":"Joker"}]);
+        let state = build_policy_state(&obs, 1, 1, 1);
+        assert_eq!(state["economy"]["current_interest"], 5);
+        assert!(state["joker_order_hint"].as_array().unwrap().len() >= 4);
+        assert!(
+            state["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action["action"] == "reroll")
+        );
+
+        let mut blind = observation("BLIND_SELECT");
+        blind["run"]["blind_choices"] = json!({"Small":{"state":"Skip"},"Big":{"state":"Select"}});
+        let actions = build_policy_state(&blind, 0, 0, 1)["legal_actions"].clone();
+        assert!(
+            actions
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["blind"] == "Big")
         );
     }
 }

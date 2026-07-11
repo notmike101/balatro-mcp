@@ -294,6 +294,7 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -442,5 +443,29 @@ mod tests {
                 .iter()
                 .any(|x| x.contains("missing poker_hands"))
         );
+    }
+
+    #[test]
+    fn all_card_modifier_families_are_explicitly_handled() {
+        for edition in ["Holographic", "Holo", "Negative", "Mystery"] {
+            for enhancement in ["Mult", "Steel", "Wild", "Stone", "Gold", "Lucky", "Mystery"] {
+                let observation = json!({
+                    "areas":{"hand":[{"base":{"rank":"A","suit":"H"},"edition":edition,"enhancement":enhancement}]},
+                    "poker_hands":{"values":{"High Card":{"chips":10,"mult":2}}}
+                });
+                let result = score_hand(&observation, None);
+                assert_eq!(result.hand_name, "High Card");
+                if edition == "Mystery" || enhancement == "Mystery" {
+                    assert!(result.exact_score.is_none());
+                }
+            }
+        }
+        let four = vec![
+            card("A", "H"),
+            card("A", "S"),
+            card("A", "D"),
+            card("A", "C"),
+        ];
+        assert_eq!(classify_hand(&four), "Four of a Kind");
     }
 }

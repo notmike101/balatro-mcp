@@ -202,6 +202,7 @@ pub fn guard_command(command: &Value, observation: &Value) -> Result<(), SafetyE
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use serde_json::json;

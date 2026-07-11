@@ -212,6 +212,7 @@ pub fn advance_safe_with_discovery(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use serde_json::json;
     use tempfile::tempdir;
@@ -302,5 +303,6 @@ mod tests {
         assert!(super::checkpoint_internal(&ipc, "manual").is_ok());
         std::fs::write(&ipc.response_path, r#"{"id":"first","ok":true}"#).unwrap();
         assert!(super::advance_safe_with_discovery(&ipc, &["first", "second"], 1).is_ok());
+        assert!(super::advance_safe_with_discovery(&ipc, &[], 1).is_err());
     }
 }

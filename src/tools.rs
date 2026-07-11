@@ -74,6 +74,16 @@ fn observation_id_for(observation: &Value) -> String {
     digest("o3", observation)
 }
 
+fn action_error_code(error: &str) -> &'static str {
+    if error.contains("stale") {
+        "stale_decision"
+    } else if error.contains("timeout") {
+        "timeout"
+    } else {
+        "action_failed"
+    }
+}
+
 fn active_directives(rules: &Value, observation: &Value) -> Value {
     let values = rules
         .get("rules")
@@ -110,6 +120,7 @@ pub struct Server {
     pub mutations: Arc<Mutex<()>>,
     pub replay_db: Arc<Mutex<ReplayDB>>,
     pub state_db: Arc<Mutex<StateDB>>,
+    pub(crate) process_override: Arc<Mutex<Option<Vec<Value>>>>,
     pub tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
 }
 
@@ -128,6 +139,7 @@ impl Server {
             mutations: Arc::new(Mutex::new(())),
             replay_db,
             state_db,
+            process_override: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
         })
     }
@@ -149,28 +161,34 @@ impl Server {
             .await
             .strategy()
             .unwrap_or_else(|_| json!({"rules":[]}));
-        if let Some(object) = state.as_object_mut() {
-            object.insert("schema".into(), json!("balatro-mcp/policy/v3"));
-            object.insert("decision_id".into(), json!(decision_id));
-            object.insert("observation_id".into(), json!(observation_id));
-            object.insert(
-                "active_directives".into(),
-                active_directives(&directives, &observation),
-            );
-            object.insert("score_analysis".into(), score.clone());
-            object.insert(
-                "estimate_quality".into(),
-                score
-                    .get("estimate_quality")
-                    .cloned()
-                    .unwrap_or_else(|| json!("partial")),
-            );
-        }
+        let object = state
+            .as_object_mut()
+            .expect("policy state must be an object");
+        object.insert("schema".into(), json!("balatro-mcp/policy/v3"));
+        object.insert("decision_id".into(), json!(decision_id));
+        object.insert("observation_id".into(), json!(observation_id));
+        object.insert(
+            "active_directives".into(),
+            active_directives(&directives, &observation),
+        );
+        object.insert("score_analysis".into(), score.clone());
+        object.insert(
+            "estimate_quality".into(),
+            score
+                .get("estimate_quality")
+                .cloned()
+                .unwrap_or_else(|| json!("partial")),
+        );
         Ok(state)
     }
 
     async fn status(&self) -> Result<Value, String> {
-        let processes = balatro_processes().unwrap_or_default();
+        let processes = self
+            .process_override
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| balatro_processes().unwrap_or_default());
         let observation = self.read_observation();
         let obs_path = self.runtime_root.join("Balatro/codex_observation.json");
         let age = observation_age(&obs_path);
@@ -530,13 +548,7 @@ impl Server {
             Ok(data) => to_tool_result(envelope(true, data, "", "")),
             Err(error) => {
                 let current = self.policy(40).await.unwrap_or(Value::Null);
-                let code = if error.contains("stale") {
-                    "stale_decision"
-                } else if error.contains("timeout") {
-                    "timeout"
-                } else {
-                    "action_failed"
-                };
+                let code = action_error_code(&error);
                 to_tool_result(envelope(false, current, code, &error))
             }
         }
@@ -1156,45 +1168,52 @@ impl rmcp::ServerHandler for Server {
             "Use only these MCP tools for Balatro. Start with game_status, then get_decision; examine decision_checks.ordering when jokers are present; examine decision_checks.consumables for owned or shop Tarot/Planet/Spectral; examine decision_checks.shop and decision_checks.slots during SHOP state; execute only legal action_id with its decision_id.",
         )
     }
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn list_resources(
         &self,
         _: Option<rmcp::model::PaginatedRequestParams>,
         _: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, rmcp::ErrorData>> + Send + '_
     {
-        let mut resources = vec![rmcp::model::Annotated::new(
-            rmcp::model::RawResource::new("balatro://guide", "Balatro guides"),
-            None,
-        )];
-        for topic in GUIDE_TOPICS {
-            resources.push(rmcp::model::Annotated::new(
-                rmcp::model::RawResource::new(
-                    format!("balatro://guide/{topic}"),
-                    format!("Balatro guide: {topic}"),
-                ),
-                None,
-            ));
-        }
-        std::future::ready(Ok(ListResourcesResult::with_all_items(resources)))
+        std::future::ready(Ok(guide_resources()))
     }
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> impl std::future::Future<Output = Result<ReadResourceResult, rmcp::ErrorData>> + Send + '_
     {
-        let topic = request
-            .uri
-            .strip_prefix("balatro://guide/")
-            .unwrap_or("core");
-        let result = guide(topic)
-            .map(|text| ReadResourceResult::new(vec![ResourceContents::text(text, request.uri)]))
-            .ok_or_else(|| rmcp::ErrorData::invalid_params("unknown guide topic", None));
-        std::future::ready(result)
+        std::future::ready(read_guide_resource(request.uri))
     }
 }
 
+fn guide_resources() -> ListResourcesResult {
+    let mut resources = vec![rmcp::model::Annotated::new(
+        rmcp::model::RawResource::new("balatro://guide", "Balatro guides"),
+        None,
+    )];
+    for topic in GUIDE_TOPICS {
+        resources.push(rmcp::model::Annotated::new(
+            rmcp::model::RawResource::new(
+                format!("balatro://guide/{topic}"),
+                format!("Balatro guide: {topic}"),
+            ),
+            None,
+        ));
+    }
+    ListResourcesResult::with_all_items(resources)
+}
+
+fn read_guide_resource(uri: String) -> Result<ReadResourceResult, rmcp::ErrorData> {
+    let topic = uri.strip_prefix("balatro://guide/").unwrap_or("core");
+    guide(topic)
+        .map(|text| ReadResourceResult::new(vec![ResourceContents::text(text, uri)]))
+        .ok_or_else(|| rmcp::ErrorData::invalid_params("unknown guide topic", None))
+}
+
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use tempfile::tempdir;
@@ -1208,6 +1227,18 @@ mod tests {
     #[tokio::test]
     async fn route_validation_errors_are_structured() {
         let (_dir, server) = server();
+        assert!(
+            server
+                .strategy_add_rule(Parameters(StrategyRuleParams {
+                    id: String::new(),
+                    kind: "bad".into(),
+                    conditions: json!({}),
+                    directive: String::new(),
+                    absolute: false
+                }))
+                .await
+                .is_ok()
+        );
         assert!(
             server
                 .observe(Parameters(ObserveParams {
@@ -1301,6 +1332,41 @@ mod tests {
                     .is_ok()
             );
         }
+        let step = (0..14)
+            .map(|i| format!("field{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sparse_step = vec![
+            "action", "details", "", "", "", "", "", "", "", "", "", "", "", "",
+        ]
+        .join(",");
+        assert!(
+            server
+                .log_replay(Parameters(ReplayLogParams {
+                    outcome: "clear".into(),
+                    ante: 2,
+                    stake: 1,
+                    blind_key: "Boss".into(),
+                    jokers: vec!["Joker,Foil,Bonus".into(), "Joker,,".into()],
+                    steps: vec![step, sparse_step],
+                    dollars_start: Some(10),
+                    dollars_end: Some(20),
+                    notes: "full fixture".into(),
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .query_replays(Parameters(ReplayQueryParams {
+                    ante: 2,
+                    stake: 1,
+                    blind: "Boss".into(),
+                    outcome: "clear".into(),
+                }))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -1313,6 +1379,23 @@ mod tests {
                 .get_decision(Parameters(DecisionParams {
                     action_type: String::new(),
                     limit: 1
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .get_decision(Parameters(DecisionParams {
+                    action_type: "play".into(),
+                    limit: 10
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .observe(Parameters(ObserveParams {
+                    section: "summary".into()
                 }))
                 .await
                 .is_ok()
@@ -1361,6 +1444,14 @@ mod tests {
             server
                 .score_hand(Parameters(ScoreParams {
                     card_indices: vec![]
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .score_hand(Parameters(ScoreParams {
+                    card_indices: vec![0]
                 }))
                 .await
                 .is_ok()
@@ -1424,6 +1515,15 @@ mod tests {
         );
         assert!(
             server
+                .run_state(Parameters(StateParams {
+                    kind: "read".into(),
+                    limit: 10
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
                 .event_history(Parameters(StateParams {
                     kind: "events".into(),
                     limit: 10
@@ -1431,6 +1531,371 @@ mod tests {
                 .await
                 .is_ok()
         );
+        assert!(
+            server
+                .event_history(Parameters(StateParams {
+                    kind: "events".into(),
+                    limit: 10
+                }))
+                .await
+                .is_ok()
+        );
+    }
+
+    fn write_fixture(server: &Server) {
+        let observation = json!({
+            "state": "PLAY",
+            "round": {"seed": SEED},
+            "ready": {},
+            "bridge": {"loaded": true, "version": "0.6.0", "session_id": "test"},
+            "areas": {"hand": [
+                {"base": {"rank": "A", "suit": "H"}, "suits": [{"key": "H"}]},
+                {"base": {"rank": "K", "suit": "D"}, "suits": [{"key": "D"}]}
+            ]},
+            "poker_hands": {"values": {"High Card": {"chips": 10, "mult": 2}}}
+        });
+        std::fs::write(
+            &server.ipc.observation_path,
+            serde_json::to_vec(&observation).unwrap(),
+        )
+        .unwrap();
+        let age_path = server.runtime_root.join("Balatro/codex_observation.json");
+        std::fs::create_dir_all(age_path.parent().unwrap()).unwrap();
+        std::fs::write(age_path, b"{}").unwrap();
+    }
+
+    #[tokio::test]
+    async fn deterministic_observation_and_ipc_route_success_paths() {
+        let (_dir, server) = server();
+        write_fixture(&server);
+        assert!(
+            server
+                .observe(Parameters(ObserveParams {
+                    section: "all".into()
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .get_decision(Parameters(DecisionParams {
+                    action_type: String::new(),
+                    limit: 10
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .score_hand(Parameters(ScoreParams {
+                    card_indices: vec![]
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(server.hand_values().await.is_ok());
+        assert!(
+            server
+                .wait_for_state(Parameters(WaitParams {
+                    state: "PLAY".into(),
+                    timeout: 0.1
+                }))
+                .await
+                .is_ok()
+        );
+
+        std::fs::write(
+            &server.ipc.response_path,
+            r#"{"id":"checkpoint","ok":true}"#,
+        )
+        .unwrap();
+        assert!(
+            server
+                .checkpoint(Parameters(CheckpointParams {
+                    kind: "test".into()
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .run_state(Parameters(StateParams {
+                    kind: "checkpoint".into(),
+                    limit: 10
+                }))
+                .await
+                .is_ok()
+        );
+
+        *server.process_override.lock().await = Some(vec![json!({
+            "pid": 1234,
+            "name": "Balatro.exe"
+        })]);
+        assert!(server.game_status().await.is_ok());
+        assert!(server.ensure_runtime().await.is_ok());
+        std::fs::write(
+            &server.ipc.response_path,
+            r#"{"id":"policy_step","ok":true}"#,
+        )
+        .unwrap();
+        let observation: Value =
+            serde_json::from_slice(&std::fs::read(&server.ipc.observation_path).unwrap()).unwrap();
+        let decision = decision_id_for(&observation);
+        assert!(
+            server
+                .take_action(Parameters(ActionParams {
+                    action_id: "play".into(),
+                    decision_id: "stale".into(),
+                    settle_timeout: 1.0
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .take_action(Parameters(ActionParams {
+                    action_id: "play".into(),
+                    decision_id: decision.clone(),
+                    settle_timeout: 1.0
+                }))
+                .await
+                .is_ok()
+        );
+        std::fs::write(
+            &server.ipc.response_path,
+            r#"{"id":"safe_transition","ok":true}"#,
+        )
+        .unwrap();
+        assert!(
+            server
+                .advance_safe(Parameters(AdvanceParams { max_steps: 1 }))
+                .await
+                .is_ok()
+        );
+        let mut broken = server.clone();
+        broken.ipc.command_path = std::path::PathBuf::from("Z:\\missing\\command.lua");
+        assert!(
+            broken
+                .take_action(Parameters(ActionParams {
+                    action_id: "play".into(),
+                    decision_id: decision,
+                    settle_timeout: 1.0
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            broken
+                .advance_safe(Parameters(AdvanceParams { max_steps: 1 }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            broken
+                .checkpoint(Parameters(CheckpointParams {
+                    kind: "broken".into()
+                }))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn info_db_routes_cover_json_success_and_backend_failures() {
+        let (dir, server) = server();
+        let script = dir.path().join("tools/balatro-info-db/bin/balatro-info.js");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(
+            &script,
+            "console.log(JSON.stringify({ok:true, args:process.argv.slice(2)}));",
+        )
+        .unwrap();
+        assert!(
+            server
+                .lookup_rule(Parameters(LookupParams {
+                    entity_type: "joker".into(),
+                    name: "Joker".into(),
+                    suit: "H".into(),
+                    edition: "Foil".into(),
+                    enhancement: "Bonus".into(),
+                    seal: "Red".into(),
+                    stickers: vec!["eternal".into()]
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .list_rules(Parameters(ListParams {
+                    entity_type: "joker".into()
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(server.rules_stats().await.is_ok());
+        std::fs::write(&script, "console.error('backend failed'); process.exit(2);").unwrap();
+        assert!(server.rules_stats().await.is_ok());
+        assert!(
+            server
+                .lookup_rule(Parameters(LookupParams {
+                    entity_type: "joker".into(),
+                    name: "Joker".into(),
+                    suit: String::new(),
+                    edition: String::new(),
+                    enhancement: String::new(),
+                    seal: String::new(),
+                    stickers: vec![]
+                }))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn external_runner_covers_non_json_launch_and_timeout_errors() {
+        let (dir, server) = server();
+        let script = dir.path().join("tools/balatro-info-db/bin/balatro-info.js");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "console.log('not-json');").unwrap();
+        let error = server.node(&["stats".into()]).await.unwrap_err();
+        assert!(error.contains("non-JSON"));
+        let error = server
+            .run_external_json("definitely-not-a-real-program", &[], 0.1)
+            .await
+            .unwrap_err();
+        assert!(error.contains("launch failed"));
+        std::fs::write(&script, "setTimeout(() => console.log('{}'), 1000);").unwrap();
+        let error = server
+            .run_external_json("node", &[script.display().to_string()], 0.1)
+            .await
+            .unwrap_err();
+        assert!(error.contains("timeout"));
+    }
+
+    #[tokio::test]
+    async fn state_and_replay_route_failures_are_structured() {
+        let (dir, server) = server();
+        let bad_state_root = dir.path().join("bad-state");
+        std::fs::create_dir_all(bad_state_root.join("agent/rust_state.db")).unwrap();
+        *server.state_db.lock().await = StateDB::new(&bad_state_root);
+        assert!(server.strategy_state().await.is_ok());
+        assert!(
+            server
+                .strategy_add_rule(Parameters(StrategyRuleParams {
+                    id: "bad".into(),
+                    kind: "x".into(),
+                    conditions: json!({}),
+                    directive: "x".into(),
+                    absolute: false
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .lesson_add(Parameters(LessonParams {
+                    category: "x".into(),
+                    lesson: "x".into(),
+                    source: "x".into(),
+                    confidence: 0.5
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .estimation_record(Parameters(EstimateParams {
+                    hand_type: "x".into(),
+                    estimated: 1,
+                    actual: 2,
+                    context: json!({})
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(server.estimation_report().await.is_ok());
+        assert!(
+            server
+                .run_state(Parameters(StateParams {
+                    kind: "read".into(),
+                    limit: 1
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .event_history(Parameters(StateParams {
+                    kind: "events".into(),
+                    limit: 1
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .strategy_record_evidence(Parameters(StrategyEvidenceParams {
+                    rule_id: "bad".into(),
+                    outcome: "failure".into(),
+                    event_id: "x".into(),
+                    note: "x".into()
+                }))
+                .await
+                .is_ok()
+        );
+
+        let bad_replay_root = dir.path().join("bad-replay");
+        std::fs::create_dir_all(bad_replay_root.join("agent/replays.db")).unwrap();
+        *server.replay_db.lock().await = ReplayDB::new(&bad_replay_root);
+        assert!(
+            server
+                .query_replays(Parameters(ReplayQueryParams {
+                    ante: 1,
+                    stake: 1,
+                    blind: String::new(),
+                    outcome: "other".into()
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .log_replay(Parameters(ReplayLogParams {
+                    outcome: "fail".into(),
+                    ante: 1,
+                    stake: 1,
+                    blind_key: "x".into(),
+                    jokers: vec![],
+                    steps: vec![],
+                    dollars_start: None,
+                    dollars_end: None,
+                    notes: String::new()
+                }))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn directive_filtering_and_diagnostics_are_safe() {
+        let (_dir, server) = server();
+        let rules = json!({"rules":[
+            {"id":"active","active":true,"conditions":{"/state":"PLAY"}},
+            {"id":"inactive","active":false,"conditions":{}},
+            {"id":"unconditional","conditions":{}}
+        ]});
+        let result = active_directives(&rules, &json!({"state":"PLAY"}));
+        assert_eq!(result.as_array().unwrap().len(), 2);
+        assert!(server.diagnostic(0).get("log_found").is_some());
+    }
+
+    #[test]
+    fn resource_helpers_cover_root_known_and_unknown_topics() {
+        let resources = guide_resources();
+        assert!(resources.resources.len() > GUIDE_TOPICS.len());
+        assert!(read_guide_resource("balatro://guide/core".into()).is_ok());
+        assert!(read_guide_resource("balatro://guide/does-not-exist".into()).is_err());
+        assert!(read_guide_resource("balatro://guide".into()).is_ok());
     }
 
     #[test]
@@ -1441,6 +1906,73 @@ mod tests {
         assert_ne!(
             decision_id_for(&first),
             decision_id_for(&json!({"b":2,"a":[true]}))
+        );
+        assert_eq!(canonical_json(&Value::Null), "null");
+        assert_eq!(canonical_json(&json!(42)), "42");
+        assert_eq!(canonical_json(&json!("text")), "\"text\"");
+        assert_eq!(action_error_code("stale decision"), "stale_decision");
+        assert_eq!(action_error_code("bridge timeout"), "timeout");
+        assert_eq!(action_error_code("cannot write"), "action_failed");
+    }
+
+    #[tokio::test]
+    async fn runtime_status_and_preflight_failure_branches_are_exercised() {
+        let (_dir, server) = server();
+        *server.process_override.lock().await = Some(vec![]);
+        assert!(server.game_status().await.is_ok());
+        assert!(
+            server
+                .take_action(Parameters(ActionParams {
+                    action_id: "x".into(),
+                    decision_id: "d".into(),
+                    settle_timeout: 1.0
+                }))
+                .await
+                .is_ok()
+        );
+
+        *server.process_override.lock().await = Some(vec![json!({"pid": 1}), json!({"pid": 2})]);
+        assert!(server.ensure_runtime().await.is_ok());
+
+        write_fixture(&server);
+        let mut wrong =
+            serde_json::from_slice::<Value>(&std::fs::read(&server.ipc.observation_path).unwrap())
+                .unwrap();
+        wrong["round"]["seed"] = json!("WRONG");
+        std::fs::write(
+            &server.ipc.observation_path,
+            serde_json::to_vec(&wrong).unwrap(),
+        )
+        .unwrap();
+        *server.process_override.lock().await = Some(vec![json!({"pid": 1})]);
+        assert!(server.game_status().await.is_ok());
+        assert!(
+            server
+                .take_action(Parameters(ActionParams {
+                    action_id: "x".into(),
+                    decision_id: "d".into(),
+                    settle_timeout: 1.0
+                }))
+                .await
+                .is_ok()
+        );
+
+        wrong["round"]["seed"] = json!(SEED);
+        wrong["bridge"] = json!({"loaded": true, "version": "0.6.0"});
+        std::fs::write(
+            &server.ipc.observation_path,
+            serde_json::to_vec(&wrong).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            server
+                .take_action(Parameters(ActionParams {
+                    action_id: "x".into(),
+                    decision_id: "d".into(),
+                    settle_timeout: 1.0
+                }))
+                .await
+                .is_ok()
         );
     }
 }

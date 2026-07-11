@@ -443,7 +443,7 @@ impl ReplayDB {
             Option<String>,
             Option<String>,
         )],
-        _tags: &[&str],
+        tags: &[&str],
         _notes: &str,
     ) -> Result<i64, String> {
         let mut conn = self.open()?;
@@ -486,6 +486,13 @@ impl ReplayDB {
                 rusqlite::params![rid, dollars_start, dollars_end, shop_bought, shop_skipped])
                 .map_err(|e| format!("insert economy: {e}"))?;
         }
+        for tag in tags {
+            tx.execute(
+                "INSERT INTO replay_tags (replay_id, tag_name, source) VALUES (?,?,?)",
+                rusqlite::params![rid, tag, "mcp"],
+            )
+            .map_err(|e| format!("insert tag: {e}"))?;
+        }
         tx.commit().map_err(|e| format!("commit: {e}"))?;
         Ok(rid)
     }
@@ -509,6 +516,7 @@ impl ReplayDB {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use tempfile::tempdir;
@@ -551,7 +559,7 @@ mod tests {
     fn test_log_clear_with_full_data() {
         let (db, _dir) = make_db();
         let jokers: Vec<(i64, &str, Option<&str>, Option<&str>, Option<&str>)> =
-            vec![(0i64, "Joker", Some("Sealed"), None, None)];
+            vec![(0i64, "Joker", Some("Sealed"), Some("Bonus"), Some("note"))];
         let vouchers: Vec<&str> = vec!["Double Credit"];
         let hand_levels: Vec<(&str, i64, Option<i64>, Option<i64>)> =
             vec![("Flush", 3, Some(20), Some(5))];
@@ -605,6 +613,12 @@ mod tests {
             )
             .unwrap();
         assert!(rid > 0);
+        let conn = db.open().unwrap();
+        conn.execute(
+            "UPDATE replay SET chips_required=100, max_chips_gained=120 WHERE id=?",
+            [rid],
+        )
+        .unwrap();
         let result = db
             .query_replays(Some("2K9H9HN"), None, None, None, None, true)
             .unwrap();
@@ -629,6 +643,10 @@ mod tests {
             .query_replays(None, None, None, None, Some("fail"), true)
             .unwrap();
         assert!(!result.as_array().unwrap().is_empty());
+        let text = db
+            .query_replays(None, None, None, None, Some("fail"), false)
+            .unwrap();
+        assert!(text["text"].as_str().unwrap().contains("FAILED"));
     }
 
     #[test]
@@ -840,7 +858,7 @@ mod tests {
             None,
             None,
         )];
-        let _rid = db
+        let rid = db
             .log_clear(
                 "2K9H9HN",
                 3,
@@ -858,6 +876,11 @@ mod tests {
                 "",
             )
             .unwrap();
+        let details = db
+            .query_replays(None, None, None, None, None, true)
+            .unwrap();
+        assert_eq!(details[0]["tags"][0], "tag1");
+        assert!(rid > 0);
     }
 
     #[test]
@@ -953,5 +976,43 @@ mod tests {
             .query_replays(Some("2K9H9HN"), None, None, None, Some("clear"), true)
             .unwrap();
         assert!(!result.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn database_open_errors_are_reported() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("agent/replays.db")).unwrap();
+        let db = ReplayDB::new(dir.path());
+        assert!(
+            db.query_replays(None, None, None, None, None, true)
+                .is_err()
+        );
+        assert!(db.log_fail("2K9H9HN", 1, 1, "S_1").is_err());
+        assert!(
+            db.log_clear(
+                "2K9H9HN",
+                1,
+                1,
+                "S_1",
+                &[],
+                &[],
+                &[],
+                None,
+                None,
+                "",
+                "",
+                &[],
+                &[],
+                ""
+            )
+            .is_err()
+        );
+        let parent_file = dir.path().join("parent-file");
+        std::fs::write(&parent_file, b"not a directory").unwrap();
+        let db = ReplayDB::new(&parent_file);
+        assert!(
+            db.query_replays(None, None, None, None, None, true)
+                .is_err()
+        );
     }
 }

@@ -84,6 +84,7 @@ pub fn compact_observation(data: Value, section: &str) -> Value {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use serde_json::json;
