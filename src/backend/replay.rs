@@ -16,10 +16,12 @@ impl ReplayDB {
     }
 
     fn open(&self) -> Result<Connection, String> {
-        if let Some(parent) = self.db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create replay DB directory: {e}"))?;
-        }
+        let parent = self
+            .db_path
+            .parent()
+            .ok_or("replay database has no parent")?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create replay DB directory: {e}"))?;
         Connection::open_with_flags(
             &self.db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
@@ -657,6 +659,19 @@ mod tests {
             .unwrap();
         assert!(result.is_array());
         assert_eq!(result.as_array().unwrap().len(), 0);
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let replay = (
+            1,
+            "seed".into(),
+            1,
+            1,
+            "Small".into(),
+            FAIL.into(),
+            None,
+            None,
+        );
+        let text = db.format_replay_text(&conn, &replay);
+        assert!(text.contains("FAILED"));
     }
 
     #[test]
@@ -1014,5 +1029,167 @@ mod tests {
             db.query_replays(None, None, None, None, None, true)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn malformed_schema_errors_are_reported() {
+        let dir = tempdir().unwrap();
+        let db = ReplayDB::new(dir.path());
+        let path = dir.path().join("agent/replays.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE replay (wrong TEXT); CREATE TABLE replay_step (wrong TEXT); CREATE TABLE replay_joker_config (wrong TEXT); CREATE TABLE replay_hand_levels (wrong TEXT); CREATE TABLE replay_voucher (wrong TEXT); CREATE TABLE replay_economy (wrong TEXT); CREATE TABLE replay_tags (wrong TEXT);",
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            db.query_replays(None, None, None, None, None, true)
+                .is_err()
+        );
+        assert!(db.log_fail("2K9H9HN", 1, 1, "S_1").is_err());
+        assert!(
+            db.log_clear(
+                "2K9H9HN",
+                1,
+                1,
+                "S_1",
+                &[],
+                &[],
+                &[],
+                None,
+                None,
+                "",
+                "",
+                &[],
+                &[],
+                ""
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_replay_rows_are_rejected_without_panicking() {
+        let dir = tempdir().unwrap();
+        let db = ReplayDB::new(dir.path());
+        let conn = db.open().unwrap();
+        db.init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO replay(id,seed,ante,stake,blind_key,outcome) VALUES(1,X'00',1,1,'Small','clear')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            db.query_replays(None, None, None, None, None, true)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn replay_detail_handles_missing_tables_and_bad_rows() {
+        let (db, _dir) = make_db();
+        for table in [
+            "replay_joker_config",
+            "replay_voucher",
+            "replay_hand_levels",
+            "replay_step",
+            "replay_tags",
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            db.init_db(&conn).unwrap();
+            conn.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+            assert!(db.load_replay_detail(&conn, 1).is_err(), "{table}");
+        }
+
+        let cases = [
+            "INSERT INTO replay_joker_config (replay_id, slot_order, joker_name) VALUES (1, X'00', 'J')",
+            "INSERT INTO replay_voucher (replay_id, slot_order, voucher_name) VALUES (1, X'00', 'V')",
+            "INSERT INTO replay_hand_levels (replay_id, hand_type, level) VALUES (1, 'Flush', X'00')",
+            "INSERT INTO replay_step (replay_id, step_order, action_type, details, hand_type, discard_count) VALUES (1, X'00', 'play', 'd', 'Flush', 0)",
+            "INSERT INTO replay_tags (replay_id, tag_name) VALUES (1, X'00')",
+        ];
+        for insert in cases {
+            let conn = Connection::open_in_memory().unwrap();
+            db.init_db(&conn).unwrap();
+            conn.execute("INSERT INTO replay (id, seed, ante, stake, blind_key, outcome) VALUES (1, 'seed', 1, 1, 'Small', 'clear')", []).unwrap();
+            conn.execute(insert, []).unwrap();
+            assert!(db.load_replay_detail(&conn, 1).is_err(), "{insert}");
+        }
+
+        for column in [
+            "slot_order",
+            "joker_name",
+            "edition",
+            "enhancement",
+            "notes",
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            db.init_db(&conn).unwrap();
+            conn.execute("INSERT INTO replay (id, seed, ante, stake, blind_key, outcome) VALUES (1, 'seed', 1, 1, 'Small', 'clear')", []).unwrap();
+            conn.execute("INSERT INTO replay_joker_config (replay_id, slot_order, joker_name) VALUES (1, 1, 'J')", []).unwrap();
+            conn.execute(
+                &format!("UPDATE replay_joker_config SET {column}=X'00' WHERE replay_id=1"),
+                [],
+            )
+            .unwrap();
+            assert!(db.load_replay_detail(&conn, 1).is_err(), "{column}");
+        }
+        for column in ["slot_order", "voucher_name"] {
+            let conn = Connection::open_in_memory().unwrap();
+            db.init_db(&conn).unwrap();
+            conn.execute("INSERT INTO replay (id, seed, ante, stake, blind_key, outcome) VALUES (1, 'seed', 1, 1, 'Small', 'clear')", []).unwrap();
+            conn.execute("INSERT INTO replay_voucher (replay_id, slot_order, voucher_name) VALUES (1, 1, 'V')", []).unwrap();
+            conn.execute(
+                &format!("UPDATE replay_voucher SET {column}=X'00' WHERE replay_id=1"),
+                [],
+            )
+            .unwrap();
+            assert!(db.load_replay_detail(&conn, 1).is_err(), "{column}");
+        }
+        for column in ["hand_type", "level", "chips", "mult"] {
+            let conn = Connection::open_in_memory().unwrap();
+            db.init_db(&conn).unwrap();
+            conn.execute("INSERT INTO replay (id, seed, ante, stake, blind_key, outcome) VALUES (1, 'seed', 1, 1, 'Small', 'clear')", []).unwrap();
+            conn.execute("INSERT INTO replay_hand_levels (replay_id, hand_type, level) VALUES (1, 'Flush', 1)", []).unwrap();
+            conn.execute(
+                &format!("UPDATE replay_hand_levels SET {column}=X'00' WHERE replay_id=1"),
+                [],
+            )
+            .unwrap();
+            assert!(db.load_replay_detail(&conn, 1).is_err(), "{column}");
+        }
+    }
+
+    #[test]
+    fn replay_text_handles_optional_and_malformed_detail_rows() {
+        let (db, _dir) = make_db();
+        let replay = (
+            1,
+            "seed".to_string(),
+            1,
+            1,
+            "Small".to_string(),
+            CLEAR.to_string(),
+            Some(10),
+            Some(12),
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        db.init_db(&conn).unwrap();
+        conn.execute("INSERT INTO replay (id, seed, ante, stake, blind_key, outcome) VALUES (1, 'seed', 1, 1, 'Small', 'clear')", []).unwrap();
+        conn.execute("INSERT INTO replay_joker_config (replay_id, slot_order, joker_name, edition, enhancement, notes) VALUES (1, 1, 'J', 'Foil', 'Bonus', 'note')", []).unwrap();
+        conn.execute("INSERT INTO replay_step (replay_id, step_order, action_type, details, rationale, hand_type, discard_count) VALUES (1, 1, 'play', 'details', 'why', 'Flush', 0)", []).unwrap();
+        let text = db.format_replay_text(&conn, &replay);
+        assert!(text.contains("Required: 10 chips | Achieved: 12 chips"));
+        assert!(text.contains("Foil Bonus | note"));
+        assert!(text.contains("Rationale: why"));
+
+        let conn = Connection::open_in_memory().unwrap();
+        db.init_db(&conn).unwrap();
+        conn.execute("INSERT INTO replay (id, seed, ante, stake, blind_key, outcome) VALUES (1, 'seed', 1, 1, 'Small', 'clear')", []).unwrap();
+        conn.execute("INSERT INTO replay_joker_config (replay_id, slot_order, joker_name) VALUES (1, X'00', 'J')", []).unwrap();
+        conn.execute("INSERT INTO replay_step (replay_id, step_order, action_type, details, hand_type, discard_count) VALUES (1, X'00', 'play', 'details', 'Flush', 0)", []).unwrap();
+        let _ = db.format_replay_text(&conn, &replay);
     }
 }

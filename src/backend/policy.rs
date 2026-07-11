@@ -420,15 +420,21 @@ fn generate_legal_actions(
         "SHOP" => {
             if joker_open > 0 {
                 if let Some(bc) = run.get("blind_choices") {
-                    if let Some(small) = bc.get("Small") {
-                        if small.get("state").and_then(|s| s.as_str()) == Some("Select") {
-                            actions.push(json!({ "action_id": "select_small_blind", "action": "ui_click", "ui_id": "blind_select_small", "reason": "select Small Blind" }));
-                        }
+                    if bc
+                        .get("Small")
+                        .and_then(|small| small.get("state"))
+                        .and_then(Value::as_str)
+                        == Some("Select")
+                    {
+                        actions.push(json!({ "action_id": "select_small_blind", "action": "ui_click", "ui_id": "blind_select_small", "reason": "select Small Blind" }));
                     }
-                    if let Some(big) = bc.get("Big") {
-                        if big.get("state").and_then(|s| s.as_str()) == Some("Select") {
-                            actions.push(json!({ "action_id": "select_big_blind", "action": "ui_click", "ui_id": "blind_select_big", "reason": "select Big Blind" }));
-                        }
+                    if bc
+                        .get("Big")
+                        .and_then(|big| big.get("state"))
+                        .and_then(Value::as_str)
+                        == Some("Select")
+                    {
+                        actions.push(json!({ "action_id": "select_big_blind", "action": "ui_click", "ui_id": "blind_select_big", "reason": "select Big Blind" }));
                     }
                 }
             }
@@ -839,7 +845,18 @@ mod tests {
             assert_eq!(determine_best_hand(&counts, &suits), expected);
         }
         assert_eq!(estimate_best_play(&json!({"areas":{"hand":[]}})), 5);
+        assert_eq!(
+            estimate_best_play(&json!({
+                "areas":{"hand":[{"suits":[{"key":"H"}]}]},
+                "poker_hands":{"values":{}}
+            })),
+            5
+        );
         assert_eq!(estimate_best_play_raw(&[], &json!({})), 5);
+        assert_eq!(
+            estimate_best_play_raw(&[json!({"suits":[{"key":"H"}]})], &json!({})),
+            5
+        );
         assert_eq!(analyze_hands(&[], &json!({})), json!({}));
         assert!(
             analyze_hands(
@@ -849,6 +866,32 @@ mod tests {
                 .as_i64()
                 .unwrap()
                 > 0
+        );
+
+        let mut no_moves = observation("SELECTING_HAND");
+        no_moves["run"]["hands_left"] = json!(0);
+        no_moves["run"]["discards_left"] = json!(0);
+        let no_moves_state = build_policy_state(&no_moves, 40, 40, 60);
+        assert!(
+            no_moves_state["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|action| action["action"] != "play" && action["action"] != "discard")
+        );
+
+        let mut shop_without_blinds = observation("SHOP");
+        shop_without_blinds["run"]
+            .as_object_mut()
+            .unwrap()
+            .remove("blind_choices");
+        shop_without_blinds["run"]["joker_slots"] = json!(5);
+        assert!(
+            build_policy_state(&shop_without_blinds, 40, 40, 60)["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|action| action.get("action") != Some(&json!("ui_click")))
         );
     }
 
@@ -874,6 +917,26 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|action| action["action"] == "reroll")
+        );
+        obs["run"]["most_played_poker_hand"] = json!("Pair");
+        obs["run"]["blind"]["effect"] = json!({});
+        obs["areas"]["shop"] = json!([{"name":"Joker"}, {}]);
+        obs["areas"]["jokers"] = json!([{"empty":true}]);
+        let populated = build_policy_state(&obs, 1, 1, 1);
+        assert_eq!(populated["most_played_poker_hand"], "Pair");
+
+        let mut pack_fallback = observation("TAROT_PACK");
+        pack_fallback["areas"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pack");
+        pack_fallback["pack"] = json!({"cards":[{"name":"Fallback"}]});
+        assert!(
+            build_policy_state(&pack_fallback, 1, 1, 1)["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action["action"] == "choose_pack")
         );
 
         let mut blind = observation("BLIND_SELECT");

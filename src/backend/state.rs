@@ -14,9 +14,8 @@ impl StateDB {
     }
 
     fn connection(&self) -> Result<Connection, String> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
+        let parent = self.path.parent().ok_or("state database has no parent")?;
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         let conn = Connection::open_with_flags(
             &self.path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
@@ -266,5 +265,45 @@ mod tests {
         std::fs::write(&parent_file, b"not a directory").unwrap();
         let db = StateDB::new(&parent_file);
         assert!(db.current_run().is_err());
+    }
+
+    #[test]
+    fn malformed_schema_errors_are_returned_by_every_workflow() {
+        let dir = tempdir().unwrap();
+        let db = StateDB::new(dir.path());
+        let path = dir.path().join("agent/rust_state.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE current_run (wrong TEXT); CREATE TABLE events (wrong TEXT); CREATE TABLE strategy_rules (wrong TEXT); CREATE TABLE strategy_evidence (wrong TEXT); CREATE TABLE lessons (wrong TEXT); CREATE TABLE estimates (wrong TEXT);",
+        )
+        .unwrap();
+        drop(conn);
+        assert!(db.checkpoint(&json!({}), "bad").is_err());
+        assert!(db.current_run().is_err());
+        assert!(db.events(1).is_err());
+        assert!(db.add_rule("x", "x", &json!({}), "x", false).is_err());
+        assert!(db.strategy().is_err());
+        assert!(db.record_evidence("x", "x", "x", "x").is_err());
+        assert!(db.add_lesson("x", "x", "x", 0.5).is_err());
+        assert!(db.record_estimate("x", 1, 2, &json!({})).is_err());
+        assert!(db.estimation_report().is_err());
+    }
+
+    #[test]
+    fn malformed_state_rows_are_safely_rejected() {
+        let dir = tempdir().unwrap();
+        let db = StateDB::new(dir.path());
+        let conn = db.connection().unwrap();
+        conn.execute("INSERT INTO current_run(id,payload) VALUES(1,X'00')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO events(id,kind,payload) VALUES(1,X'00',X'00')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(db.current_run().is_err());
+        assert!(db.events(10).is_ok());
     }
 }

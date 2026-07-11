@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::LazyLock;
+
+static EMPTY_OBJECT: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(serde_json::Map::new);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoreResult {
@@ -192,88 +195,90 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
         .and_then(Value::as_array)
     {
         for joker in jokers {
-            if let Some(ability) = joker.get("ability").and_then(Value::as_object) {
-                let name = joker.get("name").and_then(Value::as_str).unwrap_or("joker");
-                let mut known = false;
-                if let Some(value) = ability.get("chips").and_then(Value::as_i64) {
-                    chips += value;
-                    known = true;
+            let ability = joker
+                .get("ability")
+                .and_then(Value::as_object)
+                .unwrap_or(&EMPTY_OBJECT);
+            let name = joker.get("name").and_then(Value::as_str).unwrap_or("joker");
+            let mut known = false;
+            if let Some(value) = ability.get("chips").and_then(Value::as_i64) {
+                chips += value;
+                known = true;
+            }
+            if let Some(value) = ability.get("mult").and_then(Value::as_i64) {
+                mult += value;
+                known = true;
+            }
+            if let Some(value) = ability.get("x_mult").and_then(Value::as_f64) {
+                result.x_mult *= value;
+                known = true;
+            }
+            let center_key = joker
+                .get("center_key")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let normalized_name = name.to_ascii_lowercase();
+            let is = |key: &str, label: &str| center_key == key || normalized_name == label;
+            if is("j_banner", "banner") {
+                let extra = ability
+                    .get("extra")
+                    .and_then(Value::as_i64)
+                    .or_else(|| joker.pointer("/config/extra").and_then(Value::as_i64))
+                    .unwrap_or(0);
+                let discards = observation
+                    .pointer("/run/discards_left")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                chips += extra * discards;
+                known = true;
+            } else if is("j_raised_fist", "raised fist") {
+                if let Some(min_rank) = hand.iter().filter_map(card_rank).min() {
+                    mult += i64::from(min_rank) * 2;
                 }
-                if let Some(value) = ability.get("mult").and_then(Value::as_i64) {
-                    mult += value;
-                    known = true;
+                known = true;
+            } else if is("j_mystic_summit", "mystic summit") {
+                if observation
+                    .pointer("/run/discards_left")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    == 0
+                {
+                    mult += 15;
                 }
-                if let Some(value) = ability.get("x_mult").and_then(Value::as_f64) {
-                    result.x_mult *= value;
-                    known = true;
-                }
-                let center_key = joker
-                    .get("center_key")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                let normalized_name = name.to_ascii_lowercase();
-                let is = |key: &str, label: &str| center_key == key || normalized_name == label;
-                if is("j_banner", "banner") {
-                    let extra = ability
-                        .get("extra")
-                        .and_then(Value::as_i64)
-                        .or_else(|| joker.pointer("/config/extra").and_then(Value::as_i64))
-                        .unwrap_or(0);
-                    let discards = observation
-                        .pointer("/run/discards_left")
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0);
-                    chips += extra * discards;
-                    known = true;
-                } else if is("j_raised_fist", "raised fist") {
-                    if let Some(min_rank) = hand.iter().filter_map(card_rank).min() {
-                        mult += i64::from(min_rank) * 2;
-                    }
-                    known = true;
-                } else if is("j_mystic_summit", "mystic summit") {
-                    if observation
-                        .pointer("/run/discards_left")
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0)
-                        == 0
-                    {
-                        mult += 15;
-                    }
-                    known = true;
-                } else if is("j_hanging_chad", "hanging chad") {
-                    let extra = ability
-                        .get("extra")
-                        .and_then(Value::as_i64)
-                        .or_else(|| joker.pointer("/config/extra").and_then(Value::as_i64))
-                        .unwrap_or(0);
-                    let nominal = hand
-                        .first()
-                        .and_then(|card| card.pointer("/base/nominal"))
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0);
-                    chips += extra * nominal;
-                    known = true;
-                } else if is("j_vampire", "vampire") {
-                    let x = ability
-                        .get("x_mult")
-                        .and_then(Value::as_f64)
-                        .or_else(|| joker.pointer("/config/Xmult").and_then(Value::as_f64))
-                        .unwrap_or(1.0);
-                    result.x_mult *= x.max(1.0);
-                    known = true;
-                } else if is("j_triboulet", "triboulet") {
-                    let faces = hand
-                        .iter()
-                        .filter_map(card_rank)
-                        .filter(|rank| *rank == 12 || *rank == 13)
-                        .count();
-                    result.x_mult *= 2f64.powi(faces as i32);
-                    known = true;
-                }
-                if !known && !ability.is_empty() {
-                    result.unsupported_effects.push(name.to_owned());
-                }
+                known = true;
+            } else if is("j_hanging_chad", "hanging chad") {
+                let extra = ability
+                    .get("extra")
+                    .and_then(Value::as_i64)
+                    .or_else(|| joker.pointer("/config/extra").and_then(Value::as_i64))
+                    .unwrap_or(0);
+                let nominal = hand
+                    .first()
+                    .and_then(|card| card.pointer("/base/nominal"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                chips += extra * nominal;
+                known = true;
+            } else if is("j_vampire", "vampire") {
+                let x = ability
+                    .get("x_mult")
+                    .and_then(Value::as_f64)
+                    .or_else(|| joker.pointer("/config/Xmult").and_then(Value::as_f64))
+                    .unwrap_or(1.0);
+                result.x_mult *= x.max(1.0);
+                known = true;
+            } else if is("j_triboulet", "triboulet") {
+                let faces = hand
+                    .iter()
+                    .filter_map(card_rank)
+                    .filter(|rank| *rank == 12 || *rank == 13)
+                    .count();
+                result.x_mult *= 2f64.powi(faces as i32);
+                known = true;
+            }
+            if !known && !ability.is_empty() {
+                result.unsupported_effects.push(name.to_owned());
             }
         }
     }
@@ -402,6 +407,27 @@ mod tests {
         let result = score_hand(&observation, None);
         assert_eq!(result.mult, 17);
         assert!(result.unsupported_effects.is_empty());
+        let without_ability = json!({
+            "areas":{"hand":[card("A","H")],"jokers":[{"name":"Mystery"}]},
+            "poker_hands":{"values":{"High Card":{"chips":10,"mult":2}}}
+        });
+        assert!(
+            score_hand(&without_ability, None)
+                .unsupported_effects
+                .is_empty()
+        );
+        let fallback_effects = json!({
+            "run":{"discards_left":2},
+            "areas":{"hand":[],"jokers":[
+                {"name":"Hanging Chadd","config":{"extra":2}},
+                {"name":"Raised Fist"},
+                {"name":"Mystic Summit"},
+                {"name":"Vampire","config":{"Xmult":2.0}}
+            ]},
+            "poker_hands":{"values":{"High Card":{}}}
+        });
+        let fallback = score_hand(&fallback_effects, None);
+        assert!(fallback.exact_score.is_none());
     }
 
     #[test]
@@ -443,6 +469,14 @@ mod tests {
                 .iter()
                 .any(|x| x.contains("missing poker_hands"))
         );
+        let malformed_values = score_hand(
+            &json!({
+                "areas":{"hand":[card("A","H")]},
+                "poker_hands":{"values":{"High Card":{}}}
+            }),
+            None,
+        );
+        assert!(malformed_values.exact_score.is_none());
     }
 
     #[test]

@@ -121,6 +121,8 @@ pub struct Server {
     pub replay_db: Arc<Mutex<ReplayDB>>,
     pub state_db: Arc<Mutex<StateDB>>,
     pub(crate) process_override: Arc<Mutex<Option<Vec<Value>>>>,
+    pub(crate) status_override: Arc<Mutex<Option<Value>>>,
+    pub(crate) policy_failure_override: Arc<Mutex<bool>>,
     pub tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
 }
 
@@ -140,6 +142,8 @@ impl Server {
             replay_db,
             state_db,
             process_override: Arc::new(Mutex::new(None)),
+            status_override: Arc::new(Mutex::new(None)),
+            policy_failure_override: Arc::new(Mutex::new(false)),
             tool_router: Self::tool_router(),
         })
     }
@@ -150,6 +154,9 @@ impl Server {
     }
 
     async fn policy(&self, limit: u32) -> Result<Value, String> {
+        if *self.policy_failure_override.lock().await {
+            return Err("deterministic policy failure".into());
+        }
         let observation = self.read_observation()?;
         let mut state = build_policy_state(&observation, limit as usize, 40, 60);
         let decision_id = decision_id_for(&observation);
@@ -172,17 +179,14 @@ impl Server {
             active_directives(&directives, &observation),
         );
         object.insert("score_analysis".into(), score.clone());
-        object.insert(
-            "estimate_quality".into(),
-            score
-                .get("estimate_quality")
-                .cloned()
-                .unwrap_or_else(|| json!("partial")),
-        );
+        object.insert("estimate_quality".into(), score["estimate_quality"].clone());
         Ok(state)
     }
 
     async fn status(&self) -> Value {
+        if let Some(status) = self.status_override.lock().await.clone() {
+            return status;
+        }
         let processes = self
             .process_override
             .lock()
@@ -320,15 +324,6 @@ impl Server {
                     &error.to_string(),
                 ));
             }
-            if let Err(error) = runtime::guard_command(&json!({"action": "observe"}), &observation)
-            {
-                return Err(envelope(
-                    false,
-                    status,
-                    "unsafe_runtime",
-                    &error.to_string(),
-                ));
-            }
             Ok(status)
         }
     }
@@ -384,33 +379,59 @@ impl Server {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("C:/Users/me/AppData/Roaming"));
         let directory = appdata.join("Balatro/Mods/lovely/log");
-        let latest = fs::read_dir(&directory).ok().and_then(|items| {
-            items
-                .filter_map(Result::ok)
-                .filter_map(|x| {
-                    let modified = x.metadata().ok()?.modified().ok()?;
-                    Some((modified, x.path()))
-                })
-                .max_by_key(|(modified, _)| *modified)
-                .map(|(_, path)| path)
-        });
-        match latest {
-            Some(path) => {
-                let text = fs::read_to_string(&path).unwrap_or_default();
-                let tail = text
-                    .lines()
-                    .rev()
-                    .take(lines.clamp(1, 200) as usize)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                json!({"log_found": true, "tail": tail, "truncated": text.lines().count() > lines as usize})
-            }
-            None => json!({"log_found": false, "tail": "Lovely log not found"}),
-        }
+        diagnostic_from_directory(&directory, lines)
     }
+}
+
+fn diagnostic_from_directory(directory: &std::path::Path, lines: u32) -> Value {
+    let latest = fs::read_dir(&directory).ok().and_then(|items| {
+        items
+            .filter_map(Result::ok)
+            .filter_map(|x| {
+                let modified = x.metadata().ok()?.modified().ok()?;
+                Some((modified, x.path()))
+            })
+            .max_by_key(|(modified, _)| *modified)
+            .map(|(_, path)| path)
+    });
+    match latest {
+        Some(path) => {
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            let tail = text
+                .lines()
+                .rev()
+                .take(lines.clamp(1, 200) as usize)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            json!({"log_found": true, "tail": tail, "truncated": text.lines().count() > lines as usize})
+        }
+        None => json!({"log_found": false, "tail": "Lovely log not found"}),
+    }
+}
+
+fn wait_state_matches(data: &Value, requested: &str) -> bool {
+    let state = value_state(data)
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    if requested.is_empty() {
+        !state.is_empty()
+    } else {
+        state.eq_ignore_ascii_case(requested)
+    }
+}
+
+fn state_result(result: Result<Value, String>) -> Result<CallToolResult, rmcp::ErrorData> {
+    match result {
+        Ok(data) => to_tool_result(envelope(true, data, "", "")),
+        Err(error) => to_tool_result(envelope(false, Value::Null, "run_state_failed", &error)),
+    }
+}
+
+fn observation_error_result(error: &str) -> Result<CallToolResult, rmcp::ErrorData> {
+    to_tool_result(envelope(false, Value::Null, "observation_failed", error))
 }
 
 #[tool_router]
@@ -605,12 +626,7 @@ impl Server {
             tokio::time::Instant::now() + Duration::from_secs_f64(params.timeout.clamp(0.1, 60.0));
         loop {
             if let Ok(data) = self.policy(20).await {
-                let state = value_state(&data)
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_default();
-                if (!params.state.is_empty() && state.eq_ignore_ascii_case(&params.state))
-                    || (params.state.is_empty() && !state.is_empty())
-                {
+                if wait_state_matches(&data, &params.state) {
                     return to_tool_result(envelope(true, data, "", ""));
                 }
             }
@@ -1100,28 +1116,16 @@ impl Server {
         Parameters(params): Parameters<StateParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         if params.kind == "read" {
-            return match self.state_db.lock().await.current_run() {
-                Ok(data) => to_tool_result(envelope(true, data, "", "")),
-                Err(error) => {
-                    to_tool_result(envelope(false, Value::Null, "run_state_failed", &error))
-                }
-            };
+            return state_result(self.state_db.lock().await.current_run());
         }
         match self.read_observation() {
-            Ok(observation) => match self
-                .state_db
-                .lock()
-                .await
-                .checkpoint(&observation, &params.kind)
-            {
-                Ok(data) => to_tool_result(envelope(true, data, "", "")),
-                Err(error) => {
-                    to_tool_result(envelope(false, Value::Null, "run_state_failed", &error))
-                }
-            },
-            Err(error) => {
-                to_tool_result(envelope(false, Value::Null, "observation_failed", &error))
-            }
+            Ok(observation) => state_result(
+                self.state_db
+                    .lock()
+                    .await
+                    .checkpoint(&observation, &params.kind),
+            ),
+            Err(error) => observation_error_result(&error),
         }
     }
 
@@ -1368,6 +1372,17 @@ mod tests {
                 .await
                 .is_ok()
         );
+        assert!(
+            server
+                .query_replays(Parameters(ReplayQueryParams {
+                    ante: 1,
+                    stake: 1,
+                    blind: "Small".into(),
+                    outcome: "fail".into(),
+                }))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -1593,12 +1608,14 @@ mod tests {
     fn write_fixture(server: &Server) {
         let observation = json!({
             "state": "PLAY",
+            "game": {"state": "SELECTING_HAND"},
             "round": {"seed": SEED},
+            "run": {"hands_left": 4, "discards_left": 3},
             "ready": {},
             "bridge": {"loaded": true, "version": "0.6.0", "session_id": "test"},
             "areas": {"hand": [
-                {"base": {"rank": "A", "suit": "H"}, "suits": [{"key": "H"}]},
-                {"base": {"rank": "K", "suit": "D"}, "suits": [{"key": "D"}]}
+                {"instance_id":"a", "base": {"rank": "A", "suit": "H"}, "suits": [{"key": "H"}]},
+                {"instance_id":"b", "base": {"rank": "K", "suit": "D"}, "suits": [{"key": "D"}]}
             ]},
             "poker_hands": {"values": {"High Card": {"chips": 10, "mult": 2}}}
         });
@@ -1635,8 +1652,25 @@ mod tests {
         );
         assert!(
             server
+                .get_decision(Parameters(DecisionParams {
+                    action_type: "play".into(),
+                    limit: 10
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
                 .score_hand(Parameters(ScoreParams {
                     card_indices: vec![]
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .score_hand(Parameters(ScoreParams {
+                    card_indices: vec![0]
                 }))
                 .await
                 .is_ok()
@@ -1645,7 +1679,25 @@ mod tests {
         assert!(
             server
                 .wait_for_state(Parameters(WaitParams {
-                    state: "PLAY".into(),
+                    state: "SELECTING_HAND".into(),
+                    timeout: 0.1
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .wait_for_state(Parameters(WaitParams {
+                    state: String::new(),
+                    timeout: 0.1
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .wait_for_state(Parameters(WaitParams {
+                    state: "SHOP".into(),
                     timeout: 0.1
                 }))
                 .await
@@ -1671,6 +1723,18 @@ mod tests {
                 .is_ok()
         );
 
+        std::fs::remove_file(&server.ipc.observation_path).unwrap();
+        std::fs::write(&server.ipc.response_path, r#"{"_decode_error":true}"#).unwrap();
+        assert!(
+            server
+                .checkpoint(Parameters(CheckpointParams {
+                    kind: "missing-observation".into()
+                }))
+                .await
+                .is_ok()
+        );
+        write_fixture(&server);
+
         *server.process_override.lock().await = Some(vec![json!({
             "pid": 1234,
             "name": "Balatro.exe"
@@ -1684,7 +1748,7 @@ mod tests {
         assert!(
             server
                 .take_action(Parameters(ActionParams {
-                    action_id: "play".into(),
+                    action_id: "play_a".into(),
                     decision_id: "stale".into(),
                     settle_timeout: 1.0
                 }))
@@ -1694,7 +1758,7 @@ mod tests {
         assert!(
             server
                 .take_action(Parameters(ActionParams {
-                    action_id: "play".into(),
+                    action_id: "play_a".into(),
                     decision_id: decision.clone(),
                     settle_timeout: 1.0
                 }))
@@ -1708,12 +1772,21 @@ mod tests {
                 .await
                 .is_ok()
         );
+        *server.policy_failure_override.lock().await = true;
+        std::fs::write(&server.ipc.response_path, r#"{"_decode_error":true}"#).unwrap();
+        assert!(
+            server
+                .advance_safe(Parameters(AdvanceParams { max_steps: 1 }))
+                .await
+                .is_ok()
+        );
+        *server.policy_failure_override.lock().await = false;
         let mut broken = server.clone();
         broken.ipc.command_path = std::path::PathBuf::from("Z:\\missing\\command.lua");
         assert!(
             broken
                 .take_action(Parameters(ActionParams {
-                    action_id: "play".into(),
+                    action_id: "play_a".into(),
                     decision_id: decision,
                     settle_timeout: 1.0
                 }))
@@ -1795,6 +1868,9 @@ mod tests {
         std::fs::write(&script, "console.log('not-json');").unwrap();
         let error = server.node(&["stats".into()]).await.unwrap_err();
         assert!(error.contains("non-JSON"));
+        std::fs::write(&script, "process.exit(1);").unwrap();
+        let error = server.node(&["stats".into()]).await.unwrap_err();
+        assert!(error.is_empty());
         let error = server
             .run_external_json("definitely-not-a-real-program", &[], 0.1)
             .await
@@ -1814,6 +1890,24 @@ mod tests {
         let bad_state_root = dir.path().join("bad-state");
         std::fs::create_dir_all(bad_state_root.join("agent/rust_state.db")).unwrap();
         *server.state_db.lock().await = StateDB::new(&bad_state_root);
+        assert!(
+            server
+                .run_state(Parameters(StateParams {
+                    kind: "read".into(),
+                    limit: 1
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(
+            server
+                .run_state(Parameters(StateParams {
+                    kind: "checkpoint".into(),
+                    limit: 1
+                }))
+                .await
+                .is_ok()
+        );
         assert!(server.strategy_state().await.is_ok());
         assert!(
             server
@@ -1938,7 +2032,17 @@ mod tests {
         ]});
         let result = active_directives(&rules, &json!({"state":"PLAY"}));
         assert_eq!(result.as_array().unwrap().len(), 2);
+        let mismatch = active_directives(
+            &json!({"rules":[{"conditions":{"/missing":"value"}}]}),
+            &json!({"state":"PLAY"}),
+        );
+        assert!(mismatch.as_array().unwrap().is_empty());
         assert!(server.diagnostic(0).get("log_found").is_some());
+        let empty_log_dir = tempdir().unwrap();
+        assert_eq!(
+            diagnostic_from_directory(empty_log_dir.path(), 5)["log_found"],
+            false
+        );
     }
 
     #[test]
@@ -1965,6 +2069,13 @@ mod tests {
         assert_eq!(action_error_code("stale decision"), "stale_decision");
         assert_eq!(action_error_code("bridge timeout"), "timeout");
         assert_eq!(action_error_code("cannot write"), "action_failed");
+        let state_data = json!({"game":{"state":"PLAY"}});
+        assert!(wait_state_matches(&state_data, "play"));
+        assert!(wait_state_matches(&state_data, ""));
+        assert!(!wait_state_matches(&state_data, "SHOP"));
+        assert!(matches!(state_result(Ok(json!({}))), Ok(_)));
+        assert!(matches!(state_result(Err("broken".into())), Ok(_)));
+        assert!(matches!(observation_error_result("missing"), Ok(_)));
     }
 
     #[tokio::test]
@@ -1989,6 +2100,18 @@ mod tests {
         assert!(server.ensure_runtime().await.is_ok());
 
         write_fixture(&server);
+        let saved_observation = std::fs::read(&server.ipc.observation_path).unwrap();
+        *server.status_override.lock().await = Some(json!({
+            "processes": [{"pid": 1}],
+            "seed": SEED,
+            "safe_for_mutation": true,
+            "observation_age_seconds": 0.0
+        }));
+        std::fs::remove_file(&server.ipc.observation_path).unwrap();
+        let unavailable = server.preflight().await.unwrap_err();
+        assert_eq!(unavailable["error"]["code"], "observation_unavailable");
+        std::fs::write(&server.ipc.observation_path, saved_observation).unwrap();
+        *server.status_override.lock().await = None;
         let mut wrong =
             serde_json::from_slice::<Value>(&std::fs::read(&server.ipc.observation_path).unwrap())
                 .unwrap();
@@ -2012,6 +2135,8 @@ mod tests {
         );
 
         wrong["round"]["seed"] = json!(SEED);
+        wrong["bridge"] = json!({"loaded": true});
+        assert!(server.game_status().await.is_ok());
         wrong["bridge"] = json!({"loaded": true, "version": "0.6.0"});
         std::fs::write(
             &server.ipc.observation_path,

@@ -163,6 +163,11 @@ mod tests {
         assert_eq!(r["ante"].as_i64(), None);
     }
     #[test]
+    fn test_compact_observation_summary_uses_blind_chip_fallback() {
+        let r = compact_observation(&json!({"run":{"blind":{"chips_required":99}}}), "summary");
+        assert_eq!(r["chips"], 99);
+    }
+    #[test]
     fn test_compact_observation_hand() {
         let obs = full_observation();
         let r = compact_observation(&obs, "hand");
@@ -195,6 +200,12 @@ mod tests {
         assert_eq!(r["jokers"][0]["seal"].as_str().unwrap(), "Red");
         assert_eq!(r["consumables"][0]["name"].as_str().unwrap(), "Tower");
         assert_eq!(r["consumables"][0]["type"].as_str().unwrap(), "Voucher");
+        let primitive = compact_observation(
+            &json!({"areas":{"jokers":[{"name":"J","edition":"Foil","seal":"Blue"}]}}),
+            "build",
+        );
+        assert_eq!(primitive["jokers"][0]["edition"], "Foil");
+        assert_eq!(primitive["jokers"][0]["seal"], "Blue");
     }
     #[test]
     fn test_compact_observation_blind() {
