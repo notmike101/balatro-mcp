@@ -1,0 +1,11 @@
+[manifest]
+version = "0.6.0"
+priority = 1000
+
+[[patches]]
+[patches.copy]
+target = "main.lua"
+position = "append"
+sources = [
+    "codex_agent.lua"
+]
