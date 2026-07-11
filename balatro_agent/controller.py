@@ -1414,6 +1414,8 @@ def decision_checks(
     legal_actions: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Force decision-time review of effects agents commonly overlook."""
+    state = round_data.get("game", {}) or {}
+    slots = areas.get("state") or {}
     def matching(action_name: str, area: str = "") -> list[dict[str, Any]]:
         return [
             {"action_id": action.get("id"), "card": action.get("card") or action.get("joker")}
@@ -1451,6 +1453,27 @@ def decision_checks(
             "instruction": "Evaluate every owned use/sell action and every shop consumable purchase before exiting or advancing.",
             "owned": consumables,
             "shop_purchase_actions": shop_consumables,
+        },
+        "shop": {
+            "required": state == "SHOP",
+            "instruction": "Track remaining shop items and their indexes after each purchase; reread decision state before every buy or reroll; do not assume shop inventory is unchanged.",
+            "jokers": [compact_card(card) for card in areas.get("shop_jokers") or []],
+            "vouchers": [compact_card(card) for card in areas.get("shop_vouchers") or []],
+            "booster": areas.get("shop_booster") or {},
+        },
+        "slots": {
+            "required": True,
+            "instruction": "Track joker and consumable slot counts (count/limit/open) across all purchases; do not buy if no slots remain without a voucher or other expansion.",
+            "jokers": {
+                "count": (slots.get("jokers") or {}).get("count"),
+                "limit": (slots.get("jokers") or {}).get("limit"),
+                "open": max(0, (int_or_none((slots.get("jokers") or {}).get("limit")) or 0) - (int_or_none((slots.get("jokers") or {}).get("count")) or 0)),
+            },
+            "consumeables": {
+                "count": (slots.get("consumeables") or {}).get("count"),
+                "limit": (slots.get("consumeables") or {}).get("limit"),
+                "open": max(0, (int_or_none((slots.get("consumeables") or {}).get("limit")) or 0) - (int_or_none((slots.get("consumeables") or {}).get("count")) or 0)),
+            },
         },
         "ordering": {
             "required_before_close_play": bool(areas.get("hand") and (areas.get("jokers") or [])),
