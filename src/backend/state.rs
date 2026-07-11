@@ -207,4 +207,41 @@ mod tests {
         db.record_estimate("Pair", 100, 120, &json!({})).unwrap();
         assert_eq!(db.estimation_report().unwrap()["count"], 1);
     }
+
+    #[test]
+    fn empty_state_limits_and_failure_deactivation_are_deterministic() {
+        let dir = tempdir().unwrap();
+        let db = StateDB::new(dir.path());
+        assert!(db.current_run().unwrap_err().contains("not found"));
+        assert_eq!(db.events(0).unwrap().as_array().unwrap().len(), 0);
+        db.add_rule("r1", "safety", &json!({}), "stop", true)
+            .unwrap();
+        let evidence = db.record_evidence("r1", "rejected", "e1", "bad").unwrap();
+        assert_eq!(evidence["active"], false);
+        assert_eq!(db.strategy().unwrap()["rules"][0]["active"], false);
+        let lesson = db.add_lesson("x", "y", "z", 4.0).unwrap();
+        assert_eq!(lesson["confidence"], 1.0);
+        db.record_estimate("Pair", 10, 0, &json!({"source":"test"}))
+            .unwrap();
+        assert_eq!(db.estimation_report().unwrap()["average_error_pct"], 0.0);
+    }
+
+    #[test]
+    fn malformed_persisted_json_is_safely_represented() {
+        let dir = tempdir().unwrap();
+        let db = StateDB::new(dir.path());
+        let conn = db.connection().unwrap();
+        conn.execute(
+            "INSERT INTO current_run(id,payload) VALUES(1, 'broken')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(db.current_run().unwrap(), Value::Null);
+        conn.execute(
+            "INSERT INTO events(kind,payload) VALUES('bad', 'broken')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(db.events(500).unwrap()[0]["payload"], Value::Null);
+    }
 }

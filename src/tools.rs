@@ -280,6 +280,38 @@ impl Server {
                         "runtime is not safe for mutation",
                     ));
                 }
+                let observation = match self.read_observation() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Err(envelope(false, status, "observation_unavailable", &error));
+                    }
+                };
+                let processes = status
+                    .get("processes")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let age = status
+                    .get("observation_age_seconds")
+                    .and_then(Value::as_f64);
+                if let Err(error) = runtime::validate_runtime(&observation, processes, age) {
+                    return Err(envelope(
+                        false,
+                        status,
+                        "unsafe_runtime",
+                        &error.to_string(),
+                    ));
+                }
+                if let Err(error) =
+                    runtime::guard_command(&json!({"action": "policy_step"}), &observation)
+                {
+                    return Err(envelope(
+                        false,
+                        status,
+                        "unsafe_runtime",
+                        &error.to_string(),
+                    ));
+                }
                 Ok(status)
             }
             Err(error) => Err(envelope(false, Value::Null, "status_failed", &error)),

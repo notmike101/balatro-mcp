@@ -214,15 +214,27 @@ pub fn advance_safe_with_discovery(
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::IpcPaths;
+
+    fn paths() -> (IpcPaths, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        (IpcPaths::new(dir.path()), dir)
+    }
 
     #[test]
     fn lua_values_are_encoded_safely() {
         assert_eq!(super::to_lua_value(&json!(null)), "nil");
         assert_eq!(super::to_lua_value(&json!(true)), "true");
+        assert_eq!(super::to_lua_value(&json!(12)), "12");
+        assert_eq!(super::to_lua_value(&json!(1.5)), "1.5");
+        assert_eq!(super::to_lua_value(&json!([1, "x"])), "{1, \"x\"}");
         assert_eq!(
             super::to_lua_value(&json!({"x": "a\"b"})),
             "{[\"x\"] = \"a\\\"b\"}"
         );
+        assert!(super::to_lua_value(&json!("line\n\r\t\\")).contains("\\n"));
     }
 
     #[test]
@@ -231,5 +243,64 @@ mod tests {
         let encoded = super::to_lua_command(&value);
         assert!(encoded.contains("checkpoint"));
         assert!(encoded.contains("test"));
+    }
+
+    #[test]
+    fn observation_and_command_round_trip() {
+        let (ipc, _dir) = paths();
+        std::fs::write(&ipc.observation_path, r#"{"state":"PLAY"}"#).unwrap();
+        assert_eq!(ipc.read_observation().unwrap()["state"], "PLAY");
+        ipc.write_command(&json!({"action":"play"})).unwrap();
+        assert!(
+            std::fs::read_to_string(&ipc.command_path)
+                .unwrap()
+                .contains("play")
+        );
+    }
+
+    #[test]
+    fn malformed_files_and_write_failures_are_reported() {
+        let (ipc, _dir) = paths();
+        std::fs::write(&ipc.observation_path, "not-json").unwrap();
+        assert!(
+            ipc.read_observation()
+                .unwrap_err()
+                .contains("invalid observation")
+        );
+        std::fs::write(&ipc.response_path, "not-json").unwrap();
+        assert!(ipc.wait_for_response("x", 0.0).unwrap().is_none());
+
+        let bad = IpcPaths::new(std::path::Path::new("Z:\\missing\\parent"));
+        assert!(
+            bad.write_command(&json!({}))
+                .unwrap_err()
+                .contains("cannot write")
+        );
+    }
+
+    #[test]
+    fn responses_match_decode_errors_and_ignore_stale_ids() {
+        let (ipc, _dir) = paths();
+        std::fs::write(&ipc.response_path, r#"{"id":"old"}"#).unwrap();
+        assert!(ipc.wait_for_response("new", 0.0).unwrap().is_none());
+        std::fs::write(&ipc.response_path, r#"{"_decode_error":"bad"}"#).unwrap();
+        assert!(ipc.wait_for_response("new", 0.0).unwrap().is_some());
+        std::fs::write(&ipc.response_path, r#"{"id":"42"}"#).unwrap();
+        assert!(ipc.next_command_id().parse::<u128>().unwrap() >= 43);
+        std::fs::write(&ipc.response_path, "{}").unwrap();
+        assert!(ipc.next_command_id().parse::<u128>().is_ok());
+    }
+
+    #[test]
+    fn command_helpers_use_expected_bridge_ids() {
+        let (ipc, _dir) = paths();
+        std::fs::write(&ipc.response_path, r#"{"id":"policy_step","ok":true}"#).unwrap();
+        assert!(super::execute_policy_action(&ipc, "play", "d", 1, 2, 3, 0.1).is_ok());
+        std::fs::write(&ipc.response_path, r#"{"id":"safe_transition","ok":true}"#).unwrap();
+        assert!(super::advance_safe_internal(&ipc, "cash_out", 2).is_ok());
+        std::fs::write(&ipc.response_path, r#"{"id":"checkpoint","ok":true}"#).unwrap();
+        assert!(super::checkpoint_internal(&ipc, "manual").is_ok());
+        std::fs::write(&ipc.response_path, r#"{"id":"first","ok":true}"#).unwrap();
+        assert!(super::advance_safe_with_discovery(&ipc, &["first", "second"], 1).is_ok());
     }
 }

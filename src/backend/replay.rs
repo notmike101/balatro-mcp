@@ -609,6 +609,15 @@ mod tests {
             .query_replays(Some("2K9H9HN"), None, None, None, None, true)
             .unwrap();
         assert!(!result.as_array().unwrap().is_empty());
+        let text = db
+            .query_replays(None, None, None, None, None, false)
+            .unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(text.contains("Slot 0: Joker"));
+        assert!(text.contains("Step 1: [play]"));
+        assert!(text.contains("Rationale: good hand"));
     }
 
     #[test]

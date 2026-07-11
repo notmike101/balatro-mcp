@@ -30,19 +30,22 @@ pub fn balatro_processes() -> Result<Vec<Value>, String> {
         return Ok(vec![]);
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_process_list(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn parse_process_list(stdout: &str) -> Vec<Value> {
     let mut processes = Vec::new();
 
     for line in stdout.lines() {
         let fields: Vec<&str> = line.split(',').collect();
-        if fields.len() >= 2 && fields[0].trim() == "Balatro.exe" {
+        if fields.len() >= 2 && fields[0].trim().trim_matches('"') == "Balatro.exe" {
             if let Ok(pid) = fields[1].trim().trim_matches('"').parse::<u32>() {
                 processes.push(serde_json::json!({"pid": pid, "name": "Balatro.exe"}));
             }
         }
     }
 
-    Ok(processes)
+    processes
 }
 
 /// Get the age of the observation file in seconds.
@@ -234,6 +237,27 @@ mod tests {
     fn test_observation_seed_missing() {
         let obs = json!({});
         assert_eq!(observation_seed(&obs), None);
+    }
+    #[test]
+    fn test_observation_seed_non_string_is_preserved() {
+        let obs = json!({"round":{"seed":123},"ready":{}});
+        assert_eq!(observation_seed(&obs), Some("123".to_string()));
+    }
+    #[test]
+    fn test_process_list_parser_filters_invalid_rows() {
+        let output =
+            "\"Balatro.exe\",1234,\"Console\"\n\"Other.exe\",22\n\"Balatro.exe\",bad\nshort";
+        let processes = parse_process_list(output);
+        assert_eq!(processes, vec![json!({"pid":1234,"name":"Balatro.exe"})]);
+    }
+    #[test]
+    fn test_observation_age_missing_and_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.json");
+        assert!(observation_age(&missing).is_none());
+        let present = dir.path().join("observation.json");
+        std::fs::write(&present, "{}").unwrap();
+        assert!(observation_age(&present).unwrap() < 2.0);
     }
     #[test]
     fn test_validate_runtime_single_process() {

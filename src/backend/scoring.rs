@@ -323,6 +323,64 @@ mod tests {
             ]),
             "Straight Flush"
         );
+        assert_eq!(
+            classify_hand(&[
+                card("A", "H"),
+                card("K", "H"),
+                card("Q", "H"),
+                card("J", "H"),
+                card("10", "H")
+            ]),
+            "Straight Flush"
+        );
+        assert_eq!(
+            classify_hand(&[
+                card("A", "H"),
+                card("A", "S"),
+                card("A", "D"),
+                card("A", "C"),
+                card("A", "H")
+            ]),
+            "Five of a Kind"
+        );
+        assert_eq!(
+            classify_hand(&[
+                card("A", "H"),
+                card("A", "S"),
+                card("A", "D"),
+                card("K", "C"),
+                card("K", "H")
+            ]),
+            "Full House"
+        );
+        assert_eq!(
+            classify_hand(&[card("A", "H"), card("A", "S"), card("A", "D")]),
+            "Three of a Kind"
+        );
+        assert_eq!(
+            classify_hand(&[
+                card("A", "H"),
+                card("K", "H"),
+                card("Q", "H"),
+                card("J", "H"),
+                card("9", "H")
+            ]),
+            "Flush"
+        );
+        assert_eq!(
+            classify_hand(&[
+                card("A", "H"),
+                card("2", "S"),
+                card("3", "D"),
+                card("4", "C"),
+                card("5", "H")
+            ]),
+            "Straight"
+        );
+        assert_eq!(
+            classify_hand(&[card("A", "H"), card("K", "S")]),
+            "High Card"
+        );
     }
 
     #[test]
@@ -343,5 +401,46 @@ mod tests {
         let result = score_hand(&observation, None);
         assert_eq!(result.mult, 17);
         assert!(result.unsupported_effects.is_empty());
+    }
+
+    #[test]
+    fn modifiers_and_jokers_are_deterministic_and_visible() {
+        let mut hand = card("A", "H");
+        hand["edition"] = json!("Polychrome");
+        hand["enhancement"] = json!("Glass");
+        let observation = json!({
+            "run":{"discards_left":2},
+            "areas":{"hand":[hand],"jokers":[
+                {"name":"Banner","ability":{"extra":3}},
+                {"name":"Raised Fist","ability":{}},
+                {"name":"Hanging Chadd","center_key":"j_hanging_chad","ability":{"extra":2},"config":{"extra":2}},
+                {"name":"Vampire","ability":{"x_mult":1.5}},
+                {"name":"Triboulet","ability":{}},
+                {"name":"Unknown","ability":{"mystery":true}}
+            ]},
+            "poker_hands":{"values":{"High Card":{"chips":10,"mult":2}}}
+        });
+        let result = score_hand(&observation, Some(&[0, 99]));
+        assert_eq!(result.scoring_cards, vec![0, 99]);
+        assert!(result.x_mult > 1.0);
+        assert!(result.unsupported_effects.iter().any(|x| x == "Unknown"));
+        assert_eq!(result.estimate_quality, "partial_contract");
+    }
+
+    #[test]
+    fn alternate_card_shapes_and_missing_contract_are_safe() {
+        let observation = json!({"areas":{"hand":[
+            {"rank":"10","suit":"Spades","edition":{"name":"Holographic"},"enhancement":{"key":"Bonus"}},
+            {"rank":"bad","suits":[{"name":"Hearts"}],"edition":"Negative"}
+        ]}});
+        let result = score_hand(&observation, None);
+        assert_eq!(result.hand_name, "High Card");
+        assert!(result.exact_score.is_none());
+        assert!(
+            result
+                .unsupported_effects
+                .iter()
+                .any(|x| x.contains("missing poker_hands"))
+        );
     }
 }
