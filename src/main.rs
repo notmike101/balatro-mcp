@@ -217,6 +217,12 @@ impl Server {
         .and_then(|r| r.map_err(|e| format!("backend launch failed: {e}")))?;
         let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        // `balatroctl status --json` intentionally exits nonzero when the
+        // runtime is unsafe, while still returning the authoritative status.
+        // Preserve that structured recovery data for MCP callers.
+        if let Ok(value) = serde_json::from_str(&out) {
+            return Ok(value);
+        }
         if !output.status.success() {
             return Err(if err.is_empty() { out } else { err });
         }
@@ -451,7 +457,26 @@ impl Server {
     #[tool(description = "Check process count, seed, bridge freshness, and resumable-save safety.")]
     async fn game_status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         match self.status().await {
-            Ok(data) => tool(envelope(true, data, "", "")),
+            Ok(data) => {
+                let process_count = data
+                    .get("processes")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                let valid_seed = data
+                    .get("seed")
+                    .and_then(Value::as_str)
+                    .is_none_or(|seed| seed == SEED);
+                if process_count == 1 && valid_seed {
+                    tool(envelope(true, data, "", ""))
+                } else {
+                    tool(envelope(
+                        false,
+                        data,
+                        "preflight",
+                        "Balatro runtime preflight failed",
+                    ))
+                }
+            }
             Err(e) => tool(envelope(false, Value::Null, "status_failed", &e)),
         }
     }
