@@ -52,7 +52,11 @@ pub fn settle_timeout() -> f64 {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub struct StartNewRunParams {}
+pub struct StartNewRunParams {
+    /// Required when an existing saved run would be replaced.
+    #[serde(default)]
+    pub confirm_override: bool,
+}
 
 #[derive(Deserialize, JsonSchema)]
 pub struct AdvanceParams {

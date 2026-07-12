@@ -330,13 +330,14 @@ pub fn checkpoint_internal(paths: &IpcPaths, kind: &str) -> Result<Value, String
     Ok(response)
 }
 
-/// Recover from a non-target saved run and start the only permitted seed.
+/// Start the only permitted seed, optionally replacing an existing save.
 /// The caller must have already performed the runtime and seed-recovery checks.
-pub fn start_new_run(paths: &IpcPaths) -> Result<Value, String> {
+pub fn start_new_run(paths: &IpcPaths, confirm_override: bool) -> Result<Value, String> {
     let setup_id = paths.next_command_id();
     let setup = serde_json::json!({
         "id": setup_id,
         "action": "setup_new_run",
+        "override_saved": confirm_override,
     });
     paths.write_command(&setup)?;
     let setup_response = paths

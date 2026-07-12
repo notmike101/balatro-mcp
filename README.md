@@ -31,7 +31,7 @@ Configure an MCP client:
 
 ## Agent use
 
-Begin with `game_status`; if the main menu contains a saved run with another seed, use the guarded `start_new_run` tool to recover to `2K9H9HN`. Then call `get_decision`, execute only a legal `action_id` paired with that exact `decision_id`, and verify with `observe`. Use `score_hand` for exact-contract or explicitly estimated scoring, and use `strategy_state`/`run_state` for Rust-owned directives and resumable state. Query matching replays before each blind and use `lookup_rule` for unfamiliar effects. `runtime_diagnostics` safely returns a capped latest Lovely-log tail; `ensure_runtime` verifies an externally started Balatro process and never launches the game.
+Begin with `game_status`; use `start_new_run(confirm_override=true)` to always start a new seeded run, after confirming that any existing save may be replaced. Then call `get_decision`, execute only a legal `action_id` paired with that exact `decision_id`, and verify with `observe`. Use `score_hand` for exact-contract or explicitly estimated scoring, and use `strategy_state`/`run_state` for Rust-owned directives and resumable state. Query matching replays before each blind and use `lookup_rule` for unfamiliar effects. `runtime_diagnostics` safely returns a capped latest Lovely-log tail; `ensure_runtime` verifies an externally started Balatro process and never launches the game.
 
 The MCP exposes no raw controller commands, coordinates, arbitrary filesystem reads, database rebuilds, or face-down-card identities. See [`AGENTS.md`](AGENTS.md) for the strict gameplay workflow.
 
