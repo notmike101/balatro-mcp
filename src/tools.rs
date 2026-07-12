@@ -660,6 +660,16 @@ fn observation_state(data: &Value) -> &str {
         .unwrap_or_default()
 }
 
+fn synchronize_bridge_response_state(mut response: Value, post_state: &Value) -> Value {
+    let state = observation_state(post_state);
+    if !state.is_empty() {
+        if let Some(object) = response.as_object_mut() {
+            object.insert("state".into(), json!(state));
+        }
+    }
+    response
+}
+
 fn state_result(result: Result<Value, String>) -> Result<CallToolResult, rmcp::ErrorData> {
     match result {
         Ok(data) => to_tool_result(envelope(true, data, "", "")),
@@ -767,8 +777,9 @@ impl Server {
                 if next.is_null() {
                     next = json!({"legal_actions": []});
                 }
+                let bridge_response = synchronize_bridge_response_state(data, &next);
                 if let Some(object) = next.as_object_mut() {
-                    object.insert("bridge_response".into(), data);
+                    object.insert("bridge_response".into(), bridge_response);
                 }
                 to_tool_result(envelope(true, next, "", ""))
             }
@@ -785,7 +796,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Read targeted live state. Valid sections: summary, hand, build, blind, hand_values, all."
+        description = "Read targeted live state. This is read-only and does not return a decision_id or legal_actions; call get_decision for actionable state. Valid sections: summary, hand, build, blind, hand_values, all."
     )]
     async fn observe(
         &self,
@@ -819,7 +830,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Return the current decision_id, a paged legal-action list, rankings, and strategy analysis. Use action_type, action_offset, and action_limit to inspect additional action pages when legal_actions_truncated is true. Examine decision_checks.ordering.hand_order and decision_checks.ordering.joker_order when jokers are present and trigger sequence can affect scoring. Examine decision_checks.consumables when Tarot/Planet/Spectral cards are owned or available in shop; use or sell before exiting or advancing. Examine decision_checks.shop and decision_checks.slots during SHOP state to track remaining items and indexes after each purchase."
+        description = "Return the current decision_id, a paged legal-action list, rankings, and strategy analysis. Use action_type, action_offset, and action_limit to inspect additional action pages when legal_actions_truncated is true; legal_actions_next_offset is null when no page remains. In GAME_OVER, from_game_over is a game-specific ui_click and return_to_menu is also available as a safe_transition. Examine decision_checks.ordering.hand_order and decision_checks.ordering.joker_order when jokers are present and trigger sequence can affect scoring. Examine decision_checks.consumables when Tarot/Planet/Spectral cards are owned or available in shop; use or sell before exiting or advancing. Examine decision_checks.shop and decision_checks.slots during SHOP state to track remaining items and indexes after each purchase."
     )]
     async fn get_decision(
         &self,
@@ -1006,8 +1017,9 @@ impl Server {
                 } else {
                     json!({"legal_actions": []})
                 };
+                let bridge_response = synchronize_bridge_response_state(data, &next);
                 if let Some(object) = next.as_object_mut() {
-                    object.insert("bridge_response".into(), data);
+                    object.insert("bridge_response".into(), bridge_response);
                 }
                 if !changed {
                     return to_tool_result(envelope(
@@ -1126,7 +1138,9 @@ impl Server {
         ))
     }
 
-    #[tool(description = "Wait read-only for an exact state, or for any stable state when blank.")]
+    #[tool(
+        description = "Wait read-only for an exact state, or for any stable state when blank. The result confirms state only and does not include legal_actions; call get_decision after the wait to obtain a decision_id and actions."
+    )]
     async fn wait_for_state(
         &self,
         Parameters(params): Parameters<WaitParams>,
@@ -1503,7 +1517,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Score selected hand cards using the live poker-hand contract and explicit estimate metadata."
+        description = "Score selected hand cards using the live poker-hand contract and explicit estimate metadata. When card_indices is omitted, the live highlighted hand selection is used when present; otherwise the full hand is scored."
     )]
     async fn score_hand(
         &self,
@@ -1768,6 +1782,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let server = Server::new(dir.path().to_path_buf()).unwrap();
         (dir, server)
+    }
+
+    #[test]
+    fn bridge_response_state_uses_post_action_state() {
+        let response = synchronize_bridge_response_state(
+            json!({"state": "SELECTING_HAND", "message": "queued"}),
+            &json!({"game": {"state": "HAND_PLAYED"}}),
+        );
+        assert_eq!(response["state"], "HAND_PLAYED");
+        assert_eq!(response["message"], "queued");
     }
 
     #[tokio::test]
@@ -2702,6 +2726,7 @@ mod tests {
         assert_eq!(page["legal_actions_total"], 2);
         assert_eq!(page["legal_actions"][0]["action_id"], "m2");
         assert_eq!(page["legal_actions_truncated"], false);
+        assert_eq!(page["legal_actions_next_offset"], Value::Null);
         assert_eq!(replay_outcome_filter("all"), None);
         assert_eq!(replay_outcome_filter("BEST").as_deref(), Some("clear"));
         assert_eq!(replay_outcome_filter("fail").as_deref(), Some("fail"));

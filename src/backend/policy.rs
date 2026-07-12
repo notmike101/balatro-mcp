@@ -128,7 +128,9 @@ pub fn build_policy_state(
         .get("starting_params")
         .and_then(|params| params.get("discard_limit"))
         .and_then(Value::as_i64);
-    let current_discard_limit = discards_left + discards_used;
+    let current_discard_limit = configured_discard_limit
+        .map(|limit| limit.saturating_sub(discards_used).max(0))
+        .unwrap_or(discards_left);
     let chips_remaining = std::cmp::max(0i64, blind_chips);
 
     let best_play_estimated = estimate_best_play(observation);
@@ -868,7 +870,7 @@ mod tests {
             build_policy_state(&discard_observation, 2, 1, 60)["discard_status"].clone();
         assert_eq!(discard_status["remaining"], 1);
         assert_eq!(discard_status["used"], 1);
-        assert_eq!(discard_status["current_limit"], 2);
+        assert_eq!(discard_status["current_limit"], 4);
         assert_eq!(discard_status["configured_limit"], 5);
         let play_selected = state["legal_actions"]
             .as_array()

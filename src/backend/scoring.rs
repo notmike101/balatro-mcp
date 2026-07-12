@@ -168,9 +168,27 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let indices: Vec<usize> = card_indices
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| (0..hand.len()).collect());
+    let highlighted_indices: Vec<usize> = observation
+        .pointer("/areas/hand_highlighted")
+        .and_then(Value::as_array)
+        .map(|indices| {
+            indices
+                .iter()
+                .filter_map(Value::as_u64)
+                .filter_map(|index| index.checked_sub(1))
+                .map(|index| index as usize)
+                .filter(|index| *index < hand.len())
+                .collect()
+        })
+        .unwrap_or_default();
+    let highlighted_scope = card_indices.is_none() && !highlighted_indices.is_empty();
+    let indices: Vec<usize> = card_indices.map(ToOwned::to_owned).unwrap_or_else(|| {
+        if highlighted_scope {
+            highlighted_indices.clone()
+        } else {
+            (0..hand.len()).collect()
+        }
+    });
     let cards: Vec<Value> = indices
         .iter()
         .filter_map(|index| hand.get(*index).cloned())
@@ -193,7 +211,7 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
     let mut result = ScoreResult {
         hand_key: hand_name.clone(),
         hand_name,
-        score_scope: if card_indices.is_some() {
+        score_scope: if card_indices.is_some() || highlighted_scope {
             "selected_cards".into()
         } else {
             "current_hand".into()
@@ -465,6 +483,27 @@ mod tests {
         assert_eq!(result.run_chips, Some(120));
         assert_eq!(result.blind_chips_required, Some(300));
         assert_eq!(result.blind_chips_remaining, Some(180));
+    }
+
+    #[test]
+    fn score_uses_live_highlighted_cards_when_indices_are_omitted() {
+        let observation = json!({
+            "areas": {
+                "hand": [card("K", "S"), card("9", "H"), card("9", "D"), card("7", "C")],
+                "hand_highlighted": [2, 3]
+            },
+            "poker_hands": {
+                "values": {
+                    "High Card": {"chips": 5, "mult": 1},
+                    "Pair": {"chips": 10, "mult": 2}
+                }
+            }
+        });
+        let result = score_hand(&observation, None);
+        assert_eq!(result.hand_key, "Pair");
+        assert_eq!(result.scoring_cards, vec![1, 2]);
+        assert_eq!(result.score_scope, "selected_cards");
+        assert_eq!(result.exact_score, Some(56));
     }
 
     #[test]
