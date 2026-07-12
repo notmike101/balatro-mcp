@@ -783,6 +783,19 @@ impl Server {
         .await
         {
             Ok(Ok(data)) => {
+                if data.get("ok").and_then(Value::as_bool) == Some(false) {
+                    let message = data
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("bridge rejected the policy action");
+                    let current = self.policy(40).await.unwrap_or(Value::Null);
+                    return to_tool_result(envelope(
+                        false,
+                        current,
+                        action_error_code(message),
+                        message,
+                    ));
+                }
                 let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(settle);
                 let mut changed = false;
                 loop {
