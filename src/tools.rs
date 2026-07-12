@@ -12,9 +12,7 @@ use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{process::Command, sync::Mutex, time::timeout};
 
 use crate::backend::{
-    ipc::{
-        IpcPaths, advance_safe_internal, checkpoint_internal, execute_policy_action, start_new_run,
-    },
+    ipc::{IpcPaths, advance_safe_internal, execute_policy_action, start_new_run},
     policy::{SAFE_TRANSITION_ACTIONS, build_policy_state},
     replay::ReplayDB,
     runtime::{self, balatro_processes, observation_age},
@@ -70,7 +68,14 @@ fn digest(prefix: &str, value: &Value) -> String {
 }
 
 fn decision_id_for(observation: &Value) -> String {
-    digest("d3", observation)
+    let mut basis = observation.clone();
+    if let Some(object) = basis.as_object_mut() {
+        // Bridge sequence/timestamp/last-response fields change on every poll
+        // but do not change the legal action set.
+        object.remove("bridge");
+        object.remove("observed_at_ms");
+    }
+    digest("d3", &basis)
 }
 fn observation_id_for(observation: &Value) -> String {
     digest("o3", observation)
@@ -407,7 +412,11 @@ impl Server {
                 .to_string(),
         ];
         all.extend(args.iter().cloned());
-        self.run_external_json("node", &all, 15.0).await
+        let node = env::var_os("BALATRO_NODE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("node"));
+        self.run_external_json(&node.to_string_lossy(), &all, 15.0)
+            .await
     }
 
     async fn run_external_json(
@@ -828,26 +837,19 @@ impl Server {
         if let Err(problem) = self.preflight().await {
             return to_tool_result(problem);
         }
-        let ipc = self.ipc.clone();
-        let kind = params.kind.clone();
-        match tokio::task::spawn_blocking(move || checkpoint_internal(&ipc, &kind)).await {
-            Ok(Ok(data)) => {
-                if let Ok(observation) = self.read_observation() {
-                    let _ = self
-                        .state_db
-                        .lock()
-                        .await
-                        .checkpoint(&observation, &params.kind);
+        match self.read_observation() {
+            Ok(observation) => match self
+                .state_db
+                .lock()
+                .await
+                .checkpoint(&observation, &params.kind)
+            {
+                Ok(data) => to_tool_result(envelope(true, data, "", "")),
+                Err(error) => {
+                    to_tool_result(envelope(false, Value::Null, "checkpoint_failed", &error))
                 }
-                to_tool_result(envelope(true, data, "", ""))
-            }
-            Ok(Err(e)) => to_tool_result(envelope(false, Value::Null, "checkpoint_failed", &e)),
-            Err(e) => to_tool_result(envelope(
-                false,
-                Value::Null,
-                "checkpoint_failed",
-                &format!("checkpoint worker failed: {e}"),
-            )),
+            },
+            Err(error) => to_tool_result(envelope(false, Value::Null, "checkpoint_failed", &error)),
         }
     }
 
@@ -2316,6 +2318,18 @@ mod tests {
         assert_eq!(action_error_code("stale decision"), "stale_decision");
         assert_eq!(action_error_code("bridge timeout"), "timeout");
         assert_eq!(action_error_code("cannot write"), "action_failed");
+        let bridge_refresh_1 = json!({
+            "game":{"state":"SELECTING_HAND"},
+            "bridge":{"observation_seq":1,"observed_at_ms":100,"last_response":{"id":"1"}}
+        });
+        let bridge_refresh_2 = json!({
+            "game":{"state":"SELECTING_HAND"},
+            "bridge":{"observation_seq":2,"observed_at_ms":200,"last_response":{"id":"2"}}
+        });
+        assert_eq!(
+            decision_id_for(&bridge_refresh_1),
+            decision_id_for(&bridge_refresh_2)
+        );
         let state_data = json!({"game":{"state":"PLAY"}});
         assert!(wait_state_matches(&state_data, "play"));
         assert!(wait_state_matches(&state_data, ""));
