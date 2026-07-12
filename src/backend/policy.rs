@@ -5,7 +5,9 @@ use super::scoring::score_hand;
 
 static EMPTY_VEC: [Value; 0] = [];
 static EMPTY_MAP: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(serde_json::Map::new);
-const MAX_EXPLICIT_HAND_SELECTIONS: usize = 512;
+// The caller-supplied selection templates cover arbitrary positions; keep only
+// a compact prefix of concrete combinations in the default decision payload.
+const MAX_EXPLICIT_HAND_SELECTIONS: usize = 32;
 
 pub const DECISION_STATES: &[&str] = &[
     "BLIND_SELECT",
@@ -208,7 +210,12 @@ fn estimate_best_play(observation: &Value) -> i64 {
     let mut suits = std::collections::HashMap::new();
     for card in hand_array {
         if let Some(base) = card.get("base").and_then(|b| b.as_object()) {
-            let rank = base.get("rank").and_then(|r| r.as_str()).unwrap_or("");
+            let rank = base
+                .get("rank")
+                .or_else(|| base.get("value"))
+                .or_else(|| base.get("id"))
+                .and_then(|r| r.as_str())
+                .unwrap_or("");
             *card_counts.entry(rank).or_insert(0i64) += 1;
         }
         if let Some(sv) = card.get("suits").and_then(|s| s.as_array()) {
