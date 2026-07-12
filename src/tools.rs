@@ -670,6 +670,16 @@ fn synchronize_bridge_response_state(mut response: Value, post_state: &Value) ->
     response
 }
 
+fn wait_state_summary(data: Value) -> Value {
+    let mut summary = compact_observation(data, "summary");
+    if let Some(object) = summary.as_object_mut() {
+        object.insert("read_only".into(), json!(true));
+        object.insert("legal_actions_available".into(), json!(false));
+        object.insert("next_step".into(), json!("get_decision"));
+    }
+    summary
+}
+
 fn state_result(result: Result<Value, String>) -> Result<CallToolResult, rmcp::ErrorData> {
     match result {
         Ok(data) => to_tool_result(envelope(true, data, "", "")),
@@ -830,7 +840,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Return the current decision_id, a paged legal-action list, rankings, and strategy analysis. Use action_type, action_offset, and action_limit to inspect additional action pages when legal_actions_truncated is true; legal_actions_next_offset is null when no page remains. In GAME_OVER, from_game_over is a game-specific ui_click and return_to_menu is also available as a safe_transition. Examine decision_checks.ordering.hand_order and decision_checks.ordering.joker_order when jokers are present and trigger sequence can affect scoring. Examine decision_checks.consumables when Tarot/Planet/Spectral cards are owned or available in shop; use or sell before exiting or advancing. Examine decision_checks.shop and decision_checks.slots during SHOP state to track remaining items and indexes after each purchase."
+        description = "Return the current decision_id, a paged legal-action list, rankings, and strategy analysis. When legal_actions_truncated is true, call get_decision again with action_offset set to legal_actions_next_offset and an explicit action_limit; repeat until legal_actions_next_offset is null. The same pagination contract applies after action_type filtering. In GAME_OVER, from_game_over is a game-specific ui_click and return_to_menu is also available as a safe_transition. Examine decision_checks.ordering.hand_order and decision_checks.ordering.joker_order when jokers are present and trigger sequence can affect scoring. Examine decision_checks.consumables when Tarot/Planet/Spectral cards are owned or available in shop; use or sell before exiting or advancing. Examine decision_checks.shop and decision_checks.slots during SHOP state to track remaining items and indexes after each purchase."
     )]
     async fn get_decision(
         &self,
@@ -1168,12 +1178,9 @@ impl Server {
             {
                 if wait_state_matches(&observation, &params.state) {
                     return match self.policy(20).await {
-                        Ok(data) => to_tool_result(envelope(
-                            true,
-                            compact_observation(data, "summary"),
-                            "",
-                            "",
-                        )),
+                        Ok(data) => {
+                            to_tool_result(envelope(true, wait_state_summary(data), "", ""))
+                        }
                         Err(error) => {
                             to_tool_result(envelope(false, Value::Null, "wait_failed", &error))
                         }
@@ -1725,7 +1732,7 @@ impl rmcp::ServerHandler for Server {
                 .with_description("Rust stdio boundary for safe Balatro gameplay."),
         )
         .with_instructions(
-            "Use only these MCP tools for Balatro. Start with game_status; if the main menu has a non-target saved seed, use start_new_run to recover to 2K9H9HN; then get_decision. Examine decision_checks.ordering when jokers are present; examine decision_checks.consumables for owned or shop Tarot/Planet/Spectral; examine decision_checks.shop and decision_checks.slots during SHOP state; execute only a current legal action_id with its decision_id. For arbitrary hand selections, use play_selected or discard_selected with 1-based card_indices. Page get_decision when legal_actions_truncated is true.",
+            "Use only these MCP tools for Balatro. Start with game_status; if the main menu has a non-target saved seed, use start_new_run to recover to 2K9H9HN; then get_decision. Examine decision_checks.ordering when jokers are present; examine decision_checks.consumables for owned or shop Tarot/Planet/Spectral; examine decision_checks.shop and decision_checks.slots during SHOP state; execute only a current legal action_id with its decision_id. For arbitrary hand selections, use play_selected or discard_selected with 1-based card_indices. observe is read-only and wait_for_state returns next_step=get_decision; page get_decision from legal_actions_next_offset until it is null, including after action_type filtering.",
         )
     }
     #[cfg_attr(coverage_nightly, coverage(off))]
@@ -2331,6 +2338,9 @@ mod tests {
         assert_eq!(waited["state"], "SELECTING_HAND");
         assert_eq!(waited["data"]["state"], "SELECTING_HAND");
         assert!(waited["data"].get("legal_actions").is_none());
+        assert_eq!(waited["data"]["read_only"], true);
+        assert_eq!(waited["data"]["legal_actions_available"], false);
+        assert_eq!(waited["data"]["next_step"], "get_decision");
         assert!(
             server
                 .wait_for_state(Parameters(WaitParams {
