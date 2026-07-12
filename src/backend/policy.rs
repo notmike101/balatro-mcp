@@ -572,7 +572,7 @@ fn generate_legal_actions(
         for i in 0..hand_count {
             for j in 0..hand_count {
                 if i != j {
-                    actions.push(json!({ "action_id": format!("move_card_{}_to_{}", i + 1, j + 1), "action": "move_card", "from_index": i + 1, "to_index": j + 1, "reason": "reorder hand for play" }));
+                    actions.push(json!({ "action_id": format!("move_card_{}_to_{}", i + 1, j + 1), "action": "move_card", "area": "hand", "from_index": i + 1, "to_index": j + 1, "reason": "reorder hand for play" }));
                 }
             }
         }

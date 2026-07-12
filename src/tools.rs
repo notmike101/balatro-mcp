@@ -77,6 +77,19 @@ fn decision_id_for(observation: &Value) -> String {
     }
     digest("d3", &basis)
 }
+
+fn semantic_decision_id_for(policy: &Value) -> String {
+    let basis = json!({
+        "game": policy.get("game"),
+        "legal_actions": policy.get("legal_actions"),
+        "decision_checks": policy.get("decision_checks"),
+        "economy": policy.get("economy"),
+        "slots": policy.get("slots"),
+        "run_phase": policy.get("run_phase"),
+        "score_pressure": policy.get("score_pressure"),
+    });
+    digest("d4", &basis)
+}
 fn observation_id_for(observation: &Value) -> String {
     digest("o3", observation)
 }
@@ -177,7 +190,7 @@ impl Server {
         }
         let observation = self.read_observation()?;
         let mut state = build_policy_state(&observation, limit as usize, 40, 60);
-        let decision_id = decision_id_for(&observation);
+        let decision_id = semantic_decision_id_for(&state);
         let observation_id = observation_id_for(&observation);
         let score = serde_json::to_value(score_hand(&observation, None)).unwrap_or(Value::Null);
         let directives = self
@@ -752,11 +765,6 @@ impl Server {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let before_observation_id = current
-            .get("observation_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
         let action = selected.cloned();
         match tokio::task::spawn_blocking(move || {
             execute_policy_action(
@@ -777,11 +785,10 @@ impl Server {
                 let mut changed = false;
                 loop {
                     if let Ok(observation) = self.read_observation() {
-                        let decision_id = decision_id_for(&observation);
-                        let observation_id = observation_id_for(&observation);
+                        let semantic_state = build_policy_state(&observation, 40, 40, 60);
+                        let decision_id = semantic_decision_id_for(&semantic_state);
                         changed = decision_id != before_decision_id
-                            || observation_state(&observation) != before_state
-                            || observation_id != before_observation_id;
+                            || observation_state(&observation) != before_state;
                         if changed {
                             break;
                         }
