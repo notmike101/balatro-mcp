@@ -1082,12 +1082,12 @@ local function safe_remove(object)
     end
 end
 
-local function command_setup_new_run()
+local function command_setup_new_run(command)
     if not G or not G.SETTINGS then return false, "settings unavailable" end
     if G.SAVED_GAME then
         local saved_seed = G.SAVED_GAME.GAME and G.SAVED_GAME.GAME.pseudorandom and G.SAVED_GAME.GAME.pseudorandom.seed or nil
-        if tostring(saved_seed or "") == CODA.allowed_seed then
-            return false, "saved run exists; resume it instead of starting a new run"
+        if command.override_saved ~= true then
+            return false, "saved run exists; confirm override_saved=true to start a new run"
         end
         G.SAVED_GAME = nil
     end

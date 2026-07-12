@@ -342,7 +342,7 @@ impl Server {
         }
     }
 
-    async fn preflight_new_run(&self) -> Result<Value, Value> {
+    async fn preflight_new_run(&self, confirm_override: bool) -> Result<Value, Value> {
         let status = self.status().await;
         let process_count = status
             .get("processes")
@@ -396,12 +396,18 @@ impl Server {
             .get("ready")
             .and_then(|ready| ready.get("saved_game_seed"))
             .and_then(Value::as_str);
-        if saved_seed == Some(SEED) {
+        let saved_present = observation
+            .get("ready")
+            .and_then(|ready| ready.get("saved_game_present"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || saved_seed.is_some();
+        if saved_present && !confirm_override {
             return Err(envelope(
                 false,
                 status,
-                "saved_run_exists",
-                "saved run already uses the target seed; resume it instead",
+                "confirmation_required",
+                "an existing saved run will be replaced; call start_new_run with confirm_override=true",
             ));
         }
         Ok(status)
@@ -521,11 +527,11 @@ impl Server {
     }
 
     #[tool(
-        description = "Recover from a non-target saved run and start exactly seed 2K9H9HN. Requires one Balatro process, a fresh loaded bridge, and the main menu; never accepts or creates another seed."
+        description = "Always start a new run with exactly seed 2K9H9HN. If a saved run exists, confirm replacement with confirm_override=true. Requires one Balatro process, a fresh loaded bridge, and the main menu; never accepts or creates another seed."
     )]
     async fn start_new_run(
         &self,
-        Parameters(_params): Parameters<StartNewRunParams>,
+        Parameters(params): Parameters<StartNewRunParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let _guard = match self.mutations.try_lock() {
             Ok(guard) => guard,
@@ -538,11 +544,13 @@ impl Server {
                 ));
             }
         };
-        if let Err(problem) = self.preflight_new_run().await {
+        if let Err(problem) = self.preflight_new_run(params.confirm_override).await {
             return to_tool_result(problem);
         }
         let ipc = self.ipc.clone();
-        match tokio::task::spawn_blocking(move || start_new_run(&ipc)).await {
+        match tokio::task::spawn_blocking(move || start_new_run(&ipc, params.confirm_override))
+            .await
+        {
             Ok(Ok(data)) => to_tool_result(envelope(true, data, "", "")),
             Ok(Err(error)) => {
                 to_tool_result(envelope(false, Value::Null, "new_run_failed", &error))
