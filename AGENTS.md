@@ -2,6 +2,19 @@
 
 This repository maintains the Rust MCP server, backend, Lovely bridge, and rules tooling. It does not play the game directly.
 
+## MCP runtime interaction
+
+- Gameplay agents must call the configured `balatro` MCP server/tools directly.
+- If the `balatro` tools are not exposed in the current session, stop and
+  report an MCP host/configuration problem. Do not substitute the server
+  executable's CLI, spawn unmanaged server copies, or write a custom MCP
+  client.
+- Never create helper scripts, command files, observation files, or test
+  harnesses in `D:\balatro-desktop` or elsewhere to emulate MCP usage.
+- `D:\balatro-desktop\AGENTS.md` is the runtime-side contract. Keep gameplay
+  interaction and runtime files out of this repository unless explicitly
+  requested.
+
 ## Architecture
 
 - `src/main.rs` starts the stdio MCP server.
