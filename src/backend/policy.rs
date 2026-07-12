@@ -60,6 +60,7 @@ pub fn build_policy_state(
     };
     let run = observation
         .get("run")
+        .or_else(|| observation.get("round"))
         .and_then(|r| r.as_object())
         .unwrap_or(&EMPTY_MAP);
     let areas = observation
@@ -149,6 +150,7 @@ pub fn build_policy_state(
             "best_play_surplus": best_play_surplus, "estimated_best_plays_needed": estimated_plays_needed,
         },
         "slots": { "jokers": extract_slots(jokers_array), "consumables": extract_slots(consumables_array) },
+        "hand": hand_array,
         "legal_actions": legal_actions, "hand_analysis": hand_analysis,
         "decision_checks": decision_checks,
         "most_played_poker_hand": run.get("most_played_poker_hand").and_then(|m| m.as_str()).unwrap_or("High Card"),
@@ -363,6 +365,7 @@ fn generate_legal_actions(
     };
     let run = observation
         .get("run")
+        .or_else(|| observation.get("round"))
         .and_then(|r| r.as_object())
         .unwrap_or(&EMPTY_MAP);
     let hand_count = hand_array.len();
@@ -724,6 +727,17 @@ mod tests {
             60,
         );
         assert_eq!(numeric_main_menu["legal_actions"][0]["action"], "ui_click");
+        let blind_select = build_policy_state(
+            &json!({
+                "game":{"state":"BLIND_SELECT"},
+                "round":{"blind_choices":{"Small":{"state":"Select"},"Big":{"state":"Upcoming"}}}
+            }),
+            40,
+            40,
+            60,
+        );
+        assert_eq!(blind_select["legal_actions"][0]["action"], "select_blind");
+        assert_eq!(blind_select["legal_actions"][0]["blind"], "Small");
         let menu_without_ready = build_policy_state(&json!({"game":{"state":"MENU"}}), 40, 40, 60);
         assert!(
             menu_without_ready["legal_actions"]
