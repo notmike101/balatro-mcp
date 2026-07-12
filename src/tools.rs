@@ -801,6 +801,12 @@ impl Server {
                 "invalid observe section",
             ));
         }
+        if params.section == "all" {
+            return match self.read_observation() {
+                Ok(data) => to_tool_result(envelope(true, data, "", "")),
+                Err(e) => to_tool_result(envelope(false, Value::Null, "observe_failed", &e)),
+            };
+        }
         match self.policy(40).await {
             Ok(data) => to_tool_result(envelope(
                 true,
@@ -881,7 +887,7 @@ impl Server {
                 false,
                 current,
                 "stale_decision",
-                "decision_id does not match the current live decision",
+                "decision_id is stale because the live state changed; use the returned current decision_id and legal_actions, and do not retry the previous action",
             ));
         }
         let settle = params.settle_timeout.clamp(1.0, 30.0);
@@ -2229,19 +2235,21 @@ mod tests {
     async fn deterministic_observation_and_ipc_route_success_paths() {
         let (_dir, server) = server();
         write_fixture(&server);
-        assert!(
-            server
-                .observe(Parameters(ObserveParams {
-                    section: "all".into()
-                }))
-                .await
-                .is_ok()
-        );
+        let observed = server
+            .observe(Parameters(ObserveParams {
+                section: "all".into(),
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert!(observed["data"]["areas"].is_object());
+        assert!(observed["data"].get("legal_actions").is_none());
         let decision = server
             .get_decision(Parameters(DecisionParams {
                 action_type: String::new(),
                 limit: 10,
-                action_limit: 1,
+                action_limit: 2,
                 action_offset: 0,
             }))
             .await
@@ -2249,9 +2257,16 @@ mod tests {
             .structured_content
             .unwrap();
         assert_eq!(decision["data"]["legal_actions_offset"], 0);
-        assert_eq!(decision["data"]["legal_actions_limit"], 1);
+        assert_eq!(decision["data"]["legal_actions_limit"], 2);
         assert_eq!(decision["data"]["legal_actions_truncated"], true);
-        assert_eq!(decision["data"]["legal_actions_next_offset"], 1);
+        assert_eq!(decision["data"]["legal_actions_next_offset"], 2);
+        assert!(
+            decision["data"]["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action["action_id"] == "discard_selected")
+        );
         assert!(
             server
                 .get_decision(Parameters(DecisionParams {

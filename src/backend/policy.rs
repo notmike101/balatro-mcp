@@ -116,6 +116,19 @@ pub fn build_policy_state(
         .and_then(|c| c.as_i64())
         .unwrap_or(0);
     let hands_left = run.get("hands_left").and_then(|h| h.as_i64()).unwrap_or(0);
+    let discards_left = run
+        .get("discards_left")
+        .and_then(|d| d.as_i64())
+        .unwrap_or(0);
+    let discards_used = run
+        .get("discards_used")
+        .and_then(|d| d.as_i64())
+        .unwrap_or(0);
+    let configured_discard_limit = run
+        .get("starting_params")
+        .and_then(|params| params.get("discard_limit"))
+        .and_then(Value::as_i64);
+    let current_discard_limit = discards_left + discards_used;
     let chips_remaining = std::cmp::max(0i64, blind_chips);
 
     let best_play_estimated = estimate_best_play(observation);
@@ -169,6 +182,10 @@ pub fn build_policy_state(
             "best_play_estimated_score": best_play_estimated, "best_play_clears_blind": best_play_clears,
             "best_play_surplus": best_play_surplus, "estimated_best_plays_needed": estimated_plays_needed,
         },
+        "discard_status": {
+            "remaining": discards_left, "used": discards_used,
+            "current_limit": current_discard_limit, "configured_limit": configured_discard_limit,
+        },
         "slots": { "jokers": extract_slots(jokers_array), "consumables": extract_slots(consumables_array) },
         "hand": hand_array,
         "legal_actions": legal_actions, "hand_analysis": hand_analysis,
@@ -219,7 +236,6 @@ fn determine_best_hand(
     card_counts: &std::collections::HashMap<&str, i64>,
     suits: &std::collections::HashMap<&str, i64>,
 ) -> String {
-    let total: i64 = card_counts.values().sum();
     let max_suit: Option<(&str, i64)> =
         suits.iter().max_by_key(|&(_, c)| *c).map(|(k, v)| (*k, *v));
     let max_suit_count = max_suit.map(|(_, count)| count).unwrap_or(0);
@@ -246,15 +262,45 @@ fn determine_best_hand(
         "Pair".into()
     } else if max_suit_count >= 5 {
         "Flush".into()
-    } else if total >= 5 {
-        "Straight".into()
-    } else if total >= 4 {
+    } else if has_straight(card_counts) {
         "Straight".into()
     } else if max_suit_count >= 3 {
         "Flush".into()
     } else {
         "High Card".into()
     }
+}
+
+fn rank_value(rank: &str) -> Option<u8> {
+    match rank.to_ascii_uppercase().as_str() {
+        "A" | "ACE" => Some(14),
+        "K" | "KING" => Some(13),
+        "Q" | "QUEEN" => Some(12),
+        "J" | "JACK" => Some(11),
+        "T" | "10" => Some(10),
+        value => value
+            .parse()
+            .ok()
+            .filter(|value: &u8| (2..=9).contains(value)),
+    }
+}
+
+fn has_straight(card_counts: &std::collections::HashMap<&str, i64>) -> bool {
+    let mut ranks: Vec<u8> = card_counts
+        .keys()
+        .filter_map(|rank| rank_value(rank))
+        .collect();
+    ranks.sort_unstable();
+    ranks.dedup();
+    if ranks.len() < 5 {
+        return false;
+    }
+    ranks.windows(5).any(|window| window[4] - window[0] == 4)
+        || ranks.contains(&14)
+            && ranks.contains(&2)
+            && ranks.contains(&3)
+            && ranks.contains(&4)
+            && ranks.contains(&5)
 }
 
 fn classify_jokers(jokers_array: &[Value]) -> Vec<&'static str> {
@@ -507,17 +553,6 @@ fn generate_legal_actions(
                 let hand_has_ids = hand_array.iter().all(|card| card_id(card).is_some());
                 let max_play_cards = std::cmp::min(hand_count, play_limit);
                 if hand_has_ids && max_play_cards > 0 {
-                    for (zero_based, ids) in hand_selection_combinations(
-                        hand_array,
-                        max_play_cards,
-                        MAX_EXPLICIT_HAND_SELECTIONS,
-                    ) {
-                        let score = score_hand(observation, Some(&zero_based));
-                        let indices: Vec<usize> =
-                            zero_based.iter().map(|index| index + 1).collect();
-                        let card_count = indices.len();
-                        actions.push(json!({ "action_id": format!("play_{}", ids.join("_")), "action": "play", "cards": indices, "card_indices": indices, "card_ids": ids, "estimated_score": score.estimated_score, "score_quality": score.estimate_quality, "reason": format!("play {} cards ({} hands left)", card_count, hands_left) }));
-                    }
                     actions.push(json!({
                         "action_id": "play_selected",
                         "action": "play",
@@ -539,16 +574,6 @@ fn generate_legal_actions(
                 let hand_has_ids = hand_array.iter().all(|card| card_id(card).is_some());
                 let max_discard_cards = std::cmp::min(hand_count - 1, discard_limit);
                 if hand_has_ids && max_discard_cards > 0 {
-                    for (zero_based, ids) in hand_selection_combinations(
-                        hand_array,
-                        max_discard_cards,
-                        MAX_EXPLICIT_HAND_SELECTIONS,
-                    ) {
-                        let indices: Vec<usize> =
-                            zero_based.iter().map(|index| index + 1).collect();
-                        let card_count = indices.len();
-                        actions.push(json!({ "action_id": format!("discard_{}", ids.join("_")), "action": "discard", "cards": indices, "card_indices": indices, "card_ids": ids, "reason": format!("discard {} cards ({} discards left)", card_count, discards_left) }));
-                    }
                     actions.push(json!({
                         "action_id": "discard_selected",
                         "action": "discard",
@@ -560,6 +585,44 @@ fn generate_legal_actions(
                         "max_cards": max_discard_cards,
                         "reason": "discard any distinct hand positions supplied in card_indices"
                     }));
+                }
+            }
+            let hands_left = run.get("hands_left").and_then(|h| h.as_i64()).unwrap_or(0) as usize;
+            if hands_left > 0 && hand_count > 0 {
+                let hand_has_ids = hand_array.iter().all(|card| card_id(card).is_some());
+                let max_play_cards = std::cmp::min(hand_count, play_limit);
+                if hand_has_ids && max_play_cards > 0 {
+                    for (zero_based, ids) in hand_selection_combinations(
+                        hand_array,
+                        max_play_cards,
+                        MAX_EXPLICIT_HAND_SELECTIONS,
+                    ) {
+                        let score = score_hand(observation, Some(&zero_based));
+                        let indices: Vec<usize> =
+                            zero_based.iter().map(|index| index + 1).collect();
+                        let card_count = indices.len();
+                        actions.push(json!({ "action_id": format!("play_{}", ids.join("_")), "action": "play", "cards": indices, "card_indices": indices, "card_ids": ids, "estimated_score": score.estimated_score, "score_quality": score.estimate_quality, "reason": format!("play {} cards ({} hands left)", card_count, hands_left) }));
+                    }
+                }
+            }
+            let discards_left = run
+                .get("discards_left")
+                .and_then(|d| d.as_i64())
+                .unwrap_or(0) as usize;
+            if discards_left > 0 && hand_count > 1 {
+                let hand_has_ids = hand_array.iter().all(|card| card_id(card).is_some());
+                let max_discard_cards = std::cmp::min(hand_count - 1, discard_limit);
+                if hand_has_ids && max_discard_cards > 0 {
+                    for (zero_based, ids) in hand_selection_combinations(
+                        hand_array,
+                        max_discard_cards,
+                        MAX_EXPLICIT_HAND_SELECTIONS,
+                    ) {
+                        let indices: Vec<usize> =
+                            zero_based.iter().map(|index| index + 1).collect();
+                        let card_count = indices.len();
+                        actions.push(json!({ "action_id": format!("discard_{}", ids.join("_")), "action": "discard", "cards": indices, "card_indices": indices, "card_ids": ids, "reason": format!("discard {} cards ({} discards left)", card_count, discards_left) }));
+                    }
                 }
             }
         }
@@ -798,6 +861,15 @@ mod tests {
     fn policy_state_covers_play_discard_ordering_and_checks() {
         let state = build_policy_state(&observation("SELECTING_HAND"), 2, 1, 60);
         assert_eq!(state["legal_actions"][0]["action"], "play");
+        let mut discard_observation = observation("SELECTING_HAND");
+        discard_observation["run"]["discards_used"] = json!(1);
+        discard_observation["run"]["starting_params"] = json!({"discard_limit": 5});
+        let discard_status =
+            build_policy_state(&discard_observation, 2, 1, 60)["discard_status"].clone();
+        assert_eq!(discard_status["remaining"], 1);
+        assert_eq!(discard_status["used"], 1);
+        assert_eq!(discard_status["current_limit"], 2);
+        assert_eq!(discard_status["configured_limit"], 5);
         let play_selected = state["legal_actions"]
             .as_array()
             .unwrap()
@@ -1036,7 +1108,12 @@ mod tests {
             (
                 vec![("A", 1), ("K", 1), ("Q", 1), ("J", 1)],
                 vec![],
-                "Straight",
+                "High Card",
+            ),
+            (
+                vec![("A", 1), ("K", 1), ("Q", 1), ("J", 1), ("9", 1)],
+                vec![],
+                "High Card",
             ),
             (vec![("A", 1), ("K", 1), ("Q", 1)], vec![("H", 3)], "Flush"),
             (vec![("A", 1)], vec![], "High Card"),
@@ -1058,6 +1135,20 @@ mod tests {
         assert_eq!(
             estimate_best_play_raw(&[json!({"suits":[{"key":"H"}]})], &json!({})),
             5
+        );
+        assert_eq!(
+            estimate_best_play(&json!({
+                "areas":{"hand":[
+                    {"base":{"rank":"A"}}, {"base":{"rank":"K"}},
+                    {"base":{"rank":"Q"}}, {"base":{"rank":"J"}},
+                    {"base":{"rank":"9"}}
+                ]},
+                "poker_hands":{"values":{
+                    "High Card":{"chips":10,"mult":2},
+                    "Straight":{"chips":100,"mult":100}
+                }}
+            })),
+            20
         );
         assert_eq!(analyze_hands(&[], &json!({})), json!({}));
         assert!(
