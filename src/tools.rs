@@ -12,7 +12,9 @@ use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{process::Command, sync::Mutex, time::timeout};
 
 use crate::backend::{
-    ipc::{IpcPaths, advance_safe_internal, checkpoint_internal, execute_policy_action},
+    ipc::{
+        IpcPaths, advance_safe_internal, checkpoint_internal, execute_policy_action, start_new_run,
+    },
     policy::{SAFE_TRANSITION_ACTIONS, build_policy_state},
     replay::ReplayDB,
     runtime::{self, balatro_processes, observation_age},
@@ -198,7 +200,7 @@ impl Server {
             .clone()
             .unwrap_or_else(|| balatro_processes().unwrap_or_default());
         let observation = self.read_observation();
-        let obs_path = self.runtime_root.join("Balatro/codex_observation.json");
+        let obs_path = self.ipc.observation_path.clone();
         let age = observation_age(&obs_path);
         let bridge: &serde_json::Map<String, Value> = observation
             .as_ref()
@@ -330,6 +332,71 @@ impl Server {
             }
             Ok(status)
         }
+    }
+
+    async fn preflight_new_run(&self) -> Result<Value, Value> {
+        let status = self.status().await;
+        let process_count = status
+            .get("processes")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        if process_count != 1 {
+            return Err(envelope(
+                false,
+                status,
+                "process_count",
+                "exactly one Balatro.exe process required",
+            ));
+        }
+        let observation = match self.read_observation() {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(envelope(false, status, "observation_unavailable", &error));
+            }
+        };
+        let age = status
+            .get("observation_age_seconds")
+            .and_then(Value::as_f64);
+        let processes = status
+            .get("processes")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if let Err(error) = runtime::validate_runtime(&observation, processes, age) {
+            return Err(envelope(
+                false,
+                status,
+                "unsafe_runtime",
+                &error.to_string(),
+            ));
+        }
+        let state = observation
+            .pointer("/game/state_name")
+            .and_then(Value::as_str)
+            .or_else(|| observation.pointer("/game/state").and_then(Value::as_str))
+            .or_else(|| observation.get("state").and_then(Value::as_str))
+            .unwrap_or_default();
+        if !state.eq_ignore_ascii_case("MENU") && !state.eq_ignore_ascii_case("MAIN_MENU") {
+            return Err(envelope(
+                false,
+                status,
+                "invalid_state",
+                "start_new_run requires the Balatro main menu",
+            ));
+        }
+        let saved_seed = observation
+            .get("ready")
+            .and_then(|ready| ready.get("saved_game_seed"))
+            .and_then(Value::as_str);
+        if saved_seed == Some(SEED) {
+            return Err(envelope(
+                false,
+                status,
+                "saved_run_exists",
+                "saved run already uses the target seed; resume it instead",
+            ));
+        }
+        Ok(status)
     }
 
     pub async fn node(&self, args: &[String]) -> Result<Value, String> {
@@ -488,6 +555,42 @@ impl Server {
         match self.ensure_runtime_impl().await {
             Ok(data) => to_tool_result(envelope(true, data, "", "")),
             Err(e) => to_tool_result(envelope(false, Value::Null, "runtime_failed", &e)),
+        }
+    }
+
+    #[tool(
+        description = "Recover from a non-target saved run and start exactly seed 2K9H9HN. Requires one Balatro process, a fresh loaded bridge, and the main menu; never accepts or creates another seed."
+    )]
+    async fn start_new_run(
+        &self,
+        Parameters(_params): Parameters<StartNewRunParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let _guard = match self.mutations.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return to_tool_result(envelope(
+                    false,
+                    Value::Null,
+                    "mutation_busy",
+                    "another mutation is already in progress",
+                ));
+            }
+        };
+        if let Err(problem) = self.preflight_new_run().await {
+            return to_tool_result(problem);
+        }
+        let ipc = self.ipc.clone();
+        match tokio::task::spawn_blocking(move || start_new_run(&ipc)).await {
+            Ok(Ok(data)) => to_tool_result(envelope(true, data, "", "")),
+            Ok(Err(error)) => {
+                to_tool_result(envelope(false, Value::Null, "new_run_failed", &error))
+            }
+            Err(error) => to_tool_result(envelope(
+                false,
+                Value::Null,
+                "new_run_failed",
+                &format!("new run worker failed: {error}"),
+            )),
         }
     }
 
@@ -1257,7 +1360,7 @@ impl rmcp::ServerHandler for Server {
                 .with_description("Rust stdio boundary for safe Balatro gameplay."),
         )
         .with_instructions(
-            "Use only these MCP tools for Balatro. Start with game_status, then get_decision; examine decision_checks.ordering when jokers are present; examine decision_checks.consumables for owned or shop Tarot/Planet/Spectral; examine decision_checks.shop and decision_checks.slots during SHOP state; execute only legal action_id with its decision_id.",
+            "Use only these MCP tools for Balatro. Start with game_status; if the main menu has a non-target saved seed, use start_new_run to recover to 2K9H9HN; then get_decision. Examine decision_checks.ordering when jokers are present; examine decision_checks.consumables for owned or shop Tarot/Planet/Spectral; examine decision_checks.shop and decision_checks.slots during SHOP state; execute only legal action_id with its decision_id.",
         )
     }
     #[cfg_attr(coverage_nightly, coverage(off))]
