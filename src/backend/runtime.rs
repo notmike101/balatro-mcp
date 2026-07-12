@@ -62,9 +62,14 @@ pub fn observation_age(observation_path: &PathBuf) -> Option<f64> {
 
 /// Extract the seed from observation data.
 pub fn observation_seed(observation: &Value) -> Option<String> {
-    let round = observation.get("round")?;
-    let ready = observation.get("ready")?;
-    let seed = round.get("seed").or_else(|| ready.get("saved_game_seed"))?;
+    let seed = observation
+        .get("round")
+        .and_then(|round| round.get("seed"))
+        .or_else(|| {
+            observation
+                .get("ready")
+                .and_then(|ready| ready.get("saved_game_seed"))
+        })?;
     seed.as_str()
         .map(str::to_owned)
         .or_else(|| Some(seed.to_string()))
@@ -227,6 +232,11 @@ mod tests {
     #[test]
     fn test_observation_seed_with_saved_game_seed() {
         let obs = json!({"round":{},"ready":{"saved_game_seed":"2K9H9HN"}});
+        assert_eq!(observation_seed(&obs), Some("2K9H9HN".to_string()));
+    }
+    #[test]
+    fn test_observation_seed_from_menu_ready_state_without_round() {
+        let obs = json!({"game":{"state":"MENU"},"ready":{"saved_game_seed":"2K9H9HN"}});
         assert_eq!(observation_seed(&obs), Some("2K9H9HN".to_string()));
     }
     #[test]
