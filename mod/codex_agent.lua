@@ -38,6 +38,19 @@ local function _get_hand_played_counts()
     return counts
 end
 
+local function _current_hand_type()
+    if not G or not G.GAME then return nil end
+    local current_round = G.GAME.current_round
+    local current_hand = current_round and current_round.current_hand
+    local candidate = G.GAME.last_hand_played
+        or (current_hand and (current_hand.handname or current_hand.handname_text))
+    if type(candidate) == 'table' then
+        candidate = candidate.text or candidate.name or candidate.key
+    end
+    if type(candidate) == 'string' and candidate ~= '' then return candidate end
+    return nil
+end
+
 -- Fix up chips_earned from total_chips diffs. Call after any recording.
 local function _recompute_earnings()
     local n = #CODA.play_history
@@ -108,16 +121,21 @@ local function capture_hand_score()
             end
         end
 
+        local detected_hand = changed_hand or _current_hand_type()
+
         if existing_entry then
             -- Update existing entry with latest chip values (multi-step scoring catching up)
             local new_delta = math.max(0, chips_this - CODA._chips_at_last_capture)
             existing_entry.chips_earned = math.max(existing_entry.chips_earned, new_delta)
             existing_entry.total_chips = chips_this
+            if existing_entry.hand_type == nil or existing_entry.hand_type == 'Unknown' then
+                existing_entry.hand_type = detected_hand or existing_entry.hand_type or 'Unknown'
+            end
         elseif current_hands_played > (CODA._last_hand_num_captured or -1) then
 -- DEBUG: removed noisy print statement --
             table.insert(CODA.play_history, {
                 hand_num = current_hands_played,
-                hand_type = changed_hand or 'Unknown',
+                hand_type = detected_hand or 'Unknown',
                 chips_earned = score_delta,
                 total_chips = chips_this,
             })
@@ -919,7 +937,7 @@ function CODA.observe()
         run_info = run_info_summary(),
         round = round_summary(),
         poker_hands = poker_hands_summary(),
-        deprecated_fields = {"round.hands", "run_info.hand_upgrades"},
+        deprecated_fields = {"round.hands"},
         blind = blind_summary(),
         play_history = CODA.play_history or {},
         ui = collect_ui_nodes(),
