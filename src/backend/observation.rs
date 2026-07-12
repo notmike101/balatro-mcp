@@ -55,7 +55,7 @@ fn compact_hand(data: &Value) -> Value {
             "cards": cards.iter().map(|card| {
                 serde_json::json!({
                     "index": card.get("index"),
-                    "instance_id": card.get("instance_id"),
+                    "instance_id": card.get("instance_id").or_else(|| card.get("id")),
                     "base": card.get("base"),
                     "edition": card.get("edition"),
                     "seal": card.get("seal"),
