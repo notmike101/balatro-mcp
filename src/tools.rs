@@ -717,6 +717,14 @@ impl Server {
                 "current observation has no decision_id",
             ));
         }
+        if params.decision_id != current_decision_id {
+            return to_tool_result(envelope(
+                false,
+                current,
+                "stale_decision",
+                "decision_id does not match the current live decision",
+            ));
+        }
         let settle = params.settle_timeout.clamp(1.0, 30.0);
         let selected = current
             .get("legal_actions")
@@ -835,14 +843,44 @@ impl Server {
             return to_tool_result(problem);
         }
         let steps = params.max_steps.clamp(1, 20) as u32;
-        let before_state = self.policy(20).await.ok().and_then(|value| {
-            value
-                .pointer("/game/state")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        });
+        let before_policy = match self.policy(20).await {
+            Ok(value) => value,
+            Err(error) => {
+                return to_tool_result(envelope(false, Value::Null, "advance_failed", &error));
+            }
+        };
+        let before_state = before_policy
+            .pointer("/game/state")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let available: Vec<String> = before_policy
+            .get("legal_actions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|action| {
+                action.get("action").and_then(Value::as_str) == Some("safe_transition")
+            })
+            .filter_map(|action| {
+                action
+                    .get("action_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+        if available.is_empty() {
+            return to_tool_result(envelope(
+                false,
+                before_policy,
+                "advance_failed",
+                "no safe transition is legal in the current state",
+            ));
+        }
         // Try each safe transition action from the policy module.
         for action in SAFE_TRANSITION_ACTIONS {
+            if !available.iter().any(|candidate| candidate == action) {
+                continue;
+            }
             match advance_safe_internal(&self.ipc, action, steps) {
                 Ok(bridge_data) => {
                     match self.policy(40).await {
