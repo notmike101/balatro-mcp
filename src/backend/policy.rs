@@ -65,12 +65,12 @@ pub fn build_policy_state(
 ) -> Value {
     let game = observation
         .get("game")
-        .and_then(|g| g.get("state"))
+        .and_then(|g| g.get("state_name"))
         .and_then(|s| s.as_str())
         .or_else(|| {
             observation
                 .get("game")
-                .and_then(|g| g.get("state_name"))
+                .and_then(|g| g.get("state"))
                 .and_then(|s| s.as_str())
         })
         .unwrap_or("");
@@ -489,12 +489,12 @@ fn generate_legal_actions(
     let mut actions = Vec::new();
     let state = observation
         .get("game")
-        .and_then(|g| g.get("state"))
+        .and_then(|g| g.get("state_name"))
         .and_then(|s| s.as_str())
         .or_else(|| {
             observation
                 .get("game")
-                .and_then(|g| g.get("state_name"))
+                .and_then(|g| g.get("state"))
                 .and_then(|s| s.as_str())
         })
         .unwrap_or("");
@@ -1116,6 +1116,13 @@ mod tests {
                 .iter()
                 .any(|a| a["action"] == "safe_transition")
         );
+
+        let mut numeric_game_over = observation("not-a-state-name");
+        numeric_game_over["game"] = json!({"state": 4, "state_name": "GAME_OVER"});
+        let recovery_state = build_policy_state(&numeric_game_over, 40, 40, 60);
+        let recovery = recovery_state["legal_actions"].as_array().unwrap();
+        assert!(recovery.iter().any(|a| a["action_id"] == "from_game_over"));
+        assert!(recovery.iter().any(|a| a["action_id"] == "return_to_menu"));
 
         let round_eval = build_policy_state(&observation("ROUND_EVAL"), 40, 40, 60);
         assert!(

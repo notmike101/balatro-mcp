@@ -911,6 +911,10 @@ local function available_actions()
     if G.STATE == G.STATES.ROUND_EVAL then
         actions[#actions + 1] = "cash_out"
     end
+    if G.STATE == G.STATES.GAME_OVER then
+        actions[#actions + 1] = "from_game_over"
+        actions[#actions + 1] = "return_to_menu"
+    end
     if G.STATE == G.STATES.SHOP then
         actions[#actions + 1] = "buy"
         actions[#actions + 1] = "buy_and_use"
@@ -931,9 +935,7 @@ end
 
 function CODA.observe()
     -- Capture scores during observe cycle (0.25s after play command, E_MANAGER should be done)
-    capture_hand_score()
-
-    CODA.observation_seq = CODA.observation_seq + 1
+    pcall(capture_hand_score)
     local observation = {
         bridge = {
             loaded = true,
@@ -1000,10 +1002,14 @@ local function write_json_file(path, value)
 end
 
 function CODA.write_observation()
+    -- Advance the sequence even if a transient game-state collector fails.
+    -- This keeps Rust-side freshness checks alive across run transitions.
+    CODA.observation_seq = (CODA.observation_seq or 0) + 1
     local ok, observation = pcall(CODA.observe)
     if ok then
         write_json_file(CODA.observation_path, observation)
     else
+        local seed = G and G.GAME and G.GAME.pseudorandom and G.GAME.pseudorandom.seed or nil
         write_json_file(CODA.observation_path, {
             bridge = {
                 loaded = true,
@@ -1012,6 +1018,11 @@ function CODA.write_observation()
                 observation_seq = CODA.observation_seq,
                 response_seq = CODA.response_seq
             },
+            game = {
+                state = G and G.STATE,
+                state_name = state_name()
+            },
+            run_info = {seed = seed},
             error = tostring(observation)
         })
     end
@@ -1777,7 +1788,7 @@ if not CODA.installed_update_hook then
     CODA.installed_update_hook = true
     local previous_love_update = love.update
     love.update = function(dt)
-        if previous_love_update then previous_love_update(dt) end
-        if CODA and CODA.update then CODA.update(dt) end
+        if previous_love_update then pcall(previous_love_update, dt) end
+        if CODA and CODA.update then pcall(CODA.update, dt) end
     end
 end
