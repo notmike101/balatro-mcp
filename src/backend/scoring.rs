@@ -220,7 +220,7 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
         run_chips,
         blind_chips_required,
         blind_chips_remaining,
-        scoring_cards: indices,
+        scoring_cards: indices.iter().map(|index| index + 1).collect(),
         chips: base_chips,
         mult,
         x_mult: 1.0,
@@ -234,7 +234,7 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
         if let Some(rank) = card_rank(card) {
             result.chips += i64::from(rank.min(10));
         }
-        let original_index = result.scoring_cards[position];
+        let original_index = indices[position];
         add_modifier(&mut result, card, original_index);
     }
     let mut chips = result.chips;
@@ -501,7 +501,7 @@ mod tests {
         });
         let result = score_hand(&observation, None);
         assert_eq!(result.hand_key, "Pair");
-        assert_eq!(result.scoring_cards, vec![1, 2]);
+        assert_eq!(result.scoring_cards, vec![2, 3]);
         assert_eq!(result.score_scope, "selected_cards");
         assert_eq!(result.exact_score, Some(56));
     }
@@ -566,7 +566,7 @@ mod tests {
             "poker_hands":{"values":{"High Card":{"chips":10,"mult":2}}}
         });
         let result = score_hand(&observation, Some(&[0, 99]));
-        assert_eq!(result.scoring_cards, vec![0, 99]);
+        assert_eq!(result.scoring_cards, vec![1, 100]);
         assert!(result.x_mult > 1.0);
         assert!(result.unsupported_effects.iter().any(|x| x == "Unknown"));
         assert_eq!(result.estimate_quality, "partial_contract");

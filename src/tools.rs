@@ -671,10 +671,17 @@ fn synchronize_bridge_response_state(mut response: Value, post_state: &Value) ->
 }
 
 fn wait_state_summary(data: Value) -> Value {
+    let legal_actions_available = data
+        .get("legal_actions")
+        .and_then(Value::as_array)
+        .is_some_and(|actions| !actions.is_empty());
     let mut summary = compact_observation(data, "summary");
     if let Some(object) = summary.as_object_mut() {
         object.insert("read_only".into(), json!(true));
-        object.insert("legal_actions_available".into(), json!(false));
+        object.insert(
+            "legal_actions_available".into(),
+            json!(legal_actions_available),
+        );
         object.insert("next_step".into(), json!("get_decision"));
     }
     summary
@@ -861,7 +868,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Execute exactly one current legal action using action_id and a non-empty decision_id. For arbitrary play/discard selections, use the legal play_selected or discard_selected action with 1-based card_indices. The current legal action set is authoritative because bridge polling can refresh snapshots between tool calls; mutations are serialized and checkpointed."
+        description = "Execute exactly one current legal action using action_id and a non-empty decision_id. For arbitrary play/discard selections, use the legal play_selected or discard_selected action with 1-based card_indices. If the live state changes and stale_decision is returned, use the returned current decision_id and legal_actions, then retry the action. The current legal action set is authoritative because bridge polling can refresh snapshots between tool calls; mutations are serialized and checkpointed."
     )]
     async fn take_action(
         &self,
@@ -1524,24 +1531,34 @@ impl Server {
     }
 
     #[tool(
-        description = "Score selected hand cards using the live poker-hand contract and explicit estimate metadata. When card_indices is omitted, the live highlighted hand selection is used when present; otherwise the full hand is scored."
+        description = "Score selected hand cards using the live poker-hand contract and explicit estimate metadata. card_indices uses 1-based hand positions, matching play/discard actions. When omitted, the live highlighted hand selection is used when present; otherwise the full hand is scored."
     )]
     async fn score_hand(
         &self,
         Parameters(params): Parameters<ScoreParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let selected_indices = if params.card_indices.is_empty() {
+            None
+        } else {
+            let mut indices = Vec::with_capacity(params.card_indices.len());
+            for index in params.card_indices {
+                if index == 0 {
+                    return to_tool_result(envelope(
+                        false,
+                        Value::Null,
+                        "invalid_arguments",
+                        "score_hand card_indices are 1-based and must be non-zero",
+                    ));
+                }
+                indices.push(index - 1);
+            }
+            Some(indices)
+        };
         match self.read_observation() {
             Ok(observation) => to_tool_result(envelope(
                 true,
-                serde_json::to_value(score_hand(
-                    &observation,
-                    if params.card_indices.is_empty() {
-                        None
-                    } else {
-                        Some(params.card_indices.as_slice())
-                    },
-                ))
-                .unwrap_or(Value::Null),
+                serde_json::to_value(score_hand(&observation, selected_indices.as_deref()))
+                    .unwrap_or(Value::Null),
                 "",
                 "",
             )),
@@ -1687,7 +1704,9 @@ impl Server {
         }
     }
 
-    #[tool(description = "Read recent Rust-owned run events.")]
+    #[tool(
+        description = "Read recent Rust-owned run events, newest checkpoint first. This is explicit checkpoint history, not an automatic live-observation stream; call run_state with a checkpoint kind to record the current observation."
+    )]
     async fn event_history(
         &self,
         Parameters(params): Parameters<StateParams>,
@@ -1732,7 +1751,7 @@ impl rmcp::ServerHandler for Server {
                 .with_description("Rust stdio boundary for safe Balatro gameplay."),
         )
         .with_instructions(
-            "Use only these MCP tools for Balatro. Start with game_status; if the main menu has a non-target saved seed, use start_new_run to recover to 2K9H9HN; then get_decision. Examine decision_checks.ordering when jokers are present; examine decision_checks.consumables for owned or shop Tarot/Planet/Spectral; examine decision_checks.shop and decision_checks.slots during SHOP state; execute only a current legal action_id with its decision_id. For arbitrary hand selections, use play_selected or discard_selected with 1-based card_indices. observe is read-only and wait_for_state returns next_step=get_decision; page get_decision from legal_actions_next_offset until it is null, including after action_type filtering.",
+            "Use only these MCP tools for Balatro. Start with game_status; if the main menu has a non-target saved seed, use start_new_run to recover to 2K9H9HN; then get_decision. Examine decision_checks.ordering when jokers are present; examine decision_checks.consumables for owned or shop Tarot/Planet/Spectral; examine decision_checks.shop and decision_checks.slots during SHOP state; execute only a current legal action_id with its decision_id, refreshing and retrying on stale_decision. In ROUND_EVAL use proceed_round, then next_round in SHOP. For arbitrary hand selections, use play_selected or discard_selected with 1-based card_indices. score_hand also uses 1-based indices and hand_values returns the live contract. observe is read-only and wait_for_state returns next_step=get_decision; page get_decision from legal_actions_next_offset until it is null, including after action_type filtering. Use run_state(kind=checkpoint) before event_history when current live history is needed.",
         )
     }
     #[cfg_attr(coverage_nightly, coverage(off))]
@@ -2137,7 +2156,7 @@ mod tests {
         assert!(
             server
                 .score_hand(Parameters(ScoreParams {
-                    card_indices: vec![0]
+                    card_indices: vec![1]
                 }))
                 .await
                 .is_ok()
@@ -2320,7 +2339,7 @@ mod tests {
         assert!(
             server
                 .score_hand(Parameters(ScoreParams {
-                    card_indices: vec![0]
+                    card_indices: vec![1]
                 }))
                 .await
                 .is_ok()
@@ -2339,7 +2358,7 @@ mod tests {
         assert_eq!(waited["data"]["state"], "SELECTING_HAND");
         assert!(waited["data"].get("legal_actions").is_none());
         assert_eq!(waited["data"]["read_only"], true);
-        assert_eq!(waited["data"]["legal_actions_available"], false);
+        assert_eq!(waited["data"]["legal_actions_available"], true);
         assert_eq!(waited["data"]["next_step"], "get_decision");
         assert!(
             server

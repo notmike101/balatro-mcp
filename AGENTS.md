@@ -40,6 +40,8 @@ There are no Python, Node.js, or JavaScript subprocesses. Runtime files and the 
 - Runtime startup is external. `ensure_runtime` verifies state and never launches Balatro.
 - Use the exact current `decision_id` and legal `action_id` for every action. When `legal_actions_truncated` is true, call `get_decision` with `action_offset=legal_actions_next_offset` and an explicit `action_limit`; repeat until `legal_actions_next_offset` is null, including when `action_type` filters are used. Use the legal `play_selected`/`discard_selected` actions with 1-based `card_indices` for arbitrary hand positions.
 - `observe` is read-only state and `wait_for_state` only confirms state; neither returns actionable legal actions or a decision ID. Call `get_decision` afterward. In `GAME_OVER`, `from_game_over` is a `ui_click`; `return_to_menu` is also a valid `safe_transition`.
+- If `stale_decision` is returned, refresh from the returned decision payload and retry with its current `decision_id`. `ROUND_EVAL` uses `proceed_round`; `SHOP` uses `next_round`. `score_hand` inputs and `score_analysis.scoring_cards` use 1-based hand positions.
+- `event_history` contains explicit Rust-owned checkpoints, newest first; call `run_state` with `kind=checkpoint` before reading it when current live state is needed. `hand_values` returns the live poker-hand contract.
 - Treat `exact_score` and `estimated_score` separately; unsupported effects must remain visible in `unsupported_effects`.
 - Strategy, lessons, estimation feedback, current-run state, and event history are Rust-owned MCP capabilities backed by `agent/rust_state.db`.
 - Preserve hidden-card sanitization and never expose arbitrary filesystem contents.
