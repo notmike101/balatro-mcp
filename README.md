@@ -4,6 +4,8 @@ Safe Windows stdio MCP for playing Balatro through legal policy actions. The ser
 
 This repository intentionally excludes Balatro binaries, saves, Lovely logs, local databases, captured observations, credentials, and Balatro source/data files. You need a legitimate local Balatro installation.
 
+The server uses the standard MCP `tools/list` and `tools/call` methods. The `tools: {}` object in an `initialize` capabilities response means that tool support is enabled; tool definitions are returned by `tools/list`. `callTool` is not an MCP method.
+
 ## Install
 
 1. Clone this repository into a code directory such as `D:\balatro-mcp`. Keep the game installation and its mutable runtime files in a separate directory such as `D:\balatro-desktop`.
