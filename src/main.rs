@@ -6,6 +6,7 @@ mod guide;
 mod infra;
 mod models;
 mod protocol;
+mod rules;
 mod tools;
 
 use rmcp::ServiceExt;
@@ -15,6 +16,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::env::var_os("BALATRO_MCP_ROOT")
         .map(std::path::PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(value) = rules::cli(&root, &args)? {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
     let server = infra::Server::new(root).map_err(std::io::Error::other)?;
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;

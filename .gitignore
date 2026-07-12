@@ -11,8 +11,8 @@ steam_appid.txt
 nul
 *.disabled
 balatro.rep
-tools/balatro-info-db/balatro_src/
-tools/balatro-info-db/data/
+rules/balatro_src/
+data/balatro.sqlite
 agent/policies.db
 .codegraph/
 target/
