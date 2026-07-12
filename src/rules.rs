@@ -209,7 +209,11 @@ fn card_rows(db: &Connection, rank: &str, suit: Option<&str>) -> Result<Vec<Valu
         .collect())
 }
 fn lookup(db: &Connection, kind: &str, name: &str, o: &LookupOptions) -> Result<Value, String> {
-    let normalized = kind.to_ascii_lowercase().replace('_', "-");
+    let normalized = match kind.to_ascii_lowercase().replace('_', "-").as_str() {
+        "back" | "decks" => "deck".to_string(),
+        "playingcards" => "playing-card".to_string(),
+        other => other.to_string(),
+    };
     if normalized == "card" || normalized == "playing-card" {
         let (rank_name, inferred_suit) = name
             .split_once(" of ")
@@ -244,7 +248,7 @@ fn lookup(db: &Connection, kind: &str, name: &str, o: &LookupOptions) -> Result<
         .find(|(r, _)| r.eq_ignore_ascii_case(rank))
         .map(|(_, n)| *n)
         .unwrap_or(0);
-        let mut result = json!({"query": {"type": "playing-card", "rank": rank}, "card": {"rank": rank, "suits": cards.iter().filter_map(|c| c["data"]["suit"].as_str()).collect::<Vec<_>>(), "baseChips": base}, "modifiers": {}});
+        let mut result = json!({"query": {"type": "playing-card", "rank": rank}, "entity": {"key": cards[0]["key"], "type": "Playing Card", "name": cards[0]["name"], "effect": cards[0]["effect"], "description": cards[0]["effect"], "config": cards[0]["config"]}, "card": {"rank": rank, "suits": cards.iter().filter_map(|c| c["data"]["suit"].as_str()).collect::<Vec<_>>(), "baseChips": base}, "modifiers": {}});
         if let Some(suit) = suit {
             result["query"]["suit"] = json!(suit);
         }

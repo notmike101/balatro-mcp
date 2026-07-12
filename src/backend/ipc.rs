@@ -340,9 +340,25 @@ pub fn start_new_run(paths: &IpcPaths, confirm_override: bool) -> Result<Value, 
         "override_saved": confirm_override,
     });
     paths.write_command(&setup)?;
-    let setup_response = paths
+    let mut setup_response = paths
         .wait_for_response(&setup_id, 30.0)?
         .ok_or("no response from bridge for setup_new_run")?;
+    if setup_response
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(|message| message.contains("retry setup_new_run"))
+    {
+        let retry_id = paths.next_command_id();
+        let retry = serde_json::json!({
+            "id": retry_id,
+            "action": "setup_new_run",
+            "override_saved": confirm_override,
+        });
+        paths.write_command(&retry)?;
+        setup_response = paths
+            .wait_for_response(&retry_id, 30.0)?
+            .ok_or("no response from bridge for setup_new_run retry")?;
+    }
     if setup_response.get("ok").and_then(Value::as_bool) == Some(false) {
         return Err(setup_response
             .get("message")

@@ -1088,6 +1088,14 @@ end
 
 local function command_setup_new_run(command)
     if not G or not G.SETTINGS then return false, "settings unavailable" end
+    if G.STATES and G.STATE == G.STATES.GAME_OVER then
+        local game_over_button = find_ui_node({ui_id = "from_game_over"})
+        if not game_over_button or not game_over_button.click then
+            return false, "game over menu button unavailable"
+        end
+        game_over_button:click()
+        return true, "returned to main menu; retry setup_new_run"
+    end
     if G.SAVED_GAME then
         local saved_seed = G.SAVED_GAME.GAME and G.SAVED_GAME.GAME.pseudorandom and G.SAVED_GAME.GAME.pseudorandom.seed or nil
         if command.override_saved ~= true then
@@ -1122,6 +1130,18 @@ local function command_setup_new_run(command)
     end
 
     return true, "selected New Run"
+end
+
+local function command_return_to_menu()
+    if not G or not G.STATES or G.STATE ~= G.STATES.GAME_OVER then
+        return false, "not in game over state"
+    end
+    local game_over_button = find_ui_node({ui_id = "from_game_over"})
+    if not game_over_button or not game_over_button.click then
+        return false, "game over menu button unavailable"
+    end
+    game_over_button:click()
+    return true, "queued return to main menu"
 end
 
 local function command_skip_tutorial()
@@ -1529,6 +1549,23 @@ local function command_preview_hand(command)
     return true, 'preview done'
 end
 
+local function command_safe_transition(command)
+    local transition = tostring(command.transition or "")
+    if transition == "skip_tutorial" then return command_skip_tutorial(command) end
+    if transition == "ensure_menu_ui" then return command_ensure_menu_ui(command) end
+    if transition == "cash_out" then return command_cash_out() end
+    if transition == "return_to_menu" then return command_return_to_menu() end
+    if transition == "dismiss_unlock_overlay" then
+        if G and G.OVERLAY_MENU then
+            safe_remove(G.OVERLAY_MENU)
+            G.OVERLAY_MENU = nil
+            return true, "dismissed unlock overlay"
+        end
+        return false, "unlock overlay unavailable"
+    end
+    return false, "unsupported safe transition: " .. transition
+end
+
 local function command_move_joker(command)
     local from_index = tonumber(command.from_index or command.from or command.index)
     local to_index = tonumber(command.to_index or command.to)
@@ -1579,6 +1616,7 @@ function CODA.apply_command(command)
     if action == "reroll_shop" and G and G.FUNCS and G.FUNCS.reroll_shop then G.FUNCS.reroll_shop({}); return true, "queued reroll_shop" end
     if action == "next_round" then return command_next_round() end
     if action == "cash_out" then return command_cash_out() end
+    if action == "safe_transition" then return command_safe_transition(command) end
     if action == "skip_booster" and G and G.FUNCS and G.FUNCS.skip_booster then G.FUNCS.skip_booster({}); return true, "queued skip_booster" end
     if action == "reroll_boss" then return command_reroll_boss() end
     if action == "type_char" then
