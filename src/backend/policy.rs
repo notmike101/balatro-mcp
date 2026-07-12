@@ -23,6 +23,7 @@ pub const SAFE_TRANSITION_ACTIONS: &[&str] = &[
     "dismiss_unlock_overlay",
     "ensure_menu_ui",
     "cash_out",
+    "return_to_menu",
 ];
 
 pub fn is_decision_state(state: &str) -> bool {
