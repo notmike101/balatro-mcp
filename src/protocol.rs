@@ -38,6 +38,7 @@ pub fn envelope(ok: bool, data: Value, code: &str, message: &str) -> Value {
         .cloned()
         .unwrap_or_else(|| json!([]));
     let mut answer = Map::new();
+    answer.insert("schema".into(), json!("balatro-mcp/envelope/v3"));
     answer.insert("ok".into(), Value::Bool(ok));
     answer.insert("state".into(), state);
     answer.insert("decision_id".into(), decision_id);
@@ -83,6 +84,7 @@ pub fn compact_observation(data: Value, section: &str) -> Value {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -390,14 +392,5 @@ mod tests {
         assert_eq!(result["hand"], json!(null));
         assert_eq!(result["decision_id"], json!(null));
         assert_eq!(result["legal_actions"], json!(null));
-    }}
-
-
-
-
-
-
-
-
-
-
+    }
+}

@@ -1,7 +1,11 @@
-mod models;
-mod infra;
-mod protocol;
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+#![allow(unexpected_cfgs)]
+
+mod backend;
 mod guide;
+mod infra;
+mod models;
+mod protocol;
 mod tools;
 
 use rmcp::ServiceExt;
