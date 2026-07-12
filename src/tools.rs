@@ -22,9 +22,7 @@ use crate::backend::{
 use crate::crash;
 use crate::guide::{GUIDE_TOPICS, guide};
 use crate::models::*;
-use crate::protocol::{
-    compact_observation, envelope, sanitize, tool as to_tool_result, value_state,
-};
+use crate::protocol::{compact_observation, envelope, sanitize, tool as to_tool_result};
 use crate::rules::{LookupOptions, RulesDb, default_db_path};
 
 use std::sync::LazyLock;
@@ -489,14 +487,24 @@ fn diagnostic_from_directory(directory: &std::path::Path, lines: u32) -> Value {
 }
 
 fn wait_state_matches(data: &Value, requested: &str) -> bool {
-    let state = value_state(data)
-        .and_then(|v| v.as_str().map(str::to_owned))
+    let state = data
+        .pointer("/game/state_name")
+        .or_else(|| data.pointer("/game/state"))
+        .or_else(|| data.get("state"))
+        .and_then(Value::as_str)
         .unwrap_or_default();
     if requested.is_empty() {
         !state.is_empty()
     } else {
         state.eq_ignore_ascii_case(requested)
     }
+}
+
+fn observation_state(data: &Value) -> &str {
+    data.pointer("/game/state_name")
+        .or_else(|| data.pointer("/game/state"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 fn state_result(result: Result<Value, String>) -> Result<CallToolResult, rmcp::ErrorData> {
@@ -766,24 +774,14 @@ impl Server {
         {
             Ok(Ok(data)) => {
                 let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(settle);
-                let mut next = Value::Null;
                 let mut changed = false;
                 loop {
-                    if let Ok(policy) = self.policy(40).await {
-                        let state = policy
-                            .pointer("/game/state")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        changed = policy
-                            .get("decision_id")
-                            .and_then(Value::as_str)
-                            .is_some_and(|value| value != before_decision_id)
-                            || state != before_state
-                            || policy
-                                .get("observation_id")
-                                .and_then(Value::as_str)
-                                .is_some_and(|value| value != before_observation_id);
-                        next = policy;
+                    if let Ok(observation) = self.read_observation() {
+                        let decision_id = decision_id_for(&observation);
+                        let observation_id = observation_id_for(&observation);
+                        changed = decision_id != before_decision_id
+                            || observation_state(&observation) != before_state
+                            || observation_id != before_observation_id;
                         if changed {
                             break;
                         }
@@ -793,9 +791,13 @@ impl Server {
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                if next.is_null() {
-                    next = json!({"legal_actions": []});
-                }
+                let mut next = if changed {
+                    self.policy(40)
+                        .await
+                        .unwrap_or_else(|_| json!({"legal_actions": []}))
+                } else {
+                    json!({"legal_actions": []})
+                };
                 if let Some(object) = next.as_object_mut() {
                     object.insert("bridge_response".into(), data);
                 }
@@ -933,9 +935,22 @@ impl Server {
                     "timed out waiting for state",
                 ));
             }
-            if let Ok(Ok(data)) = tokio::time::timeout(remaining, self.policy(20)).await {
-                if wait_state_matches(&data, &params.state) {
-                    return to_tool_result(envelope(true, data, "", ""));
+            if let Ok(Ok(Ok(observation))) = tokio::time::timeout(
+                remaining,
+                tokio::task::spawn_blocking({
+                    let ipc = self.ipc.clone();
+                    move || ipc.read_observation()
+                }),
+            )
+            .await
+            {
+                if wait_state_matches(&observation, &params.state) {
+                    return match self.policy(20).await {
+                        Ok(data) => to_tool_result(envelope(true, data, "", "")),
+                        Err(error) => {
+                            to_tool_result(envelope(false, Value::Null, "wait_failed", &error))
+                        }
+                    };
                 }
             }
             if tokio::time::Instant::now() >= deadline {
