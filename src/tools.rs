@@ -581,7 +581,36 @@ impl Server {
         match tokio::task::spawn_blocking(move || start_new_run(&ipc, params.confirm_override))
             .await
         {
-            Ok(Ok(data)) => to_tool_result(envelope(true, data, "", "")),
+            Ok(Ok(data)) => {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+                let mut next = Value::Null;
+                loop {
+                    if let Ok(policy) = self.policy(40).await {
+                        let state = policy
+                            .pointer("/game/state")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        next = policy;
+                        if !state.eq_ignore_ascii_case("MENU")
+                            && !state.eq_ignore_ascii_case("SPLASH")
+                        {
+                            break;
+                        }
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if next.is_null() {
+                    next = json!({"legal_actions": []});
+                }
+                if let Some(object) = next.as_object_mut() {
+                    object.insert("bridge_response".into(), data);
+                }
+                to_tool_result(envelope(true, next, "", ""))
+            }
             Ok(Err(error)) => {
                 to_tool_result(envelope(false, Value::Null, "new_run_failed", &error))
             }
@@ -700,8 +729,18 @@ impl Server {
             });
         let ipc = self.ipc.clone();
         let action_id = params.action_id.clone();
-        let requested_action_id = action_id.clone();
-        let decision_id = current_decision_id;
+        let decision_id = current_decision_id.clone();
+        let before_decision_id = current_decision_id.clone();
+        let before_state = current
+            .pointer("/game/state")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let before_observation_id = current
+            .get("observation_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
         let action = selected.cloned();
         match tokio::task::spawn_blocking(move || {
             execute_policy_action(
@@ -718,23 +757,46 @@ impl Server {
         .await
         {
             Ok(Ok(data)) => {
-                let next = match self.policy(40).await {
-                    Ok(mut policy) => {
-                        if let Some(object) = policy.as_object_mut() {
-                            object.insert("bridge_response".into(), data);
+                let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(settle);
+                let mut next = Value::Null;
+                let mut changed = false;
+                loop {
+                    if let Ok(policy) = self.policy(40).await {
+                        let state = policy
+                            .pointer("/game/state")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        changed = policy
+                            .get("decision_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value != before_decision_id)
+                            || state != before_state
+                            || policy
+                                .get("observation_id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|value| value != before_observation_id);
+                        next = policy;
+                        if changed {
+                            break;
                         }
-                        policy
                     }
-                    Err(_) => json!({"bridge_response": data, "legal_actions": []}),
-                };
-                if requested_action_id == "from_game_over"
-                    && next.pointer("/game/state").and_then(Value::as_str) == Some("GAME_OVER")
-                {
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if next.is_null() {
+                    next = json!({"legal_actions": []});
+                }
+                if let Some(object) = next.as_object_mut() {
+                    object.insert("bridge_response".into(), data);
+                }
+                if !changed {
                     return to_tool_result(envelope(
                         false,
                         next,
                         "action_failed",
-                        "from_game_over reported success but the game remained in GAME_OVER",
+                        "bridge acknowledged the action but the live decision did not change",
                     ));
                 }
                 to_tool_result(envelope(true, next, "", ""))
