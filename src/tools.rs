@@ -84,6 +84,10 @@ fn action_error_code(error: &str) -> &'static str {
     }
 }
 
+fn normalize_info_type(entity_type: &str) -> String {
+    entity_type.to_ascii_lowercase().replace('_', "-")
+}
+
 fn active_directives(rules: &Value, observation: &Value) -> Value {
     let values = rules
         .get("rules")
@@ -467,10 +471,20 @@ impl Server {
     }
 
     #[tool(
-        description = "Ensure the fixed Balatro.exe is running without UI actions or new-run creation. Refuses multiple processes."
+        description = "Verify that the fixed Balatro.exe is running and report bridge/seed safety. This tool never launches Balatro, performs UI actions, or creates a new run; it refuses multiple processes."
     )]
     async fn ensure_runtime(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let _guard = self.mutations.lock().await;
+        let _guard = match self.mutations.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return to_tool_result(envelope(
+                    false,
+                    Value::Null,
+                    "mutation_busy",
+                    "another mutation is already in progress",
+                ));
+            }
+        };
         match self.ensure_runtime_impl().await {
             Ok(data) => to_tool_result(envelope(true, data, "", "")),
             Err(e) => to_tool_result(envelope(false, Value::Null, "runtime_failed", &e)),
@@ -543,7 +557,17 @@ impl Server {
                 "action_id and decision_id are required",
             ));
         }
-        let _guard = self.mutations.lock().await;
+        let _guard = match self.mutations.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return to_tool_result(envelope(
+                    false,
+                    Value::Null,
+                    "mutation_busy",
+                    "another mutation is already in progress",
+                ));
+            }
+        };
         if let Err(problem) = self.preflight().await {
             return to_tool_result(problem);
         }
@@ -566,22 +590,36 @@ impl Server {
                         == Some(params.action_id.as_str())
                 })
             });
-        match execute_policy_action(
-            &self.ipc,
-            &params.action_id,
-            &params.decision_id,
-            selected,
-            30,
-            15,
-            60,
-            settle,
-        ) {
-            Ok(data) => to_tool_result(envelope(true, data, "", "")),
-            Err(error) => {
+        let ipc = self.ipc.clone();
+        let action_id = params.action_id.clone();
+        let decision_id = params.decision_id.clone();
+        let action = selected.cloned();
+        match tokio::task::spawn_blocking(move || {
+            execute_policy_action(
+                &ipc,
+                &action_id,
+                &decision_id,
+                action.as_ref(),
+                30,
+                15,
+                60,
+                settle,
+            )
+        })
+        .await
+        {
+            Ok(Ok(data)) => to_tool_result(envelope(true, data, "", "")),
+            Ok(Err(error)) => {
                 let current = self.policy(40).await.unwrap_or(Value::Null);
                 let code = action_error_code(&error);
                 to_tool_result(envelope(false, current, code, &error))
             }
+            Err(error) => to_tool_result(envelope(
+                false,
+                Value::Null,
+                "action_failed",
+                &format!("action worker failed: {error}"),
+            )),
         }
     }
 
@@ -590,7 +628,17 @@ impl Server {
         &self,
         Parameters(params): Parameters<AdvanceParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let _guard = self.mutations.lock().await;
+        let _guard = match self.mutations.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return to_tool_result(envelope(
+                    false,
+                    Value::Null,
+                    "mutation_busy",
+                    "another mutation is already in progress",
+                ));
+            }
+        };
         if let Err(problem) = self.preflight().await {
             return to_tool_result(problem);
         }
@@ -629,10 +677,19 @@ impl Server {
         &self,
         Parameters(params): Parameters<WaitParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_secs_f64(params.timeout.clamp(0.1, 60.0));
+        let timeout = params.timeout.clamp(0.1, 60.0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(timeout);
         loop {
-            if let Ok(data) = self.policy(20).await {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return to_tool_result(envelope(
+                    false,
+                    Value::Null,
+                    "timeout",
+                    "timed out waiting for state",
+                ));
+            }
+            if let Ok(Ok(data)) = tokio::time::timeout(remaining, self.policy(20)).await {
                 if wait_state_matches(&data, &params.state) {
                     return to_tool_result(envelope(true, data, "", ""));
                 }
@@ -654,8 +711,24 @@ impl Server {
         &self,
         Parameters(params): Parameters<CheckpointParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        match checkpoint_internal(&self.ipc, &params.kind) {
-            Ok(data) => {
+        let _guard = match self.mutations.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return to_tool_result(envelope(
+                    false,
+                    Value::Null,
+                    "mutation_busy",
+                    "another mutation is already in progress",
+                ));
+            }
+        };
+        if let Err(problem) = self.preflight().await {
+            return to_tool_result(problem);
+        }
+        let ipc = self.ipc.clone();
+        let kind = params.kind.clone();
+        match tokio::task::spawn_blocking(move || checkpoint_internal(&ipc, &kind)).await {
+            Ok(Ok(data)) => {
                 if let Ok(observation) = self.read_observation() {
                     let _ = self
                         .state_db
@@ -665,18 +738,25 @@ impl Server {
                 }
                 to_tool_result(envelope(true, data, "", ""))
             }
-            Err(e) => to_tool_result(envelope(false, Value::Null, "checkpoint_failed", &e)),
+            Ok(Err(e)) => to_tool_result(envelope(false, Value::Null, "checkpoint_failed", &e)),
+            Err(e) => to_tool_result(envelope(
+                false,
+                Value::Null,
+                "checkpoint_failed",
+                &format!("checkpoint worker failed: {e}"),
+            )),
         }
     }
 
     #[tool(
-        description = "Look up a Balatro entity and compatible editions, enhancements, seals, stickers, or suit."
+        description = "Look up a Balatro entity and compatible editions, enhancements, seals, stickers, or suit. Entity type is case-insensitive (for example, Joker or joker)."
     )]
     async fn lookup_rule(
         &self,
         Parameters(params): Parameters<LookupParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        if !INFO_TYPES.contains(&params.entity_type.as_str()) {
+        let entity_type = normalize_info_type(&params.entity_type);
+        if !INFO_TYPES.contains(&entity_type.as_str()) {
             return to_tool_result(envelope(
                 false,
                 Value::Null,
@@ -684,7 +764,7 @@ impl Server {
                 "unsupported entity type",
             ));
         }
-        let mut args = vec!["lookup".into(), params.entity_type, params.name];
+        let mut args = vec!["lookup".into(), entity_type, params.name];
         for (flag, value) in [
             ("--suit", params.suit),
             ("--edition", params.edition),
@@ -1283,6 +1363,8 @@ mod tests {
                 .await
                 .is_ok()
         );
+        assert_eq!(normalize_info_type("Joker"), "joker");
+        assert_eq!(normalize_info_type("playing_card"), "playing-card");
     }
 
     #[tokio::test]
@@ -1321,6 +1403,46 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn mutation_routes_fail_fast_without_runtime() {
+        let (_dir, server) = server();
+        let started = std::time::Instant::now();
+        assert!(
+            server
+                .take_action(Parameters(ActionParams {
+                    action_id: "play:1".into(),
+                    decision_id: "d3-test".into(),
+                    settle_timeout: 12.0,
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+        let started = std::time::Instant::now();
+        assert!(
+            server
+                .checkpoint(Parameters(CheckpointParams {
+                    kind: "test".into()
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+        let started = std::time::Instant::now();
+        assert!(
+            server
+                .wait_for_state(Parameters(WaitParams {
+                    state: "PLAY".into(),
+                    timeout: 0.1,
+                }))
+                .await
+                .is_ok()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[tokio::test]
