@@ -36,6 +36,23 @@ fn get_array<'a>(obj: &'a serde_json::Map<String, Value>, key: &str) -> &'a [Val
         .unwrap_or(&EMPTY_VEC)
 }
 
+fn card_id(card: &Value) -> Option<String> {
+    card.get("instance_id")
+        .or_else(|| card.get("id"))
+        .and_then(|id| {
+            id.as_str()
+                .map(str::to_owned)
+                .or_else(|| Some(id.to_string()))
+        })
+}
+
+fn card_id_value(card: &Value) -> Value {
+    card.get("instance_id")
+        .or_else(|| card.get("id"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
 pub fn build_policy_state(
     observation: &Value,
     play_limit: usize,
@@ -407,13 +424,7 @@ fn generate_legal_actions(
             if hands_left > 0 && hand_count > 0 {
                 for pc in 1..=std::cmp::min(hand_count, play_limit) {
                     let ids: Vec<String> = (0..pc)
-                        .filter_map(|i| {
-                            hand_array
-                                .get(i)
-                                .and_then(|c| c.get("instance_id"))
-                                .and_then(|id| id.as_str())
-                                .map(|s| s.to_string())
-                        })
+                        .filter_map(|i| hand_array.get(i).and_then(card_id))
                         .collect();
                     if !ids.is_empty() {
                         let score = score_hand(observation, Some(&(0..pc).collect::<Vec<_>>()));
@@ -428,13 +439,7 @@ fn generate_legal_actions(
             if discards_left > 0 && hand_count > 1 {
                 for dc in 1..=std::cmp::min(hand_count - 1, discard_limit) {
                     let ids: Vec<String> = (0..dc)
-                        .filter_map(|i| {
-                            hand_array
-                                .get(i)
-                                .and_then(|c| c.get("instance_id"))
-                                .and_then(|id| id.as_str())
-                                .map(|s| s.to_string())
-                        })
+                        .filter_map(|i| hand_array.get(i).and_then(card_id))
                         .collect();
                     if !ids.is_empty() {
                         actions.push(json!({ "action_id": format!("discard_{}", ids.join("_")), "action": "discard", "card_indices": (1..=dc).collect::<Vec<_>>(), "card_ids": ids, "reason": format!("discard {} cards ({} discards left)", dc, discards_left) }));
@@ -481,7 +486,7 @@ fn generate_legal_actions(
                         .unwrap_or(&EMPTY_VEC);
                     for (i, c) in cards.iter().enumerate() {
                         if let Some(name) = c.get("name").and_then(|n| n.as_str()) {
-                            actions.push(json!({ "action_id": format!("buy_{}_{}", area, i), "action": "buy_card", "area": area, "card_index": i + 1, "card_id": c.get("instance_id"), "reason": format!("buy {} (slot available)", name) }));
+                            actions.push(json!({ "action_id": format!("buy_{}_{}", area, i), "action": "buy_card", "area": area, "card_index": i + 1, "card_id": card_id_value(c), "reason": format!("buy {} (slot available)", name) }));
                         }
                     }
                 }
