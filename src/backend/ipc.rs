@@ -203,6 +203,13 @@ pub fn policy_action_command(
                 action.get("blind").cloned().unwrap_or(Value::Null),
             );
         }
+        "skip_blind" => {
+            command.insert("action".into(), serde_json::json!("skip_blind"));
+            command.insert(
+                "blind_type".into(),
+                action.get("blind").cloned().unwrap_or(Value::Null),
+            );
+        }
         "ui_click" => {
             command.insert("action".into(), serde_json::json!("ui_click"));
             for key in ["ui_id", "button"] {
@@ -495,6 +502,7 @@ mod tests {
                 json!({"action":"select_blind","blind":"Boss"}),
                 "select_blind",
             ),
+            (json!({"action":"skip_blind","blind":"Small"}), "skip_blind"),
             (
                 json!({"action":"ui_click","ui_id":"cash_out_button"}),
                 "ui_click",
