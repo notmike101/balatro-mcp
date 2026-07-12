@@ -698,8 +698,20 @@ fn generate_legal_actions(
         }
         "GAME_OVER" => {
             actions.push(json!({"action_id":"from_game_over","action":"ui_click","ui_id":"from_game_over","reason":"return to the main menu after game over"}));
+            actions.push(json!({
+                "action_id": "return_to_menu",
+                "action": "safe_transition",
+                "transition": "return_to_menu",
+                "reason": "return to the main menu after game over"
+            }));
         }
         _ => {}
+    }
+
+    // GAME_OVER is terminal: only the explicit recovery action above is
+    // legal. Do not append shared gameplay actions below this point.
+    if state == "GAME_OVER" {
+        return actions;
     }
 
     for (index, card) in consumables_array.iter().enumerate() {
@@ -1107,15 +1119,14 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|a| a["action"] == "sell_card" && a["area"] == "jokers")
-        );
-        assert!(
-            actions
-                .as_array()
-                .unwrap()
-                .iter()
                 .any(|a| a["action"] == "safe_transition")
         );
+        assert!(actions.as_array().unwrap().iter().all(|action| {
+            matches!(
+                action["action_id"].as_str(),
+                Some("from_game_over") | Some("return_to_menu")
+            )
+        }));
 
         let mut numeric_game_over = observation("not-a-state-name");
         numeric_game_over["game"] = json!({"state": 4, "state_name": "GAME_OVER"});
