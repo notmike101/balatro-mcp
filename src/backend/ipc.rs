@@ -355,7 +355,7 @@ pub fn start_new_run(paths: &IpcPaths, confirm_override: bool) -> Result<Value, 
     let start = serde_json::json!({
         "id": start_id,
         "action": "start_run",
-        "seed": crate::models::SEED,
+        "seed": crate::models::SEED,"override_saved": confirm_override,
     });
     paths.write_command(&start)?;
     let start_response = paths

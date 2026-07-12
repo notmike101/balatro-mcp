@@ -1046,13 +1046,17 @@ local function command_start_run(command)
     if is_resume and requested_seed ~= "" then
         local saved_seed = G.SAVED_GAME.GAME and G.SAVED_GAME.GAME.pseudorandom and G.SAVED_GAME.GAME.pseudorandom.seed or nil
         if tostring(saved_seed or "") == CODA.allowed_seed then
-            return false, "saved run exists; resume without supplying a seed"
-        end
-        if requested_seed ~= CODA.allowed_seed or not G.SETTINGS or G.SETTINGS.current_setup ~= "New Run" then
+            if command.override_saved ~= true then
+                return false, "saved run exists; resume without supplying a seed"
+            end
+            G.SAVED_GAME = nil
+            is_resume = false
+        elseif requested_seed ~= CODA.allowed_seed or not G.SETTINGS or G.SETTINGS.current_setup ~= "New Run" then
             return false, "wrong-seed save recovery requires New Run setup and allowed seed"
+        else
+            G.SAVED_GAME = nil
+            is_resume = false
         end
-        G.SAVED_GAME = nil
-        is_resume = false
     end
     if not is_resume and requested_seed ~= CODA.allowed_seed then
         return false, "seed rejected: only " .. CODA.allowed_seed .. " is allowed"
