@@ -1,9 +1,5 @@
 use serde_json::Value;
 
-fn run_value(data: &Value) -> Option<&Value> {
-    data.get("run").or_else(|| data.get("round"))
-}
-
 /// Extract a compact section of the observation/policy state.
 pub fn compact_observation(data: &Value, section: &str) -> Value {
     match section {
@@ -19,7 +15,7 @@ pub fn compact_observation(data: &Value, section: &str) -> Value {
 
 fn compact_summary(data: &Value) -> Value {
     let game = data.get("game");
-    let run = run_value(data);
+    let run = data.get("run");
     let areas = data.get("areas");
     let chips = match run.and_then(|r| r.get("chips")).and_then(|r| r.as_i64()) {
         Some(chips) => Some(chips),
@@ -99,7 +95,7 @@ fn compact_build(data: &Value) -> Value {
 }
 
 fn compact_blind(data: &Value) -> Value {
-    let run = run_value(data).and_then(|r| r.get("blind"));
+    let run = data.get("run").and_then(|r| r.get("blind"));
     serde_json::json!({
         "name": run.and_then(|b| b.get("name")).and_then(|b| b.as_str()),
         "boss": run.and_then(|b| b.get("boss")).and_then(|b| b.as_str()),
