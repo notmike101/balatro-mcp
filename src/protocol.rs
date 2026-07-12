@@ -64,21 +64,26 @@ pub fn compact_observation(data: Value, section: &str) -> Value {
         return data;
     }
     let get = |key: &str| data.get(key).cloned().unwrap_or(Value::Null);
+    let run = data
+        .get("run")
+        .or_else(|| data.get("round"))
+        .cloned()
+        .unwrap_or(Value::Null);
     match section {
         "hand" => {
-            json!({"game": get("game"), "run": get("run"), "hand": data.pointer("/areas/hand").cloned(), "decision_id": get("decision_id"), "legal_actions": get("legal_actions")})
+            json!({"game": get("game"), "run": run, "hand": data.get("hand").cloned().or_else(|| data.pointer("/areas/hand").cloned()).unwrap_or(Value::Null), "decision_id": get("decision_id"), "legal_actions": get("legal_actions")})
         }
         "build" => {
-            json!({"game": get("game"), "run": get("run"), "jokers": data.pointer("/areas/jokers").cloned(), "consumables": data.pointer("/areas/consumeables").cloned(), "decision_id": get("decision_id"), "legal_actions": get("legal_actions")})
+            json!({"game": get("game"), "run": run, "jokers": data.pointer("/areas/jokers").cloned(), "consumables": data.pointer("/areas/consumeables").cloned(), "decision_id": get("decision_id"), "legal_actions": get("legal_actions")})
         }
         "blind" => {
-            json!({"game": get("game"), "run": get("run"), "blind": get("blind"), "active_directives": get("active_directives"), "decision_id": get("decision_id"), "legal_actions": get("legal_actions")})
+            json!({"game": get("game"), "run": run, "blind": get("blind"), "active_directives": get("active_directives"), "decision_id": get("decision_id"), "legal_actions": get("legal_actions")})
         }
         "hand_values" => {
-            json!({"game": get("game"), "run": get("run"), "poker_hand_values": get("poker_hand_values"), "decision_id": get("decision_id"), "legal_actions": get("legal_actions")})
+            json!({"game": get("game"), "run": run, "poker_hand_values": get("poker_hand_values"), "decision_id": get("decision_id"), "legal_actions": get("legal_actions")})
         }
         _ => {
-            json!({"game": get("game"), "run": get("run"), "blind": get("blind"), "ready": get("ready"), "estimate_quality": get("estimate_quality"), "decision_id": get("decision_id"), "legal_actions": get("legal_actions")})
+            json!({"game": get("game"), "run": run, "blind": get("blind"), "ready": get("ready"), "estimate_quality": get("estimate_quality"), "decision_id": get("decision_id"), "legal_actions": get("legal_actions")})
         }
     }
 }
