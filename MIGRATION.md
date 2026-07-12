@@ -15,7 +15,7 @@ The Python runtime has been removed. The Rust MCP server owns policy state, exac
 ## Server behavior
 
 - MCP routes call the Rust backend directly.
-- Rules routes invoke the vendored Node.js information database.
+- Rules routes query the Rust-owned SQLite information database directly.
 - Runtime startup is external; `ensure_runtime` verifies process safety and never launches the game.
 - No Python subprocesses or capability files are used.
 - The public contract is `balatro-mcp/envelope/v3` and `balatro-mcp/policy/v3`.

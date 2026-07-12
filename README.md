@@ -10,7 +10,7 @@ The server uses the standard MCP `tools/list` and `tools/call` methods. The `too
 
 1. Clone this repository into a code directory such as `D:\balatro-mcp`. Keep the game installation and its mutable runtime files in a separate directory such as `D:\balatro-desktop`.
 2. Copy `mod/codex_agent.lua` and `mod/lovely.toml` into your Lovely mod directory. Restart the game and use `runtime_diagnostics` to confirm the bridge loaded.
-3. Install Node.js 22.5+ and Rust. Build the knowledge database from your own local game source as documented in [`tools/balatro-info-db/README.md`](tools/balatro-info-db/README.md).
+3. Install Rust. Copy the Lua source files from your own legitimate installation into `rules/balatro_src`, then run `cargo run --release -- rules build` to build `data/balatro.sqlite`.
 4. Run `cargo build --release`.
 
 Configure an MCP client:
@@ -34,3 +34,5 @@ Configure an MCP client:
 Begin with `game_status`; if the main menu contains a saved run with another seed, use the guarded `start_new_run` tool to recover to `2K9H9HN`. Then call `get_decision`, execute only a legal `action_id` paired with that exact `decision_id`, and verify with `observe`. Use `score_hand` for exact-contract or explicitly estimated scoring, and use `strategy_state`/`run_state` for Rust-owned directives and resumable state. Query matching replays before each blind and use `lookup_rule` for unfamiliar effects. `runtime_diagnostics` safely returns a capped latest Lovely-log tail; `ensure_runtime` verifies an externally started Balatro process and never launches the game.
 
 The MCP exposes no raw controller commands, coordinates, arbitrary filesystem reads, database rebuilds, or face-down-card identities. See [`AGENTS.md`](AGENTS.md) for the strict gameplay workflow.
+
+The static rules database is managed by the Rust binary. Use `balatro-mcp rules build`, `balatro-mcp rules lookup`, `balatro-mcp rules list`, and `balatro-mcp rules stats` for local maintenance and inspection.

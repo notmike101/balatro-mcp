@@ -9,7 +9,7 @@ use rmcp::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
-use tokio::{process::Command, sync::Mutex, time::timeout};
+use tokio::sync::Mutex;
 
 use crate::backend::{
     ipc::{IpcPaths, advance_safe_internal, execute_policy_action, start_new_run},
@@ -24,6 +24,7 @@ use crate::models::*;
 use crate::protocol::{
     compact_observation, envelope, sanitize, tool as to_tool_result, value_state,
 };
+use crate::rules::{LookupOptions, RulesDb, default_db_path};
 
 use std::sync::LazyLock;
 static EMPTY_BRIDGE: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(serde_json::Map::new);
@@ -131,6 +132,7 @@ pub struct Server {
     pub mutations: Arc<Mutex<()>>,
     pub replay_db: Arc<Mutex<ReplayDB>>,
     pub state_db: Arc<Mutex<StateDB>>,
+    pub rules_db: Arc<RulesDb>,
     pub(crate) process_override: Arc<Mutex<Option<Vec<Value>>>>,
     pub(crate) status_override: Arc<Mutex<Option<Value>>>,
     pub(crate) policy_failure_override: Arc<Mutex<bool>>,
@@ -146,12 +148,13 @@ impl Server {
         let replay_db = Arc::new(Mutex::new(ReplayDB::new(&runtime_root)));
         let state_db = Arc::new(Mutex::new(StateDB::new(&runtime_root)));
         Ok(Self {
-            root,
+            root: root.clone(),
             runtime_root,
             ipc,
             mutations: Arc::new(Mutex::new(())),
             replay_db,
             state_db,
+            rules_db: Arc::new(RulesDb::new(default_db_path(&root))),
             process_override: Arc::new(Mutex::new(None)),
             status_override: Arc::new(Mutex::new(None)),
             policy_failure_override: Arc::new(Mutex::new(false)),
@@ -402,56 +405,6 @@ impl Server {
             ));
         }
         Ok(status)
-    }
-
-    pub async fn node(&self, args: &[String]) -> Result<Value, String> {
-        let mut all = vec![
-            self.root
-                .join("tools/balatro-info-db/bin/balatro-info.js")
-                .display()
-                .to_string(),
-        ];
-        all.extend(args.iter().cloned());
-        let node = env::var_os("BALATRO_NODE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("node"));
-        self.run_external_json(&node.to_string_lossy(), &all, 15.0)
-            .await
-    }
-
-    async fn run_external_json(
-        &self,
-        program: &str,
-        args: &[String],
-        seconds: f64,
-    ) -> Result<Value, String> {
-        let mut child = Command::new(program);
-        child
-            .args(args)
-            .current_dir(&self.root)
-            .env("BALATRO_RUNTIME_ROOT", &self.runtime_root)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let output = timeout(
-            Duration::from_secs_f64(seconds.clamp(0.1, 60.0)),
-            child.output(),
-        )
-        .await
-        .map_err(|_| "backend timeout".to_string())
-        .and_then(|r| r.map_err(|e| format!("backend launch failed: {e}")))?;
-        let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if let Ok(value) = serde_json::from_str(&out) {
-            return Ok(value);
-        }
-        if !output.status.success() {
-            return Err(if err.is_empty() { out } else { err });
-        }
-        Err(format!(
-            "backend returned non-JSON output: {}",
-            out.chars().take(300).collect::<String>()
-        ))
     }
 
     pub fn diagnostic(&self, lines: u32) -> Value {
@@ -874,23 +827,14 @@ impl Server {
                 "unsupported entity type",
             ));
         }
-        let mut args = vec!["lookup".into(), entity_type, params.name];
-        for (flag, value) in [
-            ("--suit", params.suit),
-            ("--edition", params.edition),
-            ("--enhancement", params.enhancement),
-            ("--seal", params.seal),
-        ] {
-            if !value.is_empty() {
-                args.push(flag.into());
-                args.push(value);
-            }
-        }
-        for sticker in params.stickers {
-            args.push("--sticker".into());
-            args.push(sticker);
-        }
-        match self.node(&args).await {
+        let options = LookupOptions {
+            suit: (!params.suit.is_empty()).then_some(params.suit),
+            edition: (!params.edition.is_empty()).then_some(params.edition),
+            enhancement: (!params.enhancement.is_empty()).then_some(params.enhancement),
+            seal: (!params.seal.is_empty()).then_some(params.seal),
+            stickers: params.stickers,
+        };
+        match self.rules_db.lookup(&entity_type, &params.name, &options) {
             Ok(data) => to_tool_result(envelope(true, data, "", "")),
             Err(e) => to_tool_result(envelope(false, Value::Null, "lookup_failed", &e)),
         }
@@ -901,18 +845,17 @@ impl Server {
         &self,
         Parameters(params): Parameters<ListParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let mut args = vec!["list".into()];
-        if !params.entity_type.is_empty() {
-            args.push(params.entity_type);
-        }
-        match self.node(&args).await {
+        match self
+            .rules_db
+            .list((!params.entity_type.is_empty()).then_some(params.entity_type.as_str()))
+        {
             Ok(data) => to_tool_result(envelope(true, data, "", "")),
             Err(e) => to_tool_result(envelope(false, Value::Null, "list_failed", &e)),
         }
     }
     #[tool(description = "Return counts and metadata for the vendored rules database.")]
     async fn rules_stats(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        match self.node(&["stats".into()]).await {
+        match self.rules_db.stats() {
             Ok(data) => to_tool_result(envelope(true, data, "", "")),
             Err(e) => to_tool_result(envelope(false, Value::Null, "stats_failed", &e)),
         }
@@ -2046,81 +1989,6 @@ mod tests {
                 .await
                 .is_ok()
         );
-    }
-
-    #[tokio::test]
-    async fn info_db_routes_cover_json_success_and_backend_failures() {
-        let (dir, server) = server();
-        let script = dir.path().join("tools/balatro-info-db/bin/balatro-info.js");
-        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
-        std::fs::write(
-            &script,
-            "console.log(JSON.stringify({ok:true, args:process.argv.slice(2)}));",
-        )
-        .unwrap();
-        assert!(
-            server
-                .lookup_rule(Parameters(LookupParams {
-                    entity_type: "joker".into(),
-                    name: "Joker".into(),
-                    suit: "H".into(),
-                    edition: "Foil".into(),
-                    enhancement: "Bonus".into(),
-                    seal: "Red".into(),
-                    stickers: vec!["eternal".into()]
-                }))
-                .await
-                .is_ok()
-        );
-        assert!(
-            server
-                .list_rules(Parameters(ListParams {
-                    entity_type: "joker".into()
-                }))
-                .await
-                .is_ok()
-        );
-        assert!(server.rules_stats().await.is_ok());
-        std::fs::write(&script, "console.error('backend failed'); process.exit(2);").unwrap();
-        assert!(server.rules_stats().await.is_ok());
-        assert!(
-            server
-                .lookup_rule(Parameters(LookupParams {
-                    entity_type: "joker".into(),
-                    name: "Joker".into(),
-                    suit: String::new(),
-                    edition: String::new(),
-                    enhancement: String::new(),
-                    seal: String::new(),
-                    stickers: vec![]
-                }))
-                .await
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn external_runner_covers_non_json_launch_and_timeout_errors() {
-        let (dir, server) = server();
-        let script = dir.path().join("tools/balatro-info-db/bin/balatro-info.js");
-        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
-        std::fs::write(&script, "console.log('not-json');").unwrap();
-        let error = server.node(&["stats".into()]).await.unwrap_err();
-        assert!(error.contains("non-JSON"));
-        std::fs::write(&script, "process.exit(1);").unwrap();
-        let error = server.node(&["stats".into()]).await.unwrap_err();
-        assert!(error.is_empty());
-        let error = server
-            .run_external_json("definitely-not-a-real-program", &[], 0.1)
-            .await
-            .unwrap_err();
-        assert!(error.contains("launch failed"));
-        std::fs::write(&script, "setTimeout(() => console.log('{}'), 1000);").unwrap();
-        let error = server
-            .run_external_json("node", &[script.display().to_string()], 0.1)
-            .await
-            .unwrap_err();
-        assert!(error.contains("timeout"));
     }
 
     #[tokio::test]
