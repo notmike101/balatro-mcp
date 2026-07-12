@@ -1043,9 +1043,10 @@ impl Server {
         &self,
         Parameters(params): Parameters<ListParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let entity_type = normalize_info_type(&params.entity_type);
         match self
             .rules_db
-            .list((!params.entity_type.is_empty()).then_some(params.entity_type.as_str()))
+            .list((!entity_type.is_empty()).then_some(entity_type.as_str()))
         {
             Ok(data) => to_tool_result(envelope(true, data, "", "")),
             Err(e) => to_tool_result(envelope(false, Value::Null, "list_failed", &e)),
