@@ -412,9 +412,22 @@ fn generate_legal_actions(
         }
         "SELECTING_HAND" | "BLIND_SELECT" => {
             if state == "BLIND_SELECT" {
+                let blind_states = run.get("blind_states").and_then(Value::as_object);
                 if let Some(choices) = run.get("blind_choices").and_then(Value::as_object) {
                     for (name, choice) in choices {
-                        if choice.get("state").and_then(Value::as_str) == Some("Select") {
+                        let state = choice.get("state").and_then(Value::as_str).or_else(|| {
+                            blind_states
+                                .and_then(|states| states.get(name))
+                                .and_then(Value::as_str)
+                        });
+                        if state == Some("Select") {
+                            actions.push(json!({"action_id":format!("select_{}", name.to_ascii_lowercase()),"action":"select_blind","blind":name,"reason":format!("select {} blind", name)}));
+                            actions.push(json!({"action_id":format!("skip_{}", name.to_ascii_lowercase()),"action":"skip_blind","blind":name,"reason":format!("skip {} blind", name)}));
+                        }
+                    }
+                } else if let Some(states) = blind_states {
+                    for (name, state) in states {
+                        if state.as_str() == Some("Select") {
                             actions.push(json!({"action_id":format!("select_{}", name.to_ascii_lowercase()),"action":"select_blind","blind":name,"reason":format!("select {} blind", name)}));
                             actions.push(json!({"action_id":format!("skip_{}", name.to_ascii_lowercase()),"action":"skip_blind","blind":name,"reason":format!("skip {} blind", name)}));
                         }
@@ -506,6 +519,10 @@ fn generate_legal_actions(
             for (index, card) in choices.iter().enumerate().take(target_limit.max(1)) {
                 actions.push(json!({"action_id":format!("pack_{}", index),"action":"choose_pack","card_index":index,"name":card.get("name")}));
             }
+            actions.push(json!({"action_id":"skip_booster","action":"ui_click","ui_id":"next_round_button","reason":"skip the opened booster pack"}));
+        }
+        "GAME_OVER" => {
+            actions.push(json!({"action_id":"from_game_over","action":"ui_click","ui_id":"from_game_over","reason":"return to the main menu after game over"}));
         }
         _ => {}
     }
