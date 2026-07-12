@@ -121,11 +121,20 @@ pub fn core() -> String {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ReplayQueryParams {
+    #[serde(default = "default_ante")]
     pub ante: i64,
+    #[serde(default = "default_stake")]
     pub stake: i64,
+    #[serde(default)]
     pub blind: String,
     #[serde(default = "best")]
     pub outcome: String,
+}
+pub fn default_ante() -> i64 {
+    1
+}
+pub fn default_stake() -> i64 {
+    1
 }
 pub fn best() -> String {
     "best".into()
@@ -133,9 +142,13 @@ pub fn best() -> String {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ReplayLogParams {
+    #[serde(default = "default_replay_outcome")]
     pub outcome: String,
+    #[serde(default = "default_ante")]
     pub ante: i64,
+    #[serde(default = "default_stake")]
     pub stake: i64,
+    #[serde(default = "default_blind_key")]
     pub blind_key: String,
     #[serde(default)]
     pub jokers: Vec<String>,
@@ -147,6 +160,12 @@ pub struct ReplayLogParams {
     pub dollars_end: Option<i64>,
     #[serde(default)]
     pub notes: String,
+}
+pub fn default_replay_outcome() -> String {
+    "fail".into()
+}
+pub fn default_blind_key() -> String {
+    "unknown".into()
 }
 
 #[derive(Deserialize, JsonSchema)]
