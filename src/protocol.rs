@@ -5,6 +5,7 @@ use rmcp::model::CallToolResult;
 pub fn value_state(data: &Value) -> Option<Value> {
     data.pointer("/game/state")
         .cloned()
+        .or_else(|| data.pointer("/game/state_name").cloned())
         .or_else(|| data.get("state").cloned())
 }
 

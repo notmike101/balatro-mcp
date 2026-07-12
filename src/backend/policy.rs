@@ -154,6 +154,7 @@ pub fn build_policy_state(
 
     json!({
         "game": { "state": game, "round": run.get("round"), "blind": run.get("blind") },
+        "run": run,
         "economy": {
             "dollars": dollars, "full_interest_floor": full_interest_floor, "interest_cap": interest_cap,
             "current_interest": current_interest, "current_interest_floor": current_interest_floor,
@@ -442,7 +443,8 @@ fn generate_legal_actions(
                         .collect();
                     if !ids.is_empty() {
                         let score = score_hand(observation, Some(&(0..pc).collect::<Vec<_>>()));
-                        actions.push(json!({ "action_id": format!("play_{}", ids.join("_")), "action": "play", "card_indices": (1..=pc).collect::<Vec<_>>(), "card_ids": ids, "estimated_score": score.estimated_score, "score_quality": score.estimate_quality, "reason": format!("play {} cards ({} hands left)", pc, hands_left) }));
+                        let indices = (1..=pc).collect::<Vec<_>>();
+                        actions.push(json!({ "action_id": format!("play_{}", ids.join("_")), "action": "play", "cards": indices, "card_indices": indices, "card_ids": ids, "estimated_score": score.estimated_score, "score_quality": score.estimate_quality, "reason": format!("play {} cards ({} hands left)", pc, hands_left) }));
                     }
                 }
             }
@@ -456,7 +458,8 @@ fn generate_legal_actions(
                         .filter_map(|i| hand_array.get(i).and_then(card_id))
                         .collect();
                     if !ids.is_empty() {
-                        actions.push(json!({ "action_id": format!("discard_{}", ids.join("_")), "action": "discard", "card_indices": (1..=dc).collect::<Vec<_>>(), "card_ids": ids, "reason": format!("discard {} cards ({} discards left)", dc, discards_left) }));
+                        let indices = (1..=dc).collect::<Vec<_>>();
+                        actions.push(json!({ "action_id": format!("discard_{}", ids.join("_")), "action": "discard", "cards": indices, "card_indices": indices, "card_ids": ids, "reason": format!("discard {} cards ({} discards left)", dc, discards_left) }));
                     }
                 }
             }

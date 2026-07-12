@@ -19,6 +19,7 @@ use crate::backend::{
     scoring::score_hand,
     state::StateDB,
 };
+use crate::crash;
 use crate::guide::{GUIDE_TOPICS, guide};
 use crate::models::*;
 use crate::protocol::{
@@ -220,6 +221,15 @@ impl Server {
             .as_ref()
             .ok()
             .and_then(|o| runtime::observation_seed(o));
+        let state = observation
+            .as_ref()
+            .ok()
+            .and_then(|o| {
+                o.pointer("/game/state_name")
+                    .or_else(|| o.pointer("/game/state"))
+            })
+            .cloned()
+            .unwrap_or(Value::Null);
         let mut problems = Vec::new();
         if processes.len() != 1 {
             problems.push(format!(
@@ -252,6 +262,7 @@ impl Server {
             "problems": problems,
             "processes": processes,
             "observation_age_seconds": age,
+            "state": state,
             "bridge": {
                 "version": bridge.get("version"),
                 "session_id": bridge.get("session_id"),
@@ -384,7 +395,20 @@ impl Server {
             .or_else(|| observation.pointer("/game/state").and_then(Value::as_str))
             .or_else(|| observation.get("state").and_then(Value::as_str))
             .unwrap_or_default();
-        if !state.eq_ignore_ascii_case("MENU") && !state.eq_ignore_ascii_case("MAIN_MENU") {
+        let saved_present = observation
+            .get("ready")
+            .and_then(|ready| ready.get("saved_game_present"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || observation
+                .get("ready")
+                .and_then(|ready| ready.get("saved_game_seed"))
+                .and_then(Value::as_str)
+                .is_some();
+        if !state.eq_ignore_ascii_case("MENU")
+            && !state.eq_ignore_ascii_case("MAIN_MENU")
+            && !(confirm_override && saved_present)
+        {
             return Err(envelope(
                 false,
                 status,
@@ -686,7 +710,18 @@ impl Server {
         })
         .await
         {
-            Ok(Ok(data)) => to_tool_result(envelope(true, data, "", "")),
+            Ok(Ok(data)) => {
+                let next = match self.policy(40).await {
+                    Ok(mut policy) => {
+                        if let Some(object) = policy.as_object_mut() {
+                            object.insert("bridge_response".into(), data);
+                        }
+                        policy
+                    }
+                    Err(_) => json!({"bridge_response": data, "legal_actions": []}),
+                };
+                to_tool_result(envelope(true, next, "", ""))
+            }
             Ok(Err(error)) => {
                 let current = self.policy(40).await.unwrap_or(Value::Null);
                 let code = action_error_code(&error);
@@ -1298,6 +1333,10 @@ impl Server {
         Parameters(params): Parameters<RuntimeParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let mut data = self.diagnostic(params.lines);
+        data["mcp_crash_log"] = crash::tail(
+            &self.runtime_root.join("agent").join("mcp_crash.log"),
+            params.lines,
+        );
         data["status"] = sanitize(self.status().await);
         to_tool_result(envelope(true, data, "", ""))
     }

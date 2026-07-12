@@ -181,7 +181,7 @@ fn public_entity(entity: &Value) -> Value {
             attributes.insert(key.into(), value.clone());
         }
     }
-    let mut out = json!({"key": entity["key"], "type": entity["set_name"].as_str().unwrap_or(entity["kind"].as_str().unwrap_or_default()), "name": entity["name"], "effect": entity["effect"], "config": entity["config"]});
+    let mut out = json!({"key": entity["key"], "type": entity["set_name"].as_str().unwrap_or(entity["kind"].as_str().unwrap_or_default()), "name": entity["name"], "effect": entity["effect"], "description": entity["effect"], "config": entity["config"]});
     if !attributes.is_empty() {
         out["attributes"] = Value::Object(attributes);
     }
@@ -211,18 +211,20 @@ fn card_rows(db: &Connection, rank: &str, suit: Option<&str>) -> Result<Vec<Valu
 fn lookup(db: &Connection, kind: &str, name: &str, o: &LookupOptions) -> Result<Value, String> {
     let normalized = kind.to_ascii_lowercase().replace('_', "-");
     if normalized == "card" || normalized == "playing-card" {
-        let cards = card_rows(db, name, o.suit.as_deref())?;
+        let (rank_name, inferred_suit) = name
+            .split_once(" of ")
+            .map(|(rank, suit)| (rank.trim(), Some(suit.trim().to_string())))
+            .unwrap_or((name.trim(), None));
+        let suit = o.suit.as_deref().or(inferred_suit.as_deref());
+        let cards = card_rows(db, rank_name, suit)?;
         if cards.is_empty() {
             return Err(format!(
                 "playing card not found: {}{}",
-                name,
-                o.suit
-                    .as_ref()
-                    .map(|s| format!(" of {s}"))
-                    .unwrap_or_default()
+                rank_name,
+                suit.map(|s| format!(" of {s}")).unwrap_or_default()
             ));
         }
-        let rank = cards[0]["data"]["value"].as_str().unwrap_or(name);
+        let rank = cards[0]["data"]["value"].as_str().unwrap_or(rank_name);
         let base = [
             ("Ace", 11),
             ("King", 10),
@@ -242,8 +244,8 @@ fn lookup(db: &Connection, kind: &str, name: &str, o: &LookupOptions) -> Result<
         .find(|(r, _)| r.eq_ignore_ascii_case(rank))
         .map(|(_, n)| *n)
         .unwrap_or(0);
-        let mut result = json!({"query": {"type": "playing-card", "rank": name}, "card": {"rank": rank, "suits": cards.iter().filter_map(|c| c["data"]["suit"].as_str()).collect::<Vec<_>>(), "baseChips": base}, "modifiers": {}});
-        if let Some(suit) = &o.suit {
+        let mut result = json!({"query": {"type": "playing-card", "rank": rank}, "card": {"rank": rank, "suits": cards.iter().filter_map(|c| c["data"]["suit"].as_str()).collect::<Vec<_>>(), "baseChips": base}, "modifiers": {}});
+        if let Some(suit) = suit {
             result["query"]["suit"] = json!(suit);
         }
         if let Some(edition) = &o.edition {
