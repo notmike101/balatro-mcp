@@ -1136,6 +1136,10 @@ local function command_return_to_menu()
     if not G or not G.STATES or G.STATE ~= G.STATES.GAME_OVER then
         return false, "not in game over state"
     end
+    if G.FUNCS and G.FUNCS.go_to_menu then
+        local ok = pcall(function() G.FUNCS.go_to_menu() end)
+        if ok then return true, "queued return to main menu" end
+    end
     local game_over_button = find_ui_node({ui_id = "from_game_over"})
     if not game_over_button or not game_over_button.click then
         return false, "game over menu button unavailable"
@@ -1352,6 +1356,9 @@ local function command_click(command)
 end
 
 local function command_ui_click(command)
+    if command.ui_id == "from_game_over" or command.button == "from_game_over" then
+        return command_return_to_menu()
+    end
     local node = find_ui_node(command)
     if not node then
         local target_id = command.ui_id or command.target_id

@@ -700,6 +700,7 @@ impl Server {
             });
         let ipc = self.ipc.clone();
         let action_id = params.action_id.clone();
+        let requested_action_id = action_id.clone();
         let decision_id = current_decision_id;
         let action = selected.cloned();
         match tokio::task::spawn_blocking(move || {
@@ -726,6 +727,16 @@ impl Server {
                     }
                     Err(_) => json!({"bridge_response": data, "legal_actions": []}),
                 };
+                if requested_action_id == "from_game_over"
+                    && next.pointer("/game/state").and_then(Value::as_str) == Some("GAME_OVER")
+                {
+                    return to_tool_result(envelope(
+                        false,
+                        next,
+                        "action_failed",
+                        "from_game_over reported success but the game remained in GAME_OVER",
+                    ));
+                }
                 to_tool_result(envelope(true, next, "", ""))
             }
             Ok(Err(error)) => {
