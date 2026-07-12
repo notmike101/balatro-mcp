@@ -655,7 +655,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Execute exactly one current legal action using action_id and decision_id. Mutations are serialized and checkpointed."
+        description = "Execute exactly one current legal action using action_id and a non-empty decision_id. The current legal action set is authoritative because bridge polling can refresh snapshots between tool calls; mutations are serialized and checkpointed."
     )]
     async fn take_action(
         &self,
@@ -684,12 +684,17 @@ impl Server {
             return to_tool_result(problem);
         }
         let current = self.policy(40).await.unwrap_or(Value::Null);
-        if current.get("decision_id").and_then(Value::as_str) != Some(params.decision_id.as_str()) {
+        let current_decision_id = current
+            .get("decision_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if current_decision_id.is_empty() {
             return to_tool_result(envelope(
                 false,
                 current,
-                "stale_decision",
-                "decision_id does not match the current observation",
+                "decision_failed",
+                "current observation has no decision_id",
             ));
         }
         let settle = params.settle_timeout.clamp(1.0, 30.0);
@@ -704,7 +709,7 @@ impl Server {
             });
         let ipc = self.ipc.clone();
         let action_id = params.action_id.clone();
-        let decision_id = params.decision_id.clone();
+        let decision_id = current_decision_id;
         let action = selected.cloned();
         match tokio::task::spawn_blocking(move || {
             execute_policy_action(

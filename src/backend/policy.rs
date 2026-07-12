@@ -416,6 +416,7 @@ fn generate_legal_actions(
                     for (name, choice) in choices {
                         if choice.get("state").and_then(Value::as_str) == Some("Select") {
                             actions.push(json!({"action_id":format!("select_{}", name.to_ascii_lowercase()),"action":"select_blind","blind":name,"reason":format!("select {} blind", name)}));
+                            actions.push(json!({"action_id":format!("skip_{}", name.to_ascii_lowercase()),"action":"skip_blind","blind":name,"reason":format!("skip {} blind", name)}));
                         }
                     }
                 }
