@@ -9,6 +9,8 @@ static EMPTY_OBJECT: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(se
 pub struct ScoreResult {
     pub hand_name: String,
     pub hand_key: String,
+    pub score_scope: String,
+    pub run_most_played_hand: Option<String>,
     pub scoring_cards: Vec<usize>,
     pub chips: i64,
     pub mult: i64,
@@ -174,9 +176,20 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
     let contract = observation.get("poker_hands").unwrap_or(&Value::Null);
     let base = hand_value(contract, &hand_name);
     let (base_chips, mut mult) = base.unwrap_or((5, 1));
+    let run = observation.get("run").or_else(|| observation.get("round"));
+    let run_most_played_hand = run
+        .and_then(|run| run.get("most_played_poker_hand"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let mut result = ScoreResult {
         hand_key: hand_name.clone(),
         hand_name,
+        score_scope: if card_indices.is_some() {
+            "selected_cards".into()
+        } else {
+            "current_hand".into()
+        },
+        run_most_played_hand,
         scoring_cards: indices,
         chips: base_chips,
         mult,
@@ -409,6 +422,21 @@ mod tests {
         let result = score_hand(&observation, None);
         assert_eq!(result.chips, 70);
         assert_eq!(result.exact_score, Some(140));
+        assert_eq!(result.score_scope, "current_hand");
+        assert_eq!(result.run_most_played_hand, None);
+    }
+
+    #[test]
+    fn score_metadata_distinguishes_selection_from_run_history() {
+        let observation = json!({
+            "run": {"most_played_poker_hand": "Pair"},
+            "areas": {"hand": [card("A", "H"), card("K", "S")]},
+            "poker_hands": {"values": {"High Card": {"chips": 10, "mult": 2}}}
+        });
+        let result = score_hand(&observation, Some(&[0]));
+        assert_eq!(result.hand_key, "High Card");
+        assert_eq!(result.score_scope, "selected_cards");
+        assert_eq!(result.run_most_played_hand.as_deref(), Some("Pair"));
     }
 
     #[test]

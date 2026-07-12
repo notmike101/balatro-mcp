@@ -244,6 +244,7 @@ impl ReplayDB {
             query.push_str(" AND outcome = ?");
             params.push(Box::new(o));
         }
+        query.push_str(" ORDER BY id DESC");
 
         let mut stmt = conn.prepare(&query).map_err(|e| format!("prepare: {e}"))?;
         let params_ref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
@@ -259,12 +260,28 @@ impl ReplayDB {
         }
 
         if json_mode {
-            let results: Vec<Value> = replays
+            let results: Result<Vec<Value>, String> = replays
                 .iter()
-                .map(|(rid, _, _, _, _, _, _, _)| *rid)
-                .filter_map(|rid| self.load_replay_detail(&conn, rid).ok())
+                .map(
+                    |(rid, seed, ante, stake, blind, outcome, chips_required, max_chips_gained)| {
+                        let detail = self.load_replay_detail(&conn, *rid)?;
+                        let mut object = detail
+                            .as_object()
+                            .cloned()
+                            .ok_or_else(|| format!("replay {rid} detail is not an object"))?;
+                        object.insert("replay_id".into(), json!(rid));
+                        object.insert("seed".into(), json!(seed));
+                        object.insert("ante".into(), json!(ante));
+                        object.insert("stake".into(), json!(stake));
+                        object.insert("blind_key".into(), json!(blind));
+                        object.insert("outcome".into(), json!(outcome));
+                        object.insert("chips_required".into(), json!(chips_required));
+                        object.insert("max_chips_gained".into(), json!(max_chips_gained));
+                        Ok(Value::Object(object))
+                    },
+                )
                 .collect();
-            Ok(json!(results))
+            Ok(json!(results?))
         } else {
             let mut output = String::new();
             for replay in &replays {
@@ -671,10 +688,44 @@ mod tests {
             .query_replays(None, None, None, None, Some("fail"), true)
             .unwrap();
         assert!(!result.as_array().unwrap().is_empty());
+        assert_eq!(result[0]["replay_id"], rid);
+        assert_eq!(result[0]["seed"], "2K9H9HN");
+        assert_eq!(result[0]["outcome"], "fail");
         let text = db
             .query_replays(None, None, None, None, Some("fail"), false)
             .unwrap();
         assert!(text["text"].as_str().unwrap().contains("FAILED"));
+    }
+
+    #[test]
+    fn query_replays_orders_latest_first_and_keeps_all_outcomes() {
+        let (db, _dir) = make_db();
+        let clear = db
+            .log_clear(
+                "2K9H9HN",
+                1,
+                1,
+                "Small",
+                &[],
+                &[],
+                &[],
+                None,
+                None,
+                "",
+                "",
+                &[],
+                &[],
+                "",
+            )
+            .unwrap();
+        let fail = db.log_fail("2K9H9HN", 1, 1, "Small").unwrap();
+        let result = db
+            .query_replays(Some("2K9H9HN"), Some(1), Some(1), None, None, true)
+            .unwrap();
+        assert_eq!(result[0]["replay_id"], fail);
+        assert_eq!(result[1]["replay_id"], clear);
+        assert_eq!(result[0]["outcome"], "fail");
+        assert_eq!(result[1]["outcome"], "clear");
     }
 
     #[test]

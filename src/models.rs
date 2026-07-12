@@ -1,6 +1,12 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+fn object_value_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    // `serde_json::Value` normally emits the boolean schema `true`, which is
+    // valid JSON Schema but rejected by some MCP hosts for tool properties.
+    schemars::json_schema!({"type": "object"})
+}
+
 pub const SEED: &str = "2K9H9HN";
 pub const INFO_TYPES: &[&str] = &[
     "joker",
@@ -35,9 +41,18 @@ pub struct DecisionParams {
     pub action_type: String,
     #[serde(default = "decision_limit")]
     pub limit: u32,
+    /// Maximum number of legal actions returned in this page.
+    #[serde(default = "decision_action_limit")]
+    pub action_limit: u32,
+    /// Zero-based offset into the filtered legal-action list.
+    #[serde(default)]
+    pub action_offset: u32,
 }
 pub fn decision_limit() -> u32 {
     40
+}
+pub fn decision_action_limit() -> u32 {
+    80
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -46,6 +61,9 @@ pub struct ActionParams {
     pub decision_id: String,
     #[serde(default = "settle_timeout")]
     pub settle_timeout: f64,
+    /// Optional 1-based hand positions for play_selected/discard_selected.
+    #[serde(default)]
+    pub card_indices: Vec<usize>,
 }
 pub fn settle_timeout() -> f64 {
     12.0
@@ -195,6 +213,7 @@ pub struct StateParams {
 pub struct StrategyRuleParams {
     pub id: String,
     pub kind: String,
+    #[schemars(schema_with = "object_value_schema")]
     pub conditions: serde_json::Value,
     pub directive: String,
     #[serde(default)]
@@ -230,6 +249,7 @@ pub struct EstimateParams {
     pub estimated: i64,
     pub actual: i64,
     #[serde(default)]
+    #[schemars(schema_with = "object_value_schema")]
     pub context: serde_json::Value,
 }
 
@@ -341,14 +361,19 @@ mod tests {
         let params: DecisionParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.action_type, "");
         assert_eq!(params.limit, 40);
+        assert_eq!(params.action_limit, 80);
+        assert_eq!(params.action_offset, 0);
     }
 
     #[test]
     fn decision_params_accepts_custom_values() {
-        let json = json!({"action_type": "play", "limit": 100});
+        let json =
+            json!({"action_type": "play", "limit": 100, "action_limit": 12, "action_offset": 24});
         let params: DecisionParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.action_type, "play");
         assert_eq!(params.limit, 100);
+        assert_eq!(params.action_limit, 12);
+        assert_eq!(params.action_offset, 24);
     }
 
     #[test]
@@ -356,13 +381,15 @@ mod tests {
         let json = json!({"action_id": "p:1", "decision_id": "d:1"});
         let params: ActionParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.settle_timeout, 12.0);
+        assert!(params.card_indices.is_empty());
     }
 
     #[test]
     fn action_params_accepts_custom_settle_timeout() {
-        let json = json!({"action_id": "p:1", "decision_id": "d:1", "settle_timeout": 25.5});
+        let json = json!({"action_id": "p:1", "decision_id": "d:1", "settle_timeout": 25.5, "card_indices": [4, 5]});
         let params: ActionParams = serde_json::from_value(json).unwrap();
         assert!((params.settle_timeout - 25.5).abs() < f64::EPSILON);
+        assert_eq!(params.card_indices, vec![4, 5]);
     }
 
     #[test]
@@ -489,5 +516,14 @@ mod tests {
     #[test]
     fn decision_params_schema_compiles() {
         let _ = schemars::schema_for!(DecisionParams);
+    }
+
+    #[test]
+    fn arbitrary_json_tool_fields_use_object_schemas() {
+        let strategy = serde_json::to_value(schemars::schema_for!(StrategyRuleParams)).unwrap();
+        let estimate = serde_json::to_value(schemars::schema_for!(EstimateParams)).unwrap();
+
+        assert_eq!(strategy["properties"]["conditions"]["type"], "object");
+        assert_eq!(estimate["properties"]["context"]["type"], "object");
     }
 }

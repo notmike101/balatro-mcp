@@ -8,7 +8,7 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashSet, env, fs, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 use crate::backend::{
@@ -27,6 +27,11 @@ use crate::rules::{LookupOptions, RulesDb, default_db_path};
 
 use std::sync::LazyLock;
 static EMPTY_BRIDGE: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(serde_json::Map::new);
+
+const CANONICAL_PLAY_LIMIT: usize = 40;
+const CANONICAL_DISCARD_LIMIT: usize = 40;
+const CANONICAL_TARGET_LIMIT: usize = 60;
+const MAX_ACTION_PAGE: usize = 256;
 
 fn canonical_json(value: &Value) -> String {
     match value {
@@ -89,6 +94,134 @@ fn semantic_decision_id_for(policy: &Value) -> String {
         "score_pressure": policy.get("score_pressure"),
     });
     digest("d4", &basis)
+}
+
+fn canonical_policy_decision_id(observation: &Value) -> String {
+    let state = build_policy_state(
+        observation,
+        CANONICAL_PLAY_LIMIT,
+        CANONICAL_DISCARD_LIMIT,
+        CANONICAL_TARGET_LIMIT,
+    );
+    semantic_decision_id_for(&state)
+}
+
+fn page_legal_actions(
+    data: &mut Value,
+    action_type: &str,
+    requested_offset: u32,
+    requested_limit: u32,
+) {
+    let Some(object) = data.as_object_mut() else {
+        return;
+    };
+    let actions = object
+        .remove("legal_actions")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let filtered: Vec<Value> = actions
+        .into_iter()
+        .filter(|action| {
+            action_type.is_empty()
+                || action.get("action").and_then(Value::as_str) == Some(action_type)
+        })
+        .collect();
+    let total = filtered.len();
+    let offset = (requested_offset as usize).min(total);
+    let requested_limit = if requested_limit == 0 {
+        MAX_ACTION_PAGE
+    } else {
+        requested_limit as usize
+    };
+    let page_limit = requested_limit.min(MAX_ACTION_PAGE);
+    let end = offset.saturating_add(page_limit).min(total);
+    let page = filtered[offset..end].to_vec();
+
+    object.insert("legal_actions".into(), Value::Array(page));
+    object.insert("legal_actions_total".into(), json!(total));
+    object.insert("legal_actions_offset".into(), json!(offset));
+    object.insert("legal_actions_limit".into(), json!(page_limit));
+    object.insert("legal_actions_truncated".into(), json!(end < total));
+    object.insert(
+        "legal_actions_next_offset".into(),
+        if end < total { json!(end) } else { Value::Null },
+    );
+}
+
+fn resolve_hand_selection_action(
+    policy: &Value,
+    template: &Value,
+    card_indices: &[usize],
+) -> Result<Value, String> {
+    let action = template
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or("hand selection action has no action type")?;
+    if !matches!(action, "play" | "discard") {
+        return Err("card_indices can only be used with play_selected or discard_selected".into());
+    }
+    if card_indices.is_empty() {
+        return Err("card_indices must contain at least one 1-based hand position".into());
+    }
+
+    let hand = policy
+        .get("hand")
+        .and_then(Value::as_array)
+        .ok_or("current policy has no hand")?;
+    let max_cards = template
+        .get("max_cards")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(hand.len());
+    if card_indices.len() > max_cards {
+        return Err(format!(
+            "too many cards for {action}; maximum is {max_cards}"
+        ));
+    }
+
+    let mut seen = HashSet::with_capacity(card_indices.len());
+    let mut card_ids = Vec::with_capacity(card_indices.len());
+    for index in card_indices {
+        if *index == 0 || *index > hand.len() {
+            return Err(format!(
+                "hand card index {index} is not available; indices are 1-based"
+            ));
+        }
+        if !seen.insert(*index) {
+            return Err(format!(
+                "hand card index {index} was supplied more than once"
+            ));
+        }
+        let card = &hand[*index - 1];
+        let id = card
+            .get("instance_id")
+            .or_else(|| card.get("id"))
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| (!value.is_null()).then(|| value.to_string()))
+            })
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("hand card index {index} has no stable card id"))?;
+        card_ids.push(id);
+    }
+
+    let mut resolved = template.clone();
+    resolved["cards"] = json!(card_indices);
+    resolved["card_indices"] = json!(card_indices);
+    resolved["card_ids"] = json!(card_ids);
+    Ok(resolved)
+}
+
+fn replay_outcome_filter(outcome: &str) -> Option<String> {
+    let normalized = outcome.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "" | "all" => None,
+        "best" | "clear" => Some("clear".into()),
+        "fail" => Some("fail".into()),
+        _ => Some(normalized),
+    }
 }
 fn observation_id_for(observation: &Value) -> String {
     digest("o3", observation)
@@ -189,8 +322,13 @@ impl Server {
             return Err("deterministic policy failure".into());
         }
         let observation = self.read_observation()?;
-        let mut state = build_policy_state(&observation, limit as usize, 40, 60);
-        let decision_id = semantic_decision_id_for(&state);
+        let mut state = build_policy_state(
+            &observation,
+            (limit as usize).min(CANONICAL_PLAY_LIMIT),
+            CANONICAL_DISCARD_LIMIT,
+            CANONICAL_TARGET_LIMIT,
+        );
+        let decision_id = canonical_policy_decision_id(&observation);
         let observation_id = observation_id_for(&observation);
         let score = serde_json::to_value(score_hand(&observation, None)).unwrap_or(Value::Null);
         let directives = self
@@ -675,7 +813,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Return current decision_id, legal actions, rankings, and strategy analysis. Examine decision_checks.ordering.hand_order and decision_checks.ordering.joker_order when jokers are present and trigger sequence can affect scoring. Examine decision_checks.consumables when Tarot/Planet/Spectral cards are owned or available in shop; use or sell before exiting or advancing. Examine decision_checks.shop when in SHOP state to track remaining items and indexes after each purchase. Examine decision_checks.slots to verify available joker and consumable slots before buying."
+        description = "Return the current decision_id, a paged legal-action list, rankings, and strategy analysis. Use action_type, action_offset, and action_limit to inspect additional action pages when legal_actions_truncated is true. Examine decision_checks.ordering.hand_order and decision_checks.ordering.joker_order when jokers are present and trigger sequence can affect scoring. Examine decision_checks.consumables when Tarot/Planet/Spectral cards are owned or available in shop; use or sell before exiting or advancing. Examine decision_checks.shop and decision_checks.slots during SHOP state to track remaining items and indexes after each purchase."
     )]
     async fn get_decision(
         &self,
@@ -683,14 +821,12 @@ impl Server {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         match self.policy(params.limit).await {
             Ok(mut data) => {
-                if !params.action_type.is_empty()
-                    && let Some(actions) =
-                        data.get_mut("legal_actions").and_then(Value::as_array_mut)
-                {
-                    actions.retain(|a| {
-                        a.get("action").and_then(Value::as_str) == Some(params.action_type.as_str())
-                    });
-                }
+                page_legal_actions(
+                    &mut data,
+                    &params.action_type,
+                    params.action_offset,
+                    params.action_limit,
+                );
                 to_tool_result(envelope(true, data, "", ""))
             }
             Err(e) => to_tool_result(envelope(false, Value::Null, "decision_failed", &e)),
@@ -698,7 +834,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Execute exactly one current legal action using action_id and a non-empty decision_id. The current legal action set is authoritative because bridge polling can refresh snapshots between tool calls; mutations are serialized and checkpointed."
+        description = "Execute exactly one current legal action using action_id and a non-empty decision_id. For arbitrary play/discard selections, use the legal play_selected or discard_selected action with 1-based card_indices. The current legal action set is authoritative because bridge polling can refresh snapshots between tool calls; mutations are serialized and checkpointed."
     )]
     async fn take_action(
         &self,
@@ -758,6 +894,51 @@ impl Server {
                         == Some(params.action_id.as_str())
                 })
             });
+        let action = match selected {
+            None => {
+                return to_tool_result(envelope(
+                    false,
+                    current,
+                    "action_not_found",
+                    "action_id is not in the current legal action set",
+                ));
+            }
+            Some(selected) => {
+                let caller_supplies_selection =
+                    selected.get("selection").and_then(Value::as_str) == Some("caller_supplied");
+                if caller_supplies_selection {
+                    if params.card_indices.is_empty() {
+                        return to_tool_result(envelope(
+                            false,
+                            current,
+                            "invalid_arguments",
+                            "card_indices is required for play_selected/discard_selected",
+                        ));
+                    }
+                    match resolve_hand_selection_action(&current, selected, &params.card_indices) {
+                        Ok(action) => action,
+                        Err(error) => {
+                            return to_tool_result(envelope(
+                                false,
+                                current,
+                                "invalid_arguments",
+                                &error,
+                            ));
+                        }
+                    }
+                } else {
+                    if !params.card_indices.is_empty() {
+                        return to_tool_result(envelope(
+                            false,
+                            current,
+                            "invalid_arguments",
+                            "card_indices is only valid with play_selected/discard_selected",
+                        ));
+                    }
+                    selected.clone()
+                }
+            }
+        };
         let ipc = self.ipc.clone();
         let action_id = params.action_id.clone();
         let decision_id = current_decision_id.clone();
@@ -767,13 +948,12 @@ impl Server {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let action = selected.cloned();
         match tokio::task::spawn_blocking(move || {
             execute_policy_action(
                 &ipc,
                 &action_id,
                 &decision_id,
-                action.as_ref(),
+                Some(&action),
                 30,
                 15,
                 60,
@@ -968,7 +1148,12 @@ impl Server {
             {
                 if wait_state_matches(&observation, &params.state) {
                     return match self.policy(20).await {
-                        Ok(data) => to_tool_result(envelope(true, data, "", "")),
+                        Ok(data) => to_tool_result(envelope(
+                            true,
+                            compact_observation(data, "summary"),
+                            "",
+                            "",
+                        )),
                         Err(error) => {
                             to_tool_result(envelope(false, Value::Null, "wait_failed", &error))
                         }
@@ -1101,13 +1286,7 @@ impl Server {
         &self,
         Parameters(params): Parameters<ReplayQueryParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let outcome_marker: Option<&str> = if params.outcome == "best" {
-            Some("clear")
-        } else if params.outcome == "fail" {
-            Some("fail")
-        } else {
-            Some(params.outcome.as_str())
-        };
+        let outcome_marker = replay_outcome_filter(&params.outcome);
         let result = self.replay_db.lock().await.query_replays(
             Some(SEED),
             Some(params.ante),
@@ -1117,7 +1296,7 @@ impl Server {
             } else {
                 Some(params.blind.as_str())
             },
-            outcome_marker,
+            outcome_marker.as_deref(),
             true,
         );
         match result {
@@ -1526,7 +1705,7 @@ impl rmcp::ServerHandler for Server {
                 .with_description("Rust stdio boundary for safe Balatro gameplay."),
         )
         .with_instructions(
-            "Use only these MCP tools for Balatro. Start with game_status; if the main menu has a non-target saved seed, use start_new_run to recover to 2K9H9HN; then get_decision. Examine decision_checks.ordering when jokers are present; examine decision_checks.consumables for owned or shop Tarot/Planet/Spectral; examine decision_checks.shop and decision_checks.slots during SHOP state; execute only legal action_id with its decision_id.",
+            "Use only these MCP tools for Balatro. Start with game_status; if the main menu has a non-target saved seed, use start_new_run to recover to 2K9H9HN; then get_decision. Examine decision_checks.ordering when jokers are present; examine decision_checks.consumables for owned or shop Tarot/Planet/Spectral; examine decision_checks.shop and decision_checks.slots during SHOP state; execute only a current legal action_id with its decision_id. For arbitrary hand selections, use play_selected or discard_selected with 1-based card_indices. Page get_decision when legal_actions_truncated is true.",
         )
     }
     #[cfg_attr(coverage_nightly, coverage(off))]
@@ -1613,7 +1792,8 @@ mod tests {
                 .take_action(Parameters(ActionParams {
                     action_id: String::new(),
                     decision_id: String::new(),
-                    settle_timeout: 12.0
+                    settle_timeout: 12.0,
+                    card_indices: vec![]
                 }))
                 .await
                 .is_ok()
@@ -1685,6 +1865,7 @@ mod tests {
                     action_id: "play:1".into(),
                     decision_id: "d3-test".into(),
                     settle_timeout: 12.0,
+                    card_indices: vec![],
                 }))
                 .await
                 .is_ok()
@@ -1782,6 +1963,18 @@ mod tests {
                 .await
                 .is_ok()
         );
+        let all = server
+            .query_replays(Parameters(ReplayQueryParams {
+                ante: 1,
+                stake: 1,
+                blind: "Small".into(),
+                outcome: "all".into(),
+            }))
+            .await
+            .unwrap();
+        let all = all.structured_content.unwrap();
+        assert_eq!(all["ok"], true);
+        assert_eq!(all["data"]["replays"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1793,7 +1986,9 @@ mod tests {
             server
                 .get_decision(Parameters(DecisionParams {
                     action_type: String::new(),
-                    limit: 1
+                    limit: 1,
+                    action_limit: 80,
+                    action_offset: 0
                 }))
                 .await
                 .is_ok()
@@ -1802,7 +1997,9 @@ mod tests {
             server
                 .get_decision(Parameters(DecisionParams {
                     action_type: "play".into(),
-                    limit: 10
+                    limit: 10,
+                    action_limit: 80,
+                    action_offset: 0
                 }))
                 .await
                 .is_ok()
@@ -2040,20 +2237,28 @@ mod tests {
                 .await
                 .is_ok()
         );
-        assert!(
-            server
-                .get_decision(Parameters(DecisionParams {
-                    action_type: String::new(),
-                    limit: 10
-                }))
-                .await
-                .is_ok()
-        );
+        let decision = server
+            .get_decision(Parameters(DecisionParams {
+                action_type: String::new(),
+                limit: 10,
+                action_limit: 1,
+                action_offset: 0,
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(decision["data"]["legal_actions_offset"], 0);
+        assert_eq!(decision["data"]["legal_actions_limit"], 1);
+        assert_eq!(decision["data"]["legal_actions_truncated"], true);
+        assert_eq!(decision["data"]["legal_actions_next_offset"], 1);
         assert!(
             server
                 .get_decision(Parameters(DecisionParams {
                     action_type: "play".into(),
-                    limit: 10
+                    limit: 10,
+                    action_limit: 80,
+                    action_offset: 0
                 }))
                 .await
                 .is_ok()
@@ -2075,15 +2280,18 @@ mod tests {
                 .is_ok()
         );
         assert!(server.hand_values().await.is_ok());
-        assert!(
-            server
-                .wait_for_state(Parameters(WaitParams {
-                    state: "SELECTING_HAND".into(),
-                    timeout: 0.1
-                }))
-                .await
-                .is_ok()
-        );
+        let waited = server
+            .wait_for_state(Parameters(WaitParams {
+                state: "SELECTING_HAND".into(),
+                timeout: 0.1,
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(waited["state"], "SELECTING_HAND");
+        assert_eq!(waited["data"]["state"], "SELECTING_HAND");
+        assert!(waited["data"].get("legal_actions").is_none());
         assert!(
             server
                 .wait_for_state(Parameters(WaitParams {
@@ -2149,7 +2357,8 @@ mod tests {
                 .take_action(Parameters(ActionParams {
                     action_id: "play_a".into(),
                     decision_id: "stale".into(),
-                    settle_timeout: 1.0
+                    settle_timeout: 1.0,
+                    card_indices: vec![]
                 }))
                 .await
                 .is_ok()
@@ -2159,7 +2368,8 @@ mod tests {
                 .take_action(Parameters(ActionParams {
                     action_id: "play_a".into(),
                     decision_id: decision.clone(),
-                    settle_timeout: 1.0
+                    settle_timeout: 1.0,
+                    card_indices: vec![]
                 }))
                 .await
                 .is_ok()
@@ -2187,7 +2397,8 @@ mod tests {
                 .take_action(Parameters(ActionParams {
                     action_id: "play_a".into(),
                     decision_id: decision,
-                    settle_timeout: 1.0
+                    settle_timeout: 1.0,
+                    card_indices: vec![]
                 }))
                 .await
                 .is_ok()
@@ -2429,6 +2640,58 @@ mod tests {
         assert!(matches!(observation_error_result("missing"), Ok(_)));
     }
 
+    #[test]
+    fn decision_pages_and_hand_selection_are_deterministic() {
+        let observation = json!({
+            "game": {"state": "SELECTING_HAND"},
+            "run": {"hands_left": 2, "discards_left": 1, "blind": {"chips_required": 100}},
+            "areas": {"hand": [
+                {"instance_id": "a", "base": {"rank": "A"}},
+                {"instance_id": "b", "base": {"rank": "K"}},
+                {"instance_id": "c", "base": {"rank": "Q"}},
+                {"instance_id": "d", "base": {"rank": "J"}},
+                {"instance_id": "e", "base": {"rank": "10"}}
+            ]}
+        });
+        let canonical = build_policy_state(&observation, 40, 40, 60);
+        let limited = build_policy_state(&observation, 1, 40, 60);
+        assert_eq!(
+            canonical_policy_decision_id(&observation),
+            semantic_decision_id_for(&canonical)
+        );
+        assert_ne!(
+            semantic_decision_id_for(&limited),
+            semantic_decision_id_for(&canonical)
+        );
+
+        let template = canonical["legal_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|action| action["action_id"] == "play_selected")
+            .unwrap();
+        let resolved = resolve_hand_selection_action(&canonical, template, &[4, 5]).unwrap();
+        assert_eq!(resolved["card_indices"], json!([4, 5]));
+        assert_eq!(resolved["card_ids"], json!(["d", "e"]));
+        assert!(resolve_hand_selection_action(&canonical, template, &[0, 5]).is_err());
+        assert!(resolve_hand_selection_action(&canonical, template, &[4, 4]).is_err());
+
+        let mut page = json!({
+            "legal_actions": [
+                {"action": "play", "action_id": "p1"},
+                {"action": "move_card", "action_id": "m1"},
+                {"action": "move_card", "action_id": "m2"}
+            ]
+        });
+        page_legal_actions(&mut page, "move_card", 1, 1);
+        assert_eq!(page["legal_actions_total"], 2);
+        assert_eq!(page["legal_actions"][0]["action_id"], "m2");
+        assert_eq!(page["legal_actions_truncated"], false);
+        assert_eq!(replay_outcome_filter("all"), None);
+        assert_eq!(replay_outcome_filter("BEST").as_deref(), Some("clear"));
+        assert_eq!(replay_outcome_filter("fail").as_deref(), Some("fail"));
+    }
+
     #[tokio::test]
     async fn runtime_status_and_preflight_failure_branches_are_exercised() {
         let (_dir, server) = server();
@@ -2440,7 +2703,8 @@ mod tests {
                 .take_action(Parameters(ActionParams {
                     action_id: "x".into(),
                     decision_id: "d".into(),
-                    settle_timeout: 1.0
+                    settle_timeout: 1.0,
+                    card_indices: vec![]
                 }))
                 .await
                 .is_ok()
@@ -2479,7 +2743,8 @@ mod tests {
                 .take_action(Parameters(ActionParams {
                     action_id: "x".into(),
                     decision_id: "d".into(),
-                    settle_timeout: 1.0
+                    settle_timeout: 1.0,
+                    card_indices: vec![]
                 }))
                 .await
                 .is_ok()
@@ -2506,7 +2771,8 @@ mod tests {
                 .take_action(Parameters(ActionParams {
                     action_id: "x".into(),
                     decision_id: "d".into(),
-                    settle_timeout: 1.0
+                    settle_timeout: 1.0,
+                    card_indices: vec![]
                 }))
                 .await
                 .is_ok()
