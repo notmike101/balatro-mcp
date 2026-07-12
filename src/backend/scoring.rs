@@ -11,6 +11,9 @@ pub struct ScoreResult {
     pub hand_key: String,
     pub score_scope: String,
     pub run_most_played_hand: Option<String>,
+    pub run_chips: Option<i64>,
+    pub blind_chips_required: Option<i64>,
+    pub blind_chips_remaining: Option<i64>,
     pub scoring_cards: Vec<usize>,
     pub chips: i64,
     pub mult: i64,
@@ -181,6 +184,12 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
         .and_then(|run| run.get("most_played_poker_hand"))
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let run_chips = run.and_then(|run| run.get("chips")).and_then(Value::as_i64);
+    let blind_chips_required = run
+        .and_then(|run| run.pointer("/blind/chips_required"))
+        .and_then(Value::as_i64);
+    let blind_chips_remaining =
+        blind_chips_required.map(|required| required.saturating_sub(run_chips.unwrap_or(0)).max(0));
     let mut result = ScoreResult {
         hand_key: hand_name.clone(),
         hand_name,
@@ -190,6 +199,9 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
             "current_hand".into()
         },
         run_most_played_hand,
+        run_chips,
+        blind_chips_required,
+        blind_chips_remaining,
         scoring_cards: indices,
         chips: base_chips,
         mult,
@@ -437,6 +449,22 @@ mod tests {
         assert_eq!(result.hand_key, "High Card");
         assert_eq!(result.score_scope, "selected_cards");
         assert_eq!(result.run_most_played_hand.as_deref(), Some("Pair"));
+    }
+
+    #[test]
+    fn score_metadata_includes_run_progress() {
+        let observation = json!({
+            "run": {
+                "chips": 120,
+                "blind": {"chips_required": 300}
+            },
+            "areas": {"hand": [card("A", "H")]},
+            "poker_hands": {"values": {"High Card": {"chips": 10, "mult": 2}}}
+        });
+        let result = score_hand(&observation, None);
+        assert_eq!(result.run_chips, Some(120));
+        assert_eq!(result.blind_chips_required, Some(300));
+        assert_eq!(result.blind_chips_remaining, Some(180));
     }
 
     #[test]

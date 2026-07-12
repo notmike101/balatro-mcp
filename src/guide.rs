@@ -15,10 +15,10 @@ pub fn guide(topic: &str) -> Option<&'static str> {
             "Goal: clear Small, Big, and Boss blinds through Ante 8. Agent loop: game_status; query matching replays before each blind; get_decision; examine decision_checks.ordering when jokers are present; examine decision_checks.consumables for owned or shop Tarot/Planet/Spectral; examine decision_checks.shop and decision_checks.slots during SHOP state; lookup unknown effects; take one legal action with current decision_id; use play_selected or discard_selected with 1-based card_indices for arbitrary hand positions; page get_decision when legal_actions_truncated is true; observe the new state. Never infer face-down cards.",
         ),
         "hands" | "scoring" => Some(
-            "Poker hands score Chips multiplied by Mult. Planet consumables level a named hand. Use live hand_values; controller scores are estimates unless explicitly exact. score_analysis.hand_key describes the cards scored for that call, while score_analysis.run_most_played_hand describes cumulative run history.",
+            "Poker hands score Chips multiplied by Mult. Planet consumables level a named hand. Use live hand_values; controller scores are estimates unless explicitly exact. score_analysis.hand_key describes the cards scored for that call, score_analysis.score_scope identifies current-hand versus selected-card scope, and score_analysis.run_chips plus score_analysis.blind_chips_remaining expose cumulative run progress.",
         ),
         "actions" | "discards" => Some(
-            "Hands score; discards redraw without scoring. Consider all legal discard sizes and a specific draw goal. Use only legal actions.",
+            "Hands score; discards redraw without scoring. Check discard_status.remaining, discard_status.used, and discard_status.configured_limit because the remaining count can be lower than the starting limit. Consider all legal discard sizes and a specific draw goal. Use only legal actions.",
         ),
         "economy" | "shops" => Some(
             "Evaluate Joker slots, consumable slots, price, interest, and the next blind. Buy one item at a time, then reread decision state.",
