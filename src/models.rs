@@ -52,7 +52,7 @@ pub fn decision_limit() -> u32 {
     40
 }
 pub fn decision_action_limit() -> u32 {
-    80
+    256
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -362,7 +362,7 @@ mod tests {
         let params: DecisionParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.action_type, "");
         assert_eq!(params.limit, 40);
-        assert_eq!(params.action_limit, 80);
+        assert_eq!(params.action_limit, 256);
         assert_eq!(params.action_offset, 0);
     }
 

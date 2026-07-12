@@ -214,6 +214,42 @@ fn resolve_hand_selection_action(
     Ok(resolved)
 }
 
+fn resolve_encoded_selection_action(policy: &Value, action_id: &str) -> Option<Value> {
+    let (action, encoded_ids) = action_id.split_once('_')?;
+    if !matches!(action, "play" | "discard") || encoded_ids.is_empty() {
+        return None;
+    }
+    let hand = policy.get("hand")?.as_array()?;
+    let mut indices = Vec::new();
+    let mut card_ids = Vec::new();
+    for requested_id in encoded_ids.split('_') {
+        let (index, card) = hand.iter().enumerate().find(|(_, card)| {
+            card.get("instance_id")
+                .or_else(|| card.get("id"))
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string())
+                })
+                .as_deref()
+                == Some(requested_id)
+        })?;
+        if indices.contains(&(index + 1)) {
+            return None;
+        }
+        indices.push(index + 1);
+        card_ids.push(card.get("instance_id").or_else(|| card.get("id"))?.clone());
+    }
+    Some(json!({
+        "action_id": action_id,
+        "action": action,
+        "cards": indices,
+        "card_indices": indices,
+        "card_ids": card_ids,
+    }))
+}
+
 fn replay_outcome_filter(outcome: &str) -> Option<String> {
     let normalized = outcome.trim().to_ascii_lowercase();
     match normalized.as_str() {
@@ -927,16 +963,20 @@ impl Server {
                     action.get("action_id").and_then(Value::as_str)
                         == Some(params.action_id.as_str())
                 })
-            });
+            })
+            .cloned();
         let action = match selected {
-            None => {
-                return to_tool_result(envelope(
-                    false,
-                    current,
-                    "action_not_found",
-                    "action_id is not in the current legal action set",
-                ));
-            }
+            None => match resolve_encoded_selection_action(&current, &params.action_id) {
+                Some(action) => action,
+                None => {
+                    return to_tool_result(envelope(
+                        false,
+                        current,
+                        "action_not_found",
+                        "action_id is not in the current legal action set",
+                    ));
+                }
+            },
             Some(selected) => {
                 let caller_supplies_selection =
                     selected.get("selection").and_then(Value::as_str) == Some("caller_supplied");
@@ -949,7 +989,7 @@ impl Server {
                             "card_indices is required for play_selected/discard_selected",
                         ));
                     }
-                    match resolve_hand_selection_action(&current, selected, &params.card_indices) {
+                    match resolve_hand_selection_action(&current, &selected, &params.card_indices) {
                         Ok(action) => action,
                         Err(error) => {
                             return to_tool_result(envelope(
@@ -961,15 +1001,9 @@ impl Server {
                         }
                     }
                 } else {
-                    if !params.card_indices.is_empty() {
-                        return to_tool_result(envelope(
-                            false,
-                            current,
-                            "invalid_arguments",
-                            "card_indices is only valid with play_selected/discard_selected",
-                        ));
-                    }
-                    selected.clone()
+                    // Concrete play/discard action IDs already contain their card
+                    // selection. Ignore redundant card_indices for compatibility.
+                    selected
                 }
             }
         };
@@ -2741,6 +2775,9 @@ mod tests {
         let resolved = resolve_hand_selection_action(&canonical, template, &[4, 5]).unwrap();
         assert_eq!(resolved["card_indices"], json!([4, 5]));
         assert_eq!(resolved["card_ids"], json!(["d", "e"]));
+        let encoded = resolve_encoded_selection_action(&canonical, "play_d_e").unwrap();
+        assert_eq!(encoded["card_indices"], json!([4, 5]));
+        assert_eq!(encoded["card_ids"], json!(["d", "e"]));
         assert!(resolve_hand_selection_action(&canonical, template, &[0, 5]).is_err());
         assert!(resolve_hand_selection_action(&canonical, template, &[4, 4]).is_err());
 
