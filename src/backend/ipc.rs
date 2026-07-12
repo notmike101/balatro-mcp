@@ -513,6 +513,18 @@ mod tests {
 
     #[test]
     fn policy_actions_translate_to_live_bridge_commands() {
+        let non_contiguous = json!({
+            "action": "play",
+            "card_indices": [4, 5],
+            "card_ids": ["1617", "1604"]
+        });
+        let non_contiguous_command =
+            super::policy_action_command(Some(&non_contiguous), "play_1617_1604", "decision")
+                .unwrap();
+        assert_eq!(non_contiguous_command["action"], "play");
+        assert_eq!(non_contiguous_command["cards"], json!([4, 5]));
+        assert_eq!(non_contiguous_command["card_ids"], json!(["1617", "1604"]));
+
         let cases = [
             (json!({"action":"discard","card_indices":[1]}), "discard"),
             (

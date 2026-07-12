@@ -70,21 +70,27 @@ pub fn compact_observation(data: Value, section: &str) -> Value {
         .or_else(|| data.get("round"))
         .cloned()
         .unwrap_or(Value::Null);
+    let blind = data
+        .get("blind")
+        .cloned()
+        .or_else(|| run.get("blind").cloned())
+        .unwrap_or(Value::Null);
+    let observation_id = get("observation_id");
     match section {
         "hand" => {
-            json!({"game": get("game"), "run": run, "hand": data.get("hand").cloned().or_else(|| data.pointer("/areas/hand").cloned()).unwrap_or(Value::Null), "decision_id": get("decision_id"), "legal_actions": get("legal_actions")})
+            json!({"game": get("game"), "run": run, "hand": data.get("hand").cloned().or_else(|| data.pointer("/areas/hand").cloned()).unwrap_or(Value::Null), "decision_id": get("decision_id"), "observation_id": observation_id})
         }
         "build" => {
-            json!({"game": get("game"), "run": run, "jokers": data.pointer("/areas/jokers").cloned(), "consumables": data.pointer("/areas/consumeables").cloned(), "decision_id": get("decision_id"), "legal_actions": get("legal_actions")})
+            json!({"game": get("game"), "run": run, "jokers": data.pointer("/areas/jokers").cloned(), "consumables": data.pointer("/areas/consumables").cloned().or_else(|| data.pointer("/areas/consumeables").cloned()), "decision_id": get("decision_id"), "observation_id": observation_id})
         }
         "blind" => {
-            json!({"game": get("game"), "run": run, "blind": get("blind"), "active_directives": get("active_directives"), "decision_id": get("decision_id"), "legal_actions": get("legal_actions")})
+            json!({"game": get("game"), "run": run, "blind": blind, "active_directives": get("active_directives"), "decision_id": get("decision_id"), "observation_id": observation_id})
         }
         "hand_values" => {
-            json!({"game": get("game"), "run": run, "poker_hand_values": get("poker_hand_values"), "decision_id": get("decision_id"), "legal_actions": get("legal_actions")})
+            json!({"game": get("game"), "run": run, "poker_hand_values": get("poker_hand_values"), "decision_id": get("decision_id"), "observation_id": observation_id})
         }
         _ => {
-            json!({"game": get("game"), "run": run, "blind": get("blind"), "ready": get("ready"), "estimate_quality": get("estimate_quality"), "decision_id": get("decision_id"), "legal_actions": get("legal_actions")})
+            json!({"state": data.pointer("/game/state").or_else(|| data.pointer("/game/state_name")).cloned().unwrap_or(Value::Null), "ante": run.get("ante").cloned().unwrap_or(Value::Null), "round": run.get("round").cloned().unwrap_or(Value::Null), "blind": blind.get("name").cloned().unwrap_or(Value::Null), "chips": run.get("chips").cloned().or_else(|| blind.get("chips_required").cloned()).unwrap_or(Value::Null), "hands_left": run.get("hands_left").cloned().unwrap_or(Value::Null), "discards_left": run.get("discards_left").cloned().unwrap_or(Value::Null), "dollars": run.get("dollars").cloned().unwrap_or(Value::Null), "ready": get("ready"), "estimate_quality": get("estimate_quality"), "decision_id": get("decision_id"), "observation_id": observation_id})
         }
     }
 }
@@ -336,7 +342,7 @@ mod tests {
         assert_eq!(result["run"]["name"], "r");
         assert_eq!(result["hand"][0]["id"], 1);
         assert_eq!(result["decision_id"], "d1");
-        assert_eq!(result["legal_actions"][0], 1);
+        assert!(result.get("legal_actions").is_none());
     }
 
     #[test]
@@ -378,16 +384,19 @@ mod tests {
     #[test]
     fn compact_observation_summary_fallback_section() {
         let data = json!({
-            "game": {}, "run": {},
-            "blind": {"name": "Stung"},
+            "game": {"state": "SHOP"}, "run": {"ante": 2, "round": 3, "blind": {"name": "Stung", "chips_required": 100}},
             "ready": true,
             "estimate_quality": 0.85,
             "decision_id": "d5", "legal_actions": []
         });
         let result = compact_observation(data, "summary");
-        assert_eq!(result["blind"]["name"], "Stung");
+        assert_eq!(result["state"], "SHOP");
+        assert_eq!(result["ante"], 2);
+        assert_eq!(result["blind"], "Stung");
+        assert_eq!(result["chips"], 100);
         assert_eq!(result["ready"], true);
         assert_eq!(result["estimate_quality"], 0.85);
+        assert!(result.get("legal_actions").is_none());
     }
 
     #[test]
@@ -397,6 +406,6 @@ mod tests {
         assert_eq!(result["game"], json!(null));
         assert_eq!(result["hand"], json!(null));
         assert_eq!(result["decision_id"], json!(null));
-        assert_eq!(result["legal_actions"], json!(null));
+        assert_eq!(result["observation_id"], json!(null));
     }
 }

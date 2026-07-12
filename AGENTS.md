@@ -2,6 +2,19 @@
 
 This repository maintains the Rust MCP server, backend, Lovely bridge, and rules tooling. It does not play the game directly.
 
+## MCP runtime interaction
+
+- Gameplay agents must call the configured `balatro` MCP server/tools directly.
+- If the `balatro` tools are not exposed in the current session, stop and
+  report an MCP host/configuration problem. Do not substitute the server
+  executable's CLI, spawn unmanaged server copies, or write a custom MCP
+  client.
+- Never create helper scripts, command files, observation files, or test
+  harnesses in `D:\balatro-desktop` or elsewhere to emulate MCP usage.
+- `D:\balatro-desktop\AGENTS.md` is the runtime-side contract. Keep gameplay
+  interaction and runtime files out of this repository unless explicitly
+  requested.
+
 ## Architecture
 
 - `src/main.rs` starts the stdio MCP server.
@@ -25,7 +38,7 @@ There are no Python, Node.js, or JavaScript subprocesses. Runtime files and the 
 
 - Mutations require exactly one Balatro process, a fresh bridge observation, the expected bridge version, and seed `2K9H9HN`.
 - Runtime startup is external. `ensure_runtime` verifies state and never launches Balatro.
-- Use the exact current `decision_id` and legal `action_id` for every action.
+- Use the exact current `decision_id` and legal `action_id` for every action. When `legal_actions_truncated` is true, page `get_decision` with `action_offset`; use the legal `play_selected`/`discard_selected` actions with 1-based `card_indices` for arbitrary hand positions.
 - Treat `exact_score` and `estimated_score` separately; unsupported effects must remain visible in `unsupported_effects`.
 - Strategy, lessons, estimation feedback, current-run state, and event history are Rust-owned MCP capabilities backed by `agent/rust_state.db`.
 - Preserve hidden-card sanitization and never expose arbitrary filesystem contents.
