@@ -260,6 +260,8 @@ impl Server {
             if s != runtime::ALLOWED_SEED {
                 problems.push(format!("seed mismatch: {}", s));
             }
+        } else {
+            problems.push("seed missing from the live observation".into());
         }
         if bridge.get("version").and_then(|v| v.as_str()) != Some(runtime::EXPECTED_BRIDGE_VERSION)
         {
