@@ -51,6 +51,23 @@ local function _current_hand_type()
     return nil
 end
 
+local function _hand_type_from_counters(hand_num)
+    if not G or not G.GAME or not G.GAME.hands then return nil end
+    local highest_name = nil
+    local highest_count = -1
+    for name, info in pairs(G.GAME.hands) do
+        if info and type(info) == 'table' then
+            local played = tonumber(info.played) or 0
+            if played == hand_num then return name end
+            if played > highest_count then
+                highest_count = played
+                highest_name = name
+            end
+        end
+    end
+    return highest_name
+end
+
 -- Fix up chips_earned from total_chips diffs. Call after any recording.
 local function _recompute_earnings()
     local n = #CODA.play_history
@@ -121,7 +138,10 @@ local function capture_hand_score()
             end
         end
 
-        local detected_hand = changed_hand or _current_hand_type()
+        local detected_hand = changed_hand
+            or _current_hand_type()
+            or _hand_type_from_counters(current_hands_played)
+            or 'High Card'
 
         if existing_entry then
             -- Update existing entry with latest chip values (multi-step scoring catching up)

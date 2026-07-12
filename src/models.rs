@@ -197,7 +197,7 @@ pub fn log_lines() -> u32 {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ScoreParams {
-    /// Optional 1-based hand positions. Empty uses the live highlighted selection, or the full hand.
+    /// Optional 1-based hand positions. Empty uses the live highlighted selection, or the best five-card subset for hands larger than five cards.
     #[serde(default)]
     pub card_indices: Vec<usize>,
 }

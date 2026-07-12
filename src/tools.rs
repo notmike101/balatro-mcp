@@ -847,7 +847,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Return the current decision_id, a paged legal-action list, rankings, and strategy analysis. When legal_actions_truncated is true, call get_decision again with action_offset set to legal_actions_next_offset and an explicit action_limit; repeat until legal_actions_next_offset is null. The same pagination contract applies after action_type filtering. In GAME_OVER, from_game_over is a game-specific ui_click and return_to_menu is also available as a safe_transition. Examine decision_checks.ordering.hand_order and decision_checks.ordering.joker_order when jokers are present and trigger sequence can affect scoring. Examine decision_checks.consumables when Tarot/Planet/Spectral cards are owned or available in shop; use or sell before exiting or advancing. Examine decision_checks.shop and decision_checks.slots during SHOP state to track remaining items and indexes after each purchase."
+        description = "Return the current decision_id, a compact legal-action list with caller-supplied play_selected/discard_selected templates for arbitrary positions, rankings, and strategy analysis. When legal_actions_truncated is true, call get_decision again with action_offset set to legal_actions_next_offset and an explicit action_limit; repeat until legal_actions_next_offset is null. The same pagination contract applies after action_type filtering. In GAME_OVER, from_game_over is a game-specific ui_click and return_to_menu is also available as a safe_transition. Examine decision_checks.ordering.hand_order and decision_checks.ordering.joker_order when jokers are present and trigger sequence can affect scoring. Examine decision_checks.consumables when Tarot/Planet/Spectral cards are owned or available in shop; use or sell before exiting or advancing. Examine decision_checks.shop and decision_checks.slots during SHOP state to track remaining items and indexes after each purchase."
     )]
     async fn get_decision(
         &self,
@@ -1531,7 +1531,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Score selected hand cards using the live poker-hand contract and explicit estimate metadata. card_indices uses 1-based hand positions, matching play/discard actions. When omitted, the live highlighted hand selection is used when present; otherwise the full hand is scored."
+        description = "Score selected hand cards using the live poker-hand contract and explicit estimate metadata. card_indices uses 1-based hand positions, matching play/discard actions. When omitted, the live highlighted hand selection is used when present; otherwise the best five-card subset is scored for hands larger than five cards."
     )]
     async fn score_hand(
         &self,

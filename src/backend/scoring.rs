@@ -38,6 +38,8 @@ fn rank_value(rank: &str) -> Option<u8> {
 
 fn card_rank(card: &Value) -> Option<u8> {
     card.pointer("/base/rank")
+        .or_else(|| card.pointer("/base/value"))
+        .or_else(|| card.pointer("/base/id"))
         .or_else(|| card.get("rank"))
         .and_then(Value::as_str)
         .and_then(rank_value)
@@ -182,9 +184,13 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
         })
         .unwrap_or_default();
     let highlighted_scope = card_indices.is_none() && !highlighted_indices.is_empty();
+    let contract = observation.get("poker_hands").unwrap_or(&Value::Null);
+    let best_subset_scope = card_indices.is_none() && !highlighted_scope && hand.len() > 5;
     let indices: Vec<usize> = card_indices.map(ToOwned::to_owned).unwrap_or_else(|| {
         if highlighted_scope {
             highlighted_indices.clone()
+        } else if best_subset_scope {
+            best_subset_indices(&hand, contract)
         } else {
             (0..hand.len()).collect()
         }
@@ -194,7 +200,6 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
         .filter_map(|index| hand.get(*index).cloned())
         .collect();
     let hand_name = classify_hand(&cards);
-    let contract = observation.get("poker_hands").unwrap_or(&Value::Null);
     let base = hand_value(contract, &hand_name);
     let (base_chips, mut mult) = base.unwrap_or((5, 1));
     let run = observation.get("run").or_else(|| observation.get("round"));
@@ -213,6 +218,8 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
         hand_name,
         score_scope: if card_indices.is_some() || highlighted_scope {
             "selected_cards".into()
+        } else if best_subset_scope {
+            "best_play".into()
         } else {
             "current_hand".into()
         },
@@ -355,6 +362,70 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
     result
 }
 
+fn best_subset_indices(hand: &[Value], contract: &Value) -> Vec<usize> {
+    let max_cards = hand.len().min(5);
+    let mut best: Option<(usize, i64, Vec<usize>)> = None;
+    for size in 1..=max_cards {
+        let mut selected = Vec::with_capacity(size);
+        collect_best_subset(hand, contract, size, 0, &mut selected, &mut best);
+    }
+    best.map(|(_, _, indices)| indices)
+        .unwrap_or_else(|| (0..hand.len()).collect())
+}
+
+fn collect_best_subset(
+    hand: &[Value],
+    contract: &Value,
+    target_size: usize,
+    start: usize,
+    selected: &mut Vec<usize>,
+    best: &mut Option<(usize, i64, Vec<usize>)>,
+) {
+    if selected.len() == target_size {
+        let cards: Vec<Value> = selected
+            .iter()
+            .filter_map(|index| hand.get(*index).cloned())
+            .collect();
+        let hand_name = classify_hand(&cards);
+        let hand_rank = [
+            "High Card",
+            "Pair",
+            "Two Pair",
+            "Three of a Kind",
+            "Straight",
+            "Flush",
+            "Full House",
+            "Four of a Kind",
+            "Straight Flush",
+            "Five of a Kind",
+            "Flush House",
+            "Flush Five",
+        ]
+        .iter()
+        .position(|name| *name == hand_name)
+        .unwrap_or(0);
+        let base_score = hand_value(contract, &hand_name)
+            .map(|(chips, mult)| chips.saturating_mul(mult))
+            .unwrap_or(0);
+        let should_replace = best.as_ref().is_none_or(|(rank, score, indices)| {
+            hand_rank > *rank
+                || (hand_rank == *rank
+                    && (base_score > *score
+                        || (base_score == *score && selected.len() > indices.len())))
+        });
+        if should_replace {
+            *best = Some((hand_rank, base_score, selected.clone()));
+        }
+        return;
+    }
+    let remaining = target_size - selected.len();
+    for index in start..=hand.len().saturating_sub(remaining) {
+        selected.push(index);
+        collect_best_subset(hand, contract, target_size, index + 1, selected, best);
+        selected.pop();
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -385,6 +456,13 @@ mod tests {
                 card("6", "H")
             ]),
             "Straight Flush"
+        );
+        assert_eq!(
+            classify_hand(&[
+                json!({"base":{"value":"9","suit":"Hearts"}}),
+                json!({"base":{"value":"9","suit":"Diamonds"}})
+            ]),
+            "Pair"
         );
         assert_eq!(
             classify_hand(&[
@@ -504,6 +582,32 @@ mod tests {
         assert_eq!(result.scoring_cards, vec![2, 3]);
         assert_eq!(result.score_scope, "selected_cards");
         assert_eq!(result.exact_score, Some(56));
+    }
+
+    #[test]
+    fn score_full_live_hand_chooses_best_five_card_subset() {
+        let observation = json!({
+            "areas": {"hand": [
+                {"base":{"value":"9","suit":"Hearts"}},
+                {"base":{"value":"9","suit":"Diamonds"}},
+                {"base":{"value":"K","suit":"Spades"}},
+                {"base":{"value":"7","suit":"Hearts"}},
+                {"base":{"value":"6","suit":"Hearts"}},
+                {"base":{"value":"4","suit":"Hearts"}},
+                {"base":{"value":"3","suit":"Spades"}},
+                {"base":{"value":"2","suit":"Spades"}}
+            ]},
+            "poker_hands": {"values": {
+                "High Card":{"chips":5,"mult":1},
+                "Pair":{"chips":10,"mult":2}
+            }}
+        });
+        let result = score_hand(&observation, None);
+        assert_eq!(result.hand_name, "Pair");
+        assert_eq!(result.score_scope, "best_play");
+        assert_eq!(result.scoring_cards.len(), 5);
+        assert!(result.scoring_cards.contains(&1));
+        assert!(result.scoring_cards.contains(&2));
     }
 
     #[test]

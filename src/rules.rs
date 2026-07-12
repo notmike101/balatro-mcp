@@ -45,12 +45,18 @@ impl RulesDb {
         let db = self.open()?;
         let mut rows = if let Some(kind) = kind {
             let mut stmt = db.prepare("SELECT key, set_name AS type, name FROM entities WHERE kind = ?1 OR set_name = ?1 COLLATE NOCASE ORDER BY name").map_err(sql)?;
-            stmt.query_map([kind], |r| Ok(json!({"key": r.get::<_, String>(0)?, "type": r.get::<_, Option<String>>(1)?, "name": r.get::<_, String>(2)?}))).map_err(sql)?.collect::<Result<Vec<_>, _>>().map_err(sql)?
+            stmt.query_map([kind], |r| {
+                let name: String = r.get(2)?;
+                Ok(json!({"key": r.get::<_, String>(0)?, "type": r.get::<_, Option<String>>(1)?, "name": repair_mojibake(&name)}))
+            }).map_err(sql)?.collect::<Result<Vec<_>, _>>().map_err(sql)?
         } else {
             let mut stmt = db
                 .prepare("SELECT key, set_name AS type, name FROM entities ORDER BY set_name, name")
                 .map_err(sql)?;
-            stmt.query_map([], |r| Ok(json!({"key": r.get::<_, String>(0)?, "type": r.get::<_, Option<String>>(1)?, "name": r.get::<_, String>(2)?}))).map_err(sql)?.collect::<Result<Vec<_>, _>>().map_err(sql)?
+            stmt.query_map([], |r| {
+                let name: String = r.get(2)?;
+                Ok(json!({"key": r.get::<_, String>(0)?, "type": r.get::<_, Option<String>>(1)?, "name": repair_mojibake(&name)}))
+            }).map_err(sql)?.collect::<Result<Vec<_>, _>>().map_err(sql)?
         };
         Ok(json!({"count": rows.len(), "entities": rows.drain(..).collect::<Vec<_>>() }))
     }
@@ -77,6 +83,20 @@ impl RulesDb {
         }
         Ok(json!({"metadata": metadata, "counts": counts}))
     }
+}
+
+fn repair_mojibake(value: &str) -> String {
+    if !value.contains('Ã') && !value.contains('Â') && !value.contains('â') {
+        return value.to_owned();
+    }
+    let mut bytes = Vec::with_capacity(value.len());
+    for character in value.chars() {
+        let Ok(byte) = u8::try_from(character as u32) else {
+            return value.to_owned();
+        };
+        bytes.push(byte);
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| value.to_owned())
 }
 
 #[derive(Default, Clone)]
@@ -910,6 +930,12 @@ mod tests {
             "foo(bar, {x = 1})"
         );
         assert_eq!(value["key"], "value");
+    }
+
+    #[test]
+    fn repairs_utf8_mojibake_without_changing_valid_unicode() {
+        assert_eq!(repair_mojibake("SÃ©ance"), "Séance");
+        assert_eq!(repair_mojibake("Séance"), "Séance");
     }
 
     #[test]
