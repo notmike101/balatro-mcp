@@ -847,6 +847,7 @@ local function run_info_summary()
     if not G or not G.GAME then return nil end
     local g = G.GAME
     return {
+        seed = g.pseudorandom and g.pseudorandom.seed or nil,
         ante = g.ante,
         round = g.round,
         blind_on_deck = g.blind_on_deck,

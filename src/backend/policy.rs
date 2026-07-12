@@ -675,6 +675,7 @@ fn generate_legal_actions(
             if run.get("reroll_cost").and_then(Value::as_i64).unwrap_or(0) > 0 {
                 actions.push(json!({"action_id":"reroll_shop","action":"reroll","reason":"reroll shop only when economy and score pressure justify it"}));
             }
+            actions.push(json!({"action_id":"next_round","action":"next_round","reason":"leave the shop and continue to the next blind"}));
         }
         "TAROT_PACK" | "PLANET_PACK" | "SPECTRAL_PACK" | "STANDARD_PACK" | "BUFFOON_PACK" => {
             let choices = observation
@@ -705,20 +706,39 @@ fn generate_legal_actions(
     for (index, joker) in jokers_array.iter().enumerate() {
         actions.push(json!({"action_id":format!("sell_joker_{}", index + 1),"action":"sell_card","area":"jokers","card_index":index + 1,"reason":format!("sell {} when required", joker.get("name").and_then(Value::as_str).unwrap_or("Joker"))}));
     }
-    if !matches!(
-        state,
-        "MENU"
-            | "SELECTING_HAND"
-            | "BLIND_SELECT"
-            | "SHOP"
-            | "TAROT_PACK"
-            | "PLANET_PACK"
-            | "SPECTRAL_PACK"
-            | "STANDARD_PACK"
-            | "BUFFOON_PACK"
-    ) {
-        for transition in SAFE_TRANSITION_ACTIONS {
-            actions.push(json!({"action_id":transition,"action":"safe_transition","transition":transition,"reason":"confirmed non-strategic transition"}));
+    match state {
+        "ROUND_EVAL" => actions.push(json!({
+            "action_id": "proceed_round",
+            "action": "safe_transition",
+            "transition": "cash_out",
+            "reason": "proceed from the cleared blind evaluation to the shop"
+        })),
+        "GAME_OVER" => actions.push(json!({
+            "action_id": "return_to_menu",
+            "action": "safe_transition",
+            "transition": "return_to_menu",
+            "reason": "return to the main menu after game over"
+        })),
+        "" => {
+            for transition in SAFE_TRANSITION_ACTIONS {
+                actions.push(json!({"action_id":transition,"action":"safe_transition","transition":transition,"reason":"confirmed non-strategic transition"}));
+            }
+        }
+        _ => {
+            if observation
+                .pointer("/ready/overlay_menu_present")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                actions.push(json!({"action_id":"dismiss_unlock_overlay","action":"safe_transition","transition":"dismiss_unlock_overlay","reason":"dismiss the active unlock overlay"}));
+            }
+            if observation
+                .pointer("/ready/tutorial_complete")
+                .and_then(Value::as_bool)
+                == Some(false)
+            {
+                actions.push(json!({"action_id":"skip_tutorial","action":"safe_transition","transition":"skip_tutorial","reason":"skip the incomplete tutorial"}));
+            }
         }
     }
 
@@ -1088,6 +1108,31 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|a| a["action"] == "safe_transition")
+        );
+
+        let round_eval = build_policy_state(&observation("ROUND_EVAL"), 40, 40, 60);
+        assert!(
+            round_eval["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["action_id"] == "proceed_round" && a["transition"] == "cash_out")
+        );
+        assert!(
+            !round_eval["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["action_id"] == "dismiss_unlock_overlay")
+        );
+
+        let shop = build_policy_state(&observation("SHOP"), 40, 40, 60);
+        assert!(
+            shop["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["action_id"] == "next_round")
         );
     }
 

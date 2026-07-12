@@ -271,6 +271,9 @@ pub fn policy_action_command(
         "reroll" => {
             command.insert("action".into(), serde_json::json!("reroll_shop"));
         }
+        "next_round" => {
+            command.insert("action".into(), serde_json::json!("next_round"));
+        }
         "choose_pack" => {
             command.insert("action".into(), serde_json::json!("use"));
             command.insert("area".into(), serde_json::json!("pack_cards"));
@@ -550,6 +553,7 @@ mod tests {
                 "move_joker",
             ),
             (json!({"action":"reroll"}), "reroll_shop"),
+            (json!({"action":"next_round"}), "next_round"),
             (json!({"action":"choose_pack","card_index":1}), "use"),
             (
                 json!({"action":"safe_transition","transition":"cash_out"}),
