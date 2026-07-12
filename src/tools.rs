@@ -94,7 +94,12 @@ fn action_error_code(error: &str) -> &'static str {
 }
 
 fn normalize_info_type(entity_type: &str) -> String {
-    entity_type.to_ascii_lowercase().replace('_', "-")
+    let normalized = entity_type.to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
+        "back" | "decks" => "deck".into(),
+        "playingcards" => "playing-card".into(),
+        _ => normalized,
+    }
 }
 
 fn active_directives(rules: &Value, observation: &Value) -> Value {
@@ -407,6 +412,7 @@ impl Server {
                 .is_some();
         if !state.eq_ignore_ascii_case("MENU")
             && !state.eq_ignore_ascii_case("MAIN_MENU")
+            && !state.eq_ignore_ascii_case("GAME_OVER")
             && !(confirm_override && saved_present)
         {
             return Err(envelope(
@@ -756,13 +762,27 @@ impl Server {
             return to_tool_result(problem);
         }
         let steps = params.max_steps.clamp(1, 20) as u32;
-        // Try each safe transition action from the policy module
+        let before_state = self.policy(20).await.ok().and_then(|value| {
+            value
+                .pointer("/game/state")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        // Try each safe transition action from the policy module.
         for action in SAFE_TRANSITION_ACTIONS {
             match advance_safe_internal(&self.ipc, action, steps) {
-                Ok(_data) => {
+                Ok(bridge_data) => {
                     match self.policy(40).await {
                         Ok(policy_data) => {
-                            return to_tool_result(envelope(true, policy_data, "", ""));
+                            let after_state =
+                                policy_data.pointer("/game/state").and_then(Value::as_str);
+                            if before_state.as_deref() != after_state {
+                                let mut result = policy_data;
+                                if let Some(object) = result.as_object_mut() {
+                                    object.insert("bridge_response".into(), bridge_data);
+                                }
+                                return to_tool_result(envelope(true, result, "", ""));
+                            }
                         }
                         Err(e) => {
                             return to_tool_result(envelope(
@@ -1465,6 +1485,7 @@ mod tests {
         );
         assert_eq!(normalize_info_type("Joker"), "joker");
         assert_eq!(normalize_info_type("playing_card"), "playing-card");
+        assert_eq!(normalize_info_type("back"), "deck");
     }
 
     #[tokio::test]
