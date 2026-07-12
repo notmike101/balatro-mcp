@@ -847,7 +847,7 @@ mod tests {
         assert_eq!(estimate_best_play(&json!({"areas":{"hand":[]}})), 5);
         assert_eq!(
             estimate_best_play(&json!({
-                "areas":{"hand":[{"suits":[{"key":"H"}]}]},
+                "areas":{"hand":[{"suits":[{"key":"H"}, {}]}]},
                 "poker_hands":{"values":{}}
             })),
             5
@@ -866,6 +866,14 @@ mod tests {
                 .as_i64()
                 .unwrap()
                 > 0
+        );
+        assert!(
+            analyze_hands(
+                &[json!({"base":{"rank":"A"},"suits":[{}]})],
+                &json!({"values":{}}),
+            )["best_play"]["estimated_score"]
+                .as_i64()
+                .is_some()
         );
 
         let mut no_moves = observation("SELECTING_HAND");
@@ -892,6 +900,59 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|action| action.get("action") != Some(&json!("ui_click")))
+        );
+
+        let mut boss_details = observation("SELECTING_HAND");
+        boss_details["run"]["blind"]["effect"] = json!({"name":"No face cards"});
+        boss_details["run"]["blind"]["disabled"] = json!("true");
+        boss_details["run"]["blind"]["state"] = json!("Upcoming");
+        boss_details["areas"]["debuffed_cards"] = json!([{"instance_id":"a"}]);
+        boss_details["areas"]["debuffed_jokers"] = json!([{"name":"Joker"}]);
+        let checks = build_policy_state(&boss_details, 1, 1, 1)["decision_checks"].clone();
+        assert_eq!(
+            checks["boss_debuff"]["current_blind"]["effect"],
+            "No face cards"
+        );
+        assert_eq!(
+            checks["boss_debuff"]["debuffed_cards"][0]["instance_id"],
+            "a"
+        );
+
+        let shop_blind_choices = json!({
+            "game":{"state":"SHOP"},
+            "run":{"joker_slots":1,"blind_choices":{"Small":{"state":"Select"},"Big":{"state":"Select"}}},
+            "areas":{"jokers":[]}
+        });
+        let shop_actions =
+            build_policy_state(&shop_blind_choices, 0, 0, 1)["legal_actions"].clone();
+        assert!(
+            shop_actions
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["action_id"] == "select_small_blind")
+        );
+        assert!(
+            shop_actions
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["action_id"] == "select_big_blind")
+        );
+        let shop_blind_skipped = json!({
+            "game":{"state":"SHOP"},
+            "run":{"joker_slots":1,"blind_choices":{"Small":{"state":"Skip"},"Big":{"state":"Skip"}}},
+            "areas":{"jokers":[]}
+        });
+        let skipped_actions =
+            build_policy_state(&shop_blind_skipped, 0, 0, 1)["legal_actions"].clone();
+        assert!(
+            skipped_actions
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["action_id"] != "select_small_blind"
+                    && a["action_id"] != "select_big_blind")
         );
     }
 

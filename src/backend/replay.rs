@@ -1,9 +1,129 @@
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, Row, TransactionBehavior};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
 const CLEAR: &str = "clear";
 const FAIL: &str = "fail";
+
+type ReplayRow = (
+    i64,
+    String,
+    i64,
+    i64,
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+);
+type JokerRow = (i64, String, Option<String>, Option<String>, Option<String>);
+type VoucherRow = (i64, String);
+type HandLevelRow = (String, i64, Option<i64>, Option<i64>);
+type StepRow = (
+    i64,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+type FormatStepRow = (i64, String, String, Option<String>);
+type EconomyRow = (Option<i64>, Option<i64>, Option<String>, Option<String>);
+
+fn read_replay_row(row: &Row<'_>) -> rusqlite::Result<ReplayRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+    ))
+}
+
+fn read_joker_row(row: &Row<'_>) -> rusqlite::Result<JokerRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
+}
+
+fn read_voucher_row(row: &Row<'_>) -> rusqlite::Result<VoucherRow> {
+    Ok((row.get(0)?, row.get(1)?))
+}
+
+fn read_hand_level_row(row: &Row<'_>) -> rusqlite::Result<HandLevelRow> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+}
+
+fn read_step_row(row: &Row<'_>) -> rusqlite::Result<StepRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+    ))
+}
+
+fn read_tag_row(row: &Row<'_>) -> rusqlite::Result<String> {
+    row.get(0)
+}
+
+fn read_format_step_row(row: &Row<'_>) -> rusqlite::Result<FormatStepRow> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+}
+
+fn read_economy_row(row: &Row<'_>) -> rusqlite::Result<EconomyRow> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+}
+
+fn sql_context<T>(result: rusqlite::Result<T>, context: &str) -> Result<T, String> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => Err(format!("{context}: {error}")),
+    }
+}
+
+trait SqlContext<T> {
+    fn context(self, context: &str) -> Result<T, String>;
+}
+
+impl<T> SqlContext<T> for rusqlite::Result<T> {
+    fn context(self, context: &str) -> Result<T, String> {
+        sql_context(self, context)
+    }
+}
+
+fn begin_replay_transaction(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>, String> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("transaction")?;
+    Ok(tx)
+}
 
 pub struct ReplayDB {
     db_path: PathBuf,
@@ -19,7 +139,7 @@ impl ReplayDB {
         let parent = self
             .db_path
             .parent()
-            .ok_or("replay database has no parent")?;
+            .expect("ReplayDB paths always include the agent directory");
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create replay DB directory: {e}"))?;
         Connection::open_with_flags(
@@ -30,56 +150,62 @@ impl ReplayDB {
     }
 
     fn init_db(&self, conn: &Connection) -> Result<(), String> {
-        conn.execute_batch(
-            r#"CREATE TABLE IF NOT EXISTS replay (
+        sql_context(conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS replay (
                 id INTEGER PRIMARY KEY, seed TEXT NOT NULL, ante INTEGER NOT NULL,
                 stake INTEGER NOT NULL, blind_key TEXT NOT NULL, outcome TEXT NOT NULL,
                 chips_required INTEGER, max_chips_gained INTEGER,
-                created_at TEXT DEFAULT (datetime('now')))"#,
-        )
-        .map_err(|e| format!("replay table: {e}"))?;
-        conn.execute_batch(
-            r#"CREATE TABLE IF NOT EXISTS replay_step (
+                created_at TEXT DEFAULT (datetime('now')));
+            CREATE TABLE IF NOT EXISTS replay_step (
                 id INTEGER PRIMARY KEY, replay_id INTEGER NOT NULL, step_order INTEGER,
                 action_type TEXT NOT NULL, details TEXT NOT NULL, rationale TEXT,
                 hand_type TEXT, cards_held TEXT, cards_discarded TEXT, discard_count INTEGER DEFAULT 0,
                 final_cards TEXT, base_chips INTEGER, base_mult INTEGER, final_score INTEGER,
                 consumable_name TEXT, consumable_target_hand TEXT, notes TEXT,
-                FOREIGN KEY (replay_id) REFERENCES replay(id))"#
-        ).map_err(|e| format!("replay_step table: {e}"))?;
-        conn.execute_batch(
-            r#"CREATE TABLE IF NOT EXISTS replay_joker_config (
+                FOREIGN KEY (replay_id) REFERENCES replay(id));
+            CREATE TABLE IF NOT EXISTS replay_joker_config (
                 id INTEGER PRIMARY KEY, replay_id INTEGER NOT NULL, slot_order INTEGER NOT NULL,
                 joker_name TEXT NOT NULL, edition TEXT, enhancement TEXT, notes TEXT,
-                FOREIGN KEY (replay_id) REFERENCES replay(id))"#,
-        )
-        .map_err(|e| format!("replay_joker_config table: {e}"))?;
-        conn.execute_batch(
-            r#"CREATE TABLE IF NOT EXISTS replay_hand_levels (
+                FOREIGN KEY (replay_id) REFERENCES replay(id));
+            CREATE TABLE IF NOT EXISTS replay_hand_levels (
                 id INTEGER PRIMARY KEY, replay_id INTEGER NOT NULL, hand_type TEXT NOT NULL,
                 level INTEGER NOT NULL, chips INTEGER, mult INTEGER,
-                FOREIGN KEY (replay_id) REFERENCES replay(id))"#,
-        )
-        .map_err(|e| format!("replay_hand_levels table: {e}"))?;
-        conn.execute_batch(
-            r#"CREATE TABLE IF NOT EXISTS replay_voucher (
+                FOREIGN KEY (replay_id) REFERENCES replay(id));
+            CREATE TABLE IF NOT EXISTS replay_voucher (
                 id INTEGER PRIMARY KEY, replay_id INTEGER NOT NULL, voucher_name TEXT NOT NULL,
-                slot_order INTEGER, FOREIGN KEY (replay_id) REFERENCES replay(id))"#,
-        )
-        .map_err(|e| format!("replay_voucher table: {e}"))?;
-        conn.execute_batch(
-            r#"CREATE TABLE IF NOT EXISTS replay_economy (
+                slot_order INTEGER, FOREIGN KEY (replay_id) REFERENCES replay(id));
+            CREATE TABLE IF NOT EXISTS replay_economy (
                 id INTEGER PRIMARY KEY, replay_id INTEGER NOT NULL, dollars_start INTEGER,
                 dollars_end INTEGER, shop_items_bought TEXT, shop_items_skipped TEXT,
-                FOREIGN KEY (replay_id) REFERENCES replay(id))"#,
-        )
-        .map_err(|e| format!("replay_economy table: {e}"))?;
-        conn.execute_batch(
-            r#"CREATE TABLE IF NOT EXISTS replay_tags (
+                FOREIGN KEY (replay_id) REFERENCES replay(id));
+            CREATE TABLE IF NOT EXISTS replay_tags (
                 id INTEGER PRIMARY KEY, replay_id INTEGER NOT NULL, tag_name TEXT NOT NULL,
-                source TEXT, FOREIGN KEY (replay_id) REFERENCES replay(id))"#,
-        )
-        .map_err(|e| format!("replay_tags table: {e}"))?;
+                source TEXT, FOREIGN KEY (replay_id) REFERENCES replay(id));
+            "#,
+        ), "replay schema")?;
+        for (table, required_column) in [
+            ("replay", "seed"),
+            ("replay_step", "action_type"),
+            ("replay_joker_config", "joker_name"),
+            ("replay_hand_levels", "hand_type"),
+            ("replay_voucher", "voucher_name"),
+            ("replay_economy", "dollars_start"),
+            ("replay_tags", "tag_name"),
+        ] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?",
+                    rusqlite::params![table, required_column],
+                    |row| row.get(0),
+                )
+                .expect("static replay schema validation query");
+            if present == 0 {
+                return Err(format!(
+                    "replay schema missing {required_column} in {table}"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -121,44 +247,10 @@ impl ReplayDB {
 
         let mut stmt = conn.prepare(&query).map_err(|e| format!("prepare: {e}"))?;
         let params_ref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        let replays: Vec<(
-            i64,
-            String,
-            i64,
-            i64,
-            String,
-            String,
-            Option<i64>,
-            Option<i64>,
-        )> = stmt
-            .query_map(
-                params_ref.as_slice(),
-                |row| -> Result<
-                    (
-                        i64,
-                        String,
-                        i64,
-                        i64,
-                        String,
-                        String,
-                        Option<i64>,
-                        Option<i64>,
-                    ),
-                    rusqlite::Error,
-                > {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    ))
-                },
-            )
-            .map_err(|e| format!("query_map: {e}"))?
+        let replay_rows = stmt
+            .query_map(params_ref.as_slice(), read_replay_row)
+            .expect("replay query parameters are statically typed");
+        let replays: Vec<ReplayRow> = replay_rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("collect: {e}"))?;
 
@@ -185,23 +277,10 @@ impl ReplayDB {
     fn load_replay_detail(&self, conn: &Connection, replay_id: i64) -> Result<Value, String> {
         let mut jokers = Vec::new();
         let mut stmt = conn.prepare("SELECT slot_order, joker_name, edition, enhancement, notes FROM replay_joker_config WHERE replay_id=? ORDER BY slot_order").map_err(|e| e.to_string())?;
-        for row in stmt
-            .query_map(
-                [replay_id],
-                |row| -> Result<
-                    (i64, String, Option<String>, Option<String>, Option<String>),
-                    rusqlite::Error,
-                > {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .map_err(|e| e.to_string())?
+        let joker_rows = stmt
+            .query_map([replay_id], read_joker_row)
+            .expect("joker detail query parameters are statically typed");
+        for row in joker_rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?
         {
@@ -211,12 +290,10 @@ impl ReplayDB {
 
         let mut vouchers = Vec::new();
         let mut stmt = conn.prepare("SELECT slot_order, voucher_name FROM replay_voucher WHERE replay_id=? ORDER BY slot_order").map_err(|e| e.to_string())?;
-        for row in stmt
-            .query_map(
-                [replay_id],
-                |row| -> Result<(i64, String), rusqlite::Error> { Ok((row.get(0)?, row.get(1)?)) },
-            )
-            .map_err(|e| e.to_string())?
+        let voucher_rows = stmt
+            .query_map([replay_id], read_voucher_row)
+            .expect("voucher detail query parameters are statically typed");
+        for row in voucher_rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?
         {
@@ -226,14 +303,10 @@ impl ReplayDB {
 
         let mut hand_levels = Vec::new();
         let mut stmt = conn.prepare("SELECT hand_type, level, chips, mult FROM replay_hand_levels WHERE replay_id=? ORDER BY hand_type").map_err(|e| e.to_string())?;
-        for row in stmt
-            .query_map(
-                [replay_id],
-                |row| -> Result<(String, i64, Option<i64>, Option<i64>), rusqlite::Error> {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                },
-            )
-            .map_err(|e| e.to_string())?
+        let hand_level_rows = stmt
+            .query_map([replay_id], read_hand_level_row)
+            .expect("hand-level query parameters are statically typed");
+        for row in hand_level_rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?
         {
@@ -243,49 +316,10 @@ impl ReplayDB {
 
         let mut steps = Vec::new();
         let mut stmt = conn.prepare("SELECT step_order, action_type, details, rationale, hand_type, cards_held, cards_discarded, discard_count, final_cards, base_chips, base_mult, final_score, consumable_name, consumable_target_hand, notes FROM replay_step WHERE replay_id=? ORDER BY step_order").map_err(|e| e.to_string())?;
-        for row in stmt
-            .query_map(
-                [replay_id],
-                |row| -> Result<
-                    (
-                        i64,
-                        String,
-                        String,
-                        Option<String>,
-                        String,
-                        Option<String>,
-                        Option<String>,
-                        i64,
-                        Option<String>,
-                        Option<i64>,
-                        Option<i64>,
-                        Option<i64>,
-                        Option<String>,
-                        Option<String>,
-                        Option<String>,
-                    ),
-                    rusqlite::Error,
-                > {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                        row.get(10)?,
-                        row.get(11)?,
-                        row.get(12)?,
-                        row.get(13)?,
-                        row.get(14)?,
-                    ))
-                },
-            )
-            .map_err(|e| e.to_string())?
+        let step_rows = stmt
+            .query_map([replay_id], read_step_row)
+            .expect("step detail query parameters are statically typed");
+        for row in step_rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?
         {
@@ -297,7 +331,7 @@ impl ReplayDB {
         let eco = conn.query_row(
             "SELECT dollars_start, dollars_end, shop_items_bought, shop_items_skipped FROM replay_economy WHERE replay_id=?",
             [replay_id],
-            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?))
+            read_economy_row
         ).ok();
         if let Some((ds, de, sb, ss)) = eco {
             if ds.is_some() || de.is_some() {
@@ -311,11 +345,10 @@ impl ReplayDB {
         let mut stmt = conn
             .prepare("SELECT tag_name FROM replay_tags WHERE replay_id=?")
             .map_err(|e| e.to_string())?;
-        for row in stmt
-            .query_map([replay_id], |row| -> Result<String, rusqlite::Error> {
-                row.get(0)
-            })
-            .map_err(|e| e.to_string())?
+        let tag_rows = stmt
+            .query_map([replay_id], read_tag_row)
+            .expect("tag detail query parameters are statically typed");
+        for row in tag_rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?
         {
@@ -373,11 +406,7 @@ impl ReplayDB {
         if let Some(mut stmt) = stmt {
             let _ = stmt
                 .query_row([*rid], |r| {
-                    let sord: i64 = r.get(0)?;
-                    let jname: String = r.get(1)?;
-                    let edition: Option<String> = r.get(2)?;
-                    let enh: Option<String> = r.get(3)?;
-                    let notes: Option<String> = r.get(4)?;
+                    let (sord, jname, edition, enh, notes) = read_joker_row(r)?;
                     let mut line = format!("    Slot {}: {}", sord, jname);
                     if let Some(e) = edition {
                         line.push_str(&format!(" {}", e));
@@ -398,10 +427,7 @@ impl ReplayDB {
         if let Some(mut stmt) = stmt {
             let _ = stmt
                 .query_row([*rid], |r| {
-                    let so: i64 = r.get(0)?;
-                    let at: String = r.get(1)?;
-                    let det: String = r.get(2)?;
-                    let rat: Option<String> = r.get(3)?;
+                    let (so, at, det, rat) = read_format_step_row(r)?;
                     let line = format!("    Step {}: [{}] {}", so, at, det);
                     output.push_str(&line);
                     output.push('\n');
@@ -449,53 +475,53 @@ impl ReplayDB {
         _notes: &str,
     ) -> Result<i64, String> {
         let mut conn = self.open()?;
-        self.init_db(&conn)?;
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("transaction: {e}"))?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .expect("replay foreign-key pragma is static");
+        let tx = begin_replay_transaction(&mut conn)?;
+        self.init_db(&tx)?;
         tx.execute(
             "INSERT INTO replay (seed, ante, stake, blind_key, outcome) VALUES (?,?,?,?,?)",
             rusqlite::params![seed, ante, stake, blind_key, CLEAR],
         )
-        .map_err(|e| format!("insert replay: {e}"))?;
+        .context("insert replay")?;
         let rid = tx.last_insert_rowid();
         for (idx, (action, details, rationale, ht, ch, cd, dc, fc, bc, bm, fs, cn, th, nt)) in
             steps.iter().enumerate()
         {
             tx.execute("INSERT INTO replay_step (replay_id, step_order, action_type, details, rationale, hand_type, cards_held, cards_discarded, discard_count, final_cards, base_chips, base_mult, final_score, consumable_name, consumable_target_hand, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rusqlite::params![rid, idx + 1, action, details, rationale, ht, ch, cd, dc, fc, bc, bm, fs, cn, th, nt])
-                .map_err(|e| format!("insert step: {e}"))?;
+                .context("insert step")?;
         }
         for (slot, name, edition, enh, notes) in jokers {
             tx.execute("INSERT INTO replay_joker_config (replay_id, slot_order, joker_name, edition, enhancement, notes) VALUES (?,?,?,?,?,?)",
                 rusqlite::params![rid, slot, name, edition, enh, notes])
-                .map_err(|e| format!("insert joker: {e}"))?;
+                .context("insert joker")?;
         }
         for (idx, vname) in vouchers.iter().enumerate() {
             tx.execute(
                 "INSERT INTO replay_voucher (replay_id, slot_order, voucher_name) VALUES (?,?,?)",
                 rusqlite::params![rid, idx + 1, vname],
             )
-            .map_err(|e| format!("insert voucher: {e}"))?;
+            .context("insert voucher")?;
         }
         for (hname, lvl, chips, mult) in hand_levels {
             tx.execute("INSERT INTO replay_hand_levels (replay_id, hand_type, level, chips, mult) VALUES (?,?,?,?,?)",
                 rusqlite::params![rid, hname, lvl, chips, mult])
-                .map_err(|e| format!("insert hand_level: {e}"))?;
+                .context("insert hand_level")?;
         }
         if dollars_start.is_some() || dollars_end.is_some() {
             tx.execute("INSERT INTO replay_economy (replay_id, dollars_start, dollars_end, shop_items_bought, shop_items_skipped) VALUES (?,?,?,?,?)",
                 rusqlite::params![rid, dollars_start, dollars_end, shop_bought, shop_skipped])
-                .map_err(|e| format!("insert economy: {e}"))?;
+                .context("insert economy")?;
         }
         for tag in tags {
             tx.execute(
                 "INSERT INTO replay_tags (replay_id, tag_name, source) VALUES (?,?,?)",
                 rusqlite::params![rid, tag, "mcp"],
             )
-            .map_err(|e| format!("insert tag: {e}"))?;
+            .context("insert tag")?;
         }
-        tx.commit().map_err(|e| format!("commit: {e}"))?;
+        tx.commit().context("commit")?;
         Ok(rid)
     }
 
@@ -512,7 +538,7 @@ impl ReplayDB {
             "INSERT INTO replay (seed, ante, stake, blind_key, outcome) VALUES (?,?,?,?,?)",
             rusqlite::params![seed, ante, stake, blind_key, FAIL],
         )
-        .map_err(|e| format!("insert replay: {e}"))?;
+        .context("insert replay")?;
         Ok(conn.last_insert_rowid())
     }
 }
@@ -1029,6 +1055,16 @@ mod tests {
             db.query_replays(None, None, None, None, None, true)
                 .is_err()
         );
+
+        let dir = tempdir().unwrap();
+        let db = ReplayDB::new(dir.path());
+        let conn = db.open().unwrap();
+        db.init_db(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_replay_log BEFORE INSERT ON replay BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+        )
+        .unwrap();
+        assert!(db.log_fail("seed", 1, 1, "Small").is_err());
     }
 
     #[test]
@@ -1067,6 +1103,17 @@ mod tests {
             )
             .is_err()
         );
+
+        let dir = tempdir().unwrap();
+        let db = ReplayDB::new(dir.path());
+        let conn = db.open().unwrap();
+        db.init_db(&conn).unwrap();
+        conn.execute_batch("DROP TABLE replay; CREATE TABLE replay (seed TEXT NOT NULL);")
+            .unwrap();
+        assert!(
+            db.query_replays(None, None, None, None, None, true)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1085,6 +1132,90 @@ mod tests {
             db.query_replays(None, None, None, None, None, true)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn replay_row_decoders_cover_every_field_error() {
+        assert!(sql_context::<()>(Ok(()), "ok").is_ok());
+        assert!(sql_context::<()>(Err(rusqlite::Error::QueryReturnedNoRows), "bad").is_err());
+        macro_rules! assert_reader_error {
+            ($values:expr, $reader:path) => {{
+                let conn = Connection::open_in_memory().unwrap();
+                let mut stmt = conn
+                    .prepare(&format!("SELECT {}", $values.join(",")))
+                    .unwrap();
+                assert!(stmt.query_row([], $reader).is_err());
+            }};
+        }
+
+        let replay_values = [
+            "1", "'seed'", "1", "1", "'Small'", "'clear'", "NULL", "NULL",
+        ];
+        for bad in 0..replay_values.len() {
+            let mut values = replay_values.map(str::to_owned);
+            values[bad] = "X'00'".into();
+            assert_reader_error!(values, read_replay_row);
+        }
+
+        let joker_values = ["1", "'Joker'", "NULL", "NULL", "NULL"];
+        for bad in 0..joker_values.len() {
+            let mut values = joker_values.map(str::to_owned);
+            values[bad] = "X'00'".into();
+            assert_reader_error!(values, read_joker_row);
+        }
+
+        let voucher_values = ["1", "'Voucher'"];
+        for bad in 0..voucher_values.len() {
+            let mut values = voucher_values.map(str::to_owned);
+            values[bad] = "X'00'".into();
+            assert_reader_error!(values, read_voucher_row);
+        }
+
+        let hand_level_values = ["'Flush'", "1", "NULL", "NULL"];
+        for bad in 0..hand_level_values.len() {
+            let mut values = hand_level_values.map(str::to_owned);
+            values[bad] = "X'00'".into();
+            assert_reader_error!(values, read_hand_level_row);
+        }
+
+        let step_values = [
+            "1",
+            "'play'",
+            "'details'",
+            "NULL",
+            "'Flush'",
+            "NULL",
+            "NULL",
+            "0",
+            "NULL",
+            "NULL",
+            "NULL",
+            "NULL",
+            "NULL",
+            "NULL",
+            "NULL",
+        ];
+        for bad in 0..step_values.len() {
+            let mut values = step_values.map(str::to_owned);
+            values[bad] = "X'00'".into();
+            assert_reader_error!(values, read_step_row);
+        }
+
+        assert_reader_error!(vec!["X'00'".to_owned()], read_tag_row);
+
+        let format_step_values = ["1", "'play'", "'details'", "NULL"];
+        for bad in 0..format_step_values.len() {
+            let mut values = format_step_values.map(str::to_owned);
+            values[bad] = "X'00'".into();
+            assert_reader_error!(values, read_format_step_row);
+        }
+
+        let economy_values = ["NULL", "NULL", "NULL", "NULL"];
+        for bad in 0..economy_values.len() {
+            let mut values = economy_values.map(str::to_owned);
+            values[bad] = "X'00'".into();
+            assert_reader_error!(values, read_economy_row);
+        }
     }
 
     #[test]
@@ -1188,8 +1319,174 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         db.init_db(&conn).unwrap();
         conn.execute("INSERT INTO replay (id, seed, ante, stake, blind_key, outcome) VALUES (1, 'seed', 1, 1, 'Small', 'clear')", []).unwrap();
+        conn.execute("INSERT INTO replay_joker_config (replay_id, slot_order, joker_name) VALUES (1, 1, 'J')", []).unwrap();
+        conn.execute("INSERT INTO replay_step (replay_id, step_order, action_type, details, hand_type, discard_count) VALUES (1, 1, 'play', 'details', 'Flush', 0)", []).unwrap();
+        let text = db.format_replay_text(&conn, &replay);
+        assert!(text.contains("Slot 1: J"));
+        assert!(!text.contains("Slot 1: J Foil"));
+        assert!(!text.contains("Rationale:"));
+
+        let conn = Connection::open_in_memory().unwrap();
+        db.init_db(&conn).unwrap();
+        conn.execute("INSERT INTO replay (id, seed, ante, stake, blind_key, outcome) VALUES (1, 'seed', 1, 1, 'Small', 'clear')", []).unwrap();
         conn.execute("INSERT INTO replay_joker_config (replay_id, slot_order, joker_name) VALUES (1, X'00', 'J')", []).unwrap();
         conn.execute("INSERT INTO replay_step (replay_id, step_order, action_type, details, hand_type, discard_count) VALUES (1, X'00', 'play', 'details', 'Flush', 0)", []).unwrap();
         let _ = db.format_replay_text(&conn, &replay);
+
+        let conn = Connection::open_in_memory().unwrap();
+        db.init_db(&conn).unwrap();
+        conn.execute("INSERT INTO replay (id, seed, ante, stake, blind_key, outcome) VALUES (1, 'seed', 1, 1, 'Small', 'clear')", []).unwrap();
+        conn.execute("INSERT INTO replay_economy (replay_id) VALUES (1)", [])
+            .unwrap();
+        let detail = db.load_replay_detail(&conn, 1).unwrap();
+        assert!(detail["economy"].is_null());
+        conn.execute(
+            "UPDATE replay_economy SET dollars_start=10 WHERE replay_id=1",
+            [],
+        )
+        .unwrap();
+        let detail = db.load_replay_detail(&conn, 1).unwrap();
+        assert_eq!(detail["economy"]["dollars_start"], 10);
+        conn.execute(
+            "UPDATE replay_economy SET dollars_start=X'00' WHERE replay_id=1",
+            [],
+        )
+        .unwrap();
+        assert!(db.load_replay_detail(&conn, 1).unwrap()["economy"].is_null());
+    }
+
+    #[test]
+    fn replay_write_boundaries_return_sql_errors() {
+        fn failing_db(table: &str) -> (tempfile::TempDir, ReplayDB) {
+            let dir = tempdir().unwrap();
+            let db = ReplayDB::new(dir.path());
+            let conn = db.open().unwrap();
+            db.init_db(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER fail_{table}_insert BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'blocked'); END;"
+            ))
+            .unwrap();
+            (dir, db)
+        }
+
+        for table in [
+            "replay",
+            "replay_step",
+            "replay_joker_config",
+            "replay_voucher",
+            "replay_hand_levels",
+            "replay_economy",
+            "replay_tags",
+        ] {
+            let (_dir, db) = failing_db(table);
+            let jokers = vec![(0_i64, "J", None, None, None)];
+            let vouchers = vec!["V"];
+            let hand_levels = vec![("Flush", 1_i64, Some(1_i64), Some(1_i64))];
+            let steps = vec![(
+                "play".to_string(),
+                "details".to_string(),
+                None,
+                "Flush".to_string(),
+                None,
+                None,
+                0_i64,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )];
+            let result = db.log_clear(
+                "seed",
+                1,
+                1,
+                "Small",
+                &jokers,
+                &vouchers,
+                &hand_levels,
+                Some(1),
+                Some(2),
+                "bought",
+                "skipped",
+                &steps,
+                &["tag"],
+                "",
+            );
+            assert!(result.is_err(), "{table}");
+        }
+    }
+
+    #[test]
+    fn replay_transaction_and_commit_errors_are_returned() {
+        let dir = tempdir().unwrap();
+        let db = ReplayDB::new(dir.path());
+        let conn = db.open().unwrap();
+        db.init_db(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE deferred_replay_child (parent_id INTEGER REFERENCES replay(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER invalid_replay_commit AFTER INSERT ON replay BEGIN
+                 INSERT INTO deferred_replay_child(parent_id) VALUES(999);
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            db.log_clear(
+                "seed",
+                1,
+                1,
+                "Small",
+                &[],
+                &[],
+                &[],
+                None,
+                None,
+                "",
+                "",
+                &[],
+                &[],
+                "",
+            )
+            .is_err()
+        );
+
+        let dir = tempdir().unwrap();
+        let db = ReplayDB::new(dir.path());
+        let conn = db.open().unwrap();
+        db.init_db(&conn).unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        assert!(
+            db.query_replays(None, None, None, None, None, true)
+                .is_err()
+        );
+        assert!(db.log_fail("seed", 1, 1, "Small").is_err());
+        let locked_error = db
+            .log_clear(
+                "seed",
+                1,
+                1,
+                "Small",
+                &[],
+                &[],
+                &[],
+                None,
+                None,
+                "",
+                "",
+                &[],
+                &[],
+                "",
+            )
+            .unwrap_err();
+        assert!(locked_error.contains("locked") || locked_error.contains("transaction"));
+
+        let dir = tempdir().unwrap();
+        let db = ReplayDB::new(dir.path());
+        let mut conn = db.open().unwrap();
+        db.init_db(&conn).unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        assert!(begin_replay_transaction(&mut conn).is_err());
     }
 }

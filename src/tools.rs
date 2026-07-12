@@ -375,12 +375,16 @@ impl Server {
     }
 
     pub fn diagnostic(&self, lines: u32) -> Value {
-        let appdata = env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("C:/Users/me/AppData/Roaming"));
-        let directory = appdata.join("Balatro/Mods/lovely/log");
-        diagnostic_from_directory(&directory, lines)
+        diagnostic_for_appdata(env::var_os("APPDATA"), lines)
     }
+}
+
+fn diagnostic_for_appdata(appdata: Option<std::ffi::OsString>, lines: u32) -> Value {
+    let appdata = appdata
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:/Users/me/AppData/Roaming"));
+    let directory = appdata.join("Balatro/Mods/lovely/log");
+    diagnostic_from_directory(&directory, lines)
 }
 
 fn diagnostic_from_directory(directory: &std::path::Path, lines: u32) -> Value {
@@ -388,7 +392,10 @@ fn diagnostic_from_directory(directory: &std::path::Path, lines: u32) -> Value {
         items
             .filter_map(Result::ok)
             .filter_map(|x| {
-                let modified = x.metadata().ok()?.modified().ok()?;
+                let modified = x
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                 Some((modified, x.path()))
             })
             .max_by_key(|(modified, _)| *modified)
@@ -1887,9 +1894,23 @@ mod tests {
     #[tokio::test]
     async fn state_and_replay_route_failures_are_structured() {
         let (dir, server) = server();
+        write_fixture(&server);
         let bad_state_root = dir.path().join("bad-state");
         std::fs::create_dir_all(bad_state_root.join("agent/rust_state.db")).unwrap();
         *server.state_db.lock().await = StateDB::new(&bad_state_root);
+        assert!(server.policy(1).await.is_ok());
+        let saved_observation = std::fs::read(&server.ipc.observation_path).unwrap();
+        std::fs::remove_file(&server.ipc.observation_path).unwrap();
+        assert!(
+            server
+                .run_state(Parameters(StateParams {
+                    kind: "checkpoint".into(),
+                    limit: 1
+                }))
+                .await
+                .is_ok()
+        );
+        std::fs::write(&server.ipc.observation_path, saved_observation).unwrap();
         assert!(
             server
                 .run_state(Parameters(StateParams {
@@ -2043,6 +2064,7 @@ mod tests {
             diagnostic_from_directory(empty_log_dir.path(), 5)["log_found"],
             false
         );
+        assert!(diagnostic_for_appdata(None, 5).get("log_found").is_some());
     }
 
     #[test]
@@ -2136,6 +2158,13 @@ mod tests {
 
         wrong["round"]["seed"] = json!(SEED);
         wrong["bridge"] = json!({"loaded": true});
+        assert!(server.game_status().await.is_ok());
+        wrong["bridge"] = json!({"loaded": true, "version": 7});
+        std::fs::write(
+            &server.ipc.observation_path,
+            serde_json::to_vec(&wrong).unwrap(),
+        )
+        .unwrap();
         assert!(server.game_status().await.is_ok());
         wrong["bridge"] = json!({"loaded": true, "version": "0.6.0"});
         std::fs::write(

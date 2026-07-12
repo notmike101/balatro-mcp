@@ -109,8 +109,13 @@ pub fn classify_hand(cards: &[Value]) -> String {
 
 fn hand_value(contract: &Value, hand: &str) -> Option<(i64, i64)> {
     let values = contract.get("values").unwrap_or(contract);
-    let entry = values.get(hand).or_else(|| values.get("High Card"))?;
-    Some((entry.get("chips")?.as_i64()?, entry.get("mult")?.as_i64()?))
+    let entry = match values.get(hand) {
+        Some(entry) => entry,
+        None => values.get("High Card")?,
+    };
+    let chips = entry.get("chips")?.as_i64()?;
+    let mult = entry.get("mult")?.as_i64()?;
+    Some((chips, mult))
 }
 
 fn add_modifier(result: &mut ScoreResult, card: &Value, index: usize) {
@@ -221,11 +226,14 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
             let normalized_name = name.to_ascii_lowercase();
             let is = |key: &str, label: &str| center_key == key || normalized_name == label;
             if is("j_banner", "banner") {
-                let extra = ability
-                    .get("extra")
-                    .and_then(Value::as_i64)
-                    .or_else(|| joker.pointer("/config/extra").and_then(Value::as_i64))
-                    .unwrap_or(0);
+                let extra = ability.get("extra").and_then(Value::as_i64);
+                let extra = match extra {
+                    Some(extra) => extra,
+                    None => joker
+                        .pointer("/config/extra")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                };
                 let discards = observation
                     .pointer("/run/discards_left")
                     .and_then(Value::as_i64)
@@ -248,11 +256,14 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
                 }
                 known = true;
             } else if is("j_hanging_chad", "hanging chad") {
-                let extra = ability
-                    .get("extra")
-                    .and_then(Value::as_i64)
-                    .or_else(|| joker.pointer("/config/extra").and_then(Value::as_i64))
-                    .unwrap_or(0);
+                let extra = ability.get("extra").and_then(Value::as_i64);
+                let extra = match extra {
+                    Some(extra) => extra,
+                    None => joker
+                        .pointer("/config/extra")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                };
                 let nominal = hand
                     .first()
                     .and_then(|card| card.pointer("/base/nominal"))
@@ -261,11 +272,14 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
                 chips += extra * nominal;
                 known = true;
             } else if is("j_vampire", "vampire") {
-                let x = ability
-                    .get("x_mult")
-                    .and_then(Value::as_f64)
-                    .or_else(|| joker.pointer("/config/Xmult").and_then(Value::as_f64))
-                    .unwrap_or(1.0);
+                let x = ability.get("x_mult").and_then(Value::as_f64);
+                let x = match x {
+                    Some(x) => x,
+                    None => joker
+                        .pointer("/config/Xmult")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(1.0),
+                };
                 result.x_mult *= x.max(1.0);
                 known = true;
             } else if is("j_triboulet", "triboulet") {
@@ -419,7 +433,7 @@ mod tests {
         let fallback_effects = json!({
             "run":{"discards_left":2},
             "areas":{"hand":[],"jokers":[
-                {"name":"Hanging Chadd","config":{"extra":2}},
+                {"name":"Hanging Chad","config":{"extra":2}},
                 {"name":"Raised Fist"},
                 {"name":"Mystic Summit"},
                 {"name":"Vampire","config":{"Xmult":2.0}}
@@ -428,6 +442,15 @@ mod tests {
         });
         let fallback = score_hand(&fallback_effects, None);
         assert!(fallback.exact_score.is_none());
+        let banner_fallback = score_hand(
+            &json!({
+                "run":{"discards_left":1},
+                "areas":{"hand":[],"jokers":[{"name":"Banner","config":{"extra":3}}]},
+                "poker_hands":{"values":{"High Card":{"chips":5,"mult":1}}}
+            }),
+            None,
+        );
+        assert_eq!(banner_fallback.chips, 8);
     }
 
     #[test]
@@ -477,6 +500,39 @@ mod tests {
             None,
         );
         assert!(malformed_values.exact_score.is_none());
+        let partially_malformed_values = score_hand(
+            &json!({
+                "areas":{"hand":[card("A","H")]},
+                "poker_hands":{"values":{"High Card":{"chips":7}}}
+            }),
+            None,
+        );
+        assert!(partially_malformed_values.exact_score.is_none());
+        let malformed_chips = score_hand(
+            &json!({
+                "areas":{"hand":[card("A","H")]},
+                "poker_hands":{"values":{"High Card":{"chips":"bad","mult":2}}}
+            }),
+            None,
+        );
+        assert!(malformed_chips.exact_score.is_none());
+        let malformed_mult = score_hand(
+            &json!({
+                "areas":{"hand":[card("A","H")]},
+                "poker_hands":{"values":{"High Card":{"chips":7,"mult":"bad"}}}
+            }),
+            None,
+        );
+        assert!(malformed_mult.exact_score.is_none());
+        let fallback_hand_value = score_hand(
+            &json!({
+                "areas":{"hand":[card("A","H"), card("A","S")]},
+                "poker_hands":{"values":{"High Card":{"chips":7,"mult":3}}}
+            }),
+            None,
+        );
+        assert_eq!(fallback_hand_value.hand_name, "Pair");
+        assert_eq!(fallback_hand_value.chips, 7 + 20);
     }
 
     #[test]

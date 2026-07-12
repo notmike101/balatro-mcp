@@ -6,6 +6,41 @@ pub struct StateDB {
     path: PathBuf,
 }
 
+type EventRow = (i64, String, Value, String);
+type StrategyRow = (String, String, Value, String, bool, bool);
+type EstimateReportRow = (i64, f64);
+
+fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        serde_json::from_str::<Value>(&row.get::<_, String>(2)?).unwrap_or(Value::Null),
+        row.get(3)?,
+    ))
+}
+
+fn read_strategy_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StrategyRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        serde_json::from_str::<Value>(&row.get::<_, String>(2)?).unwrap_or(Value::Null),
+        row.get(3)?,
+        row.get::<_, i64>(4)? != 0,
+        row.get::<_, i64>(5)? != 0,
+    ))
+}
+
+fn read_estimate_report_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EstimateReportRow> {
+    Ok((row.get(0)?, row.get(1)?))
+}
+
+fn state_sql<T>(result: rusqlite::Result<T>, context: &str) -> Result<T, String> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => Err(format!("{context}: {error}")),
+    }
+}
+
 impl StateDB {
     pub fn new(runtime_root: &Path) -> Self {
         Self {
@@ -14,33 +49,37 @@ impl StateDB {
     }
 
     fn connection(&self) -> Result<Connection, String> {
-        let parent = self.path.parent().ok_or("state database has no parent")?;
+        let parent = self
+            .path
+            .parent()
+            .expect("StateDB paths always include the agent directory");
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         let conn = Connection::open_with_flags(
             &self.path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )
         .map_err(|e| e.to_string())?;
-        conn.execute_batch(r#"
+        state_sql(conn.execute_batch(r#"
             CREATE TABLE IF NOT EXISTS current_run (id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL, updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
             CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
             CREATE TABLE IF NOT EXISTS strategy_rules (id TEXT PRIMARY KEY, kind TEXT NOT NULL, conditions TEXT NOT NULL, directive TEXT NOT NULL, absolute INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
             CREATE TABLE IF NOT EXISTS strategy_evidence (id INTEGER PRIMARY KEY, rule_id TEXT NOT NULL, outcome TEXT NOT NULL, event_id TEXT NOT NULL, note TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
             CREATE TABLE IF NOT EXISTS lessons (id INTEGER PRIMARY KEY, category TEXT NOT NULL, lesson TEXT NOT NULL, source TEXT NOT NULL, confidence REAL NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-            CREATE TABLE IF NOT EXISTS estimates (id INTEGER PRIMARY KEY, hand_type TEXT NOT NULL, estimated INTEGER NOT NULL, actual INTEGER NOT NULL, error_pct REAL NOT NULL, context TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-        "#).map_err(|e| e.to_string())?;
+            CREATE TABLE IF NOT EXISTS estimates (id INTEGER PRIMARY KEY, hand_type TEXT NOT NULL, estimated INTEGER NOT NULL, actual INTEGER NOT NULL, error_pct REAL NOT NULL, context TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);"#), "state schema")?;
         Ok(conn)
     }
 
     pub fn checkpoint(&self, payload: &Value, kind: &str) -> Result<Value, String> {
         let conn = self.connection()?;
-        let text = serde_json::to_string(payload).map_err(|e| e.to_string())?;
-        conn.execute("INSERT INTO current_run(id,payload) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, updated_at=CURRENT_TIMESTAMP", [&text]).map_err(|e| e.to_string())?;
-        conn.execute(
-            "INSERT INTO events(kind,payload) VALUES(?,?)",
-            params![kind, text],
-        )
-        .map_err(|e| e.to_string())?;
+        let text = serde_json::to_string(payload).expect("serde_json::Value is serializable");
+        state_sql(conn.execute("INSERT INTO current_run(id,payload) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, updated_at=CURRENT_TIMESTAMP", [&text]), "current run")?;
+        state_sql(
+            conn.execute(
+                "INSERT INTO events(kind,payload) VALUES(?,?)",
+                params![kind, text],
+            ),
+            "event",
+        )?;
         Ok(json!({"kind": kind, "event_id": conn.last_insert_rowid(), "payload": payload}))
     }
 
@@ -55,11 +94,18 @@ impl StateDB {
 
     pub fn events(&self, limit: u32) -> Result<Value, String> {
         let conn = self.connection()?;
-        let mut stmt = conn
-            .prepare("SELECT id,kind,payload,created_at FROM events ORDER BY id DESC LIMIT ?")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt.query_map([limit.clamp(1, 500)], |row| Ok(json!({"event_id": row.get::<_, i64>(0)?, "kind": row.get::<_, String>(1)?, "payload": serde_json::from_str::<Value>(&row.get::<_, String>(2)?).unwrap_or(Value::Null), "created_at": row.get::<_, String>(3)?}))).map_err(|e| e.to_string())?;
-        Ok(Value::Array(rows.filter_map(Result::ok).collect()))
+        let mut stmt = state_sql(
+            conn.prepare("SELECT id,kind,payload,created_at FROM events ORDER BY id DESC LIMIT ?"),
+            "prepare events",
+        )?;
+        let rows = stmt
+            .query_map([limit.clamp(1, 500)], read_event_row)
+            .expect("event query parameters are statically typed");
+        Ok(Value::Array(rows.filter_map(|row| {
+            row.ok().map(|(event_id, kind, payload, created_at)| {
+                json!({"event_id": event_id, "kind": kind, "payload": payload, "created_at": created_at})
+            })
+        }).collect()))
     }
 
     pub fn add_rule(
@@ -71,17 +117,16 @@ impl StateDB {
         absolute: bool,
     ) -> Result<Value, String> {
         let conn = self.connection()?;
-        conn.execute(
+        state_sql(conn.execute(
             "INSERT INTO strategy_rules(id,kind,conditions,directive,absolute) VALUES(?,?,?,?,?)",
             params![
                 id,
                 kind,
-                serde_json::to_string(conditions).map_err(|e| e.to_string())?,
+                serde_json::to_string(conditions).expect("serde_json::Value is serializable"),
                 directive,
                 absolute as i64
             ],
-        )
-        .map_err(|e| e.to_string())?;
+        ), "strategy rule")?;
         Ok(
             json!({"id":id,"kind":kind,"conditions":conditions,"directive":directive,"absolute":absolute,"active":true}),
         )
@@ -89,9 +134,15 @@ impl StateDB {
 
     pub fn strategy(&self) -> Result<Value, String> {
         let conn = self.connection()?;
-        let mut stmt = conn.prepare("SELECT id,kind,conditions,directive,absolute,active FROM strategy_rules ORDER BY id").map_err(|e| e.to_string())?;
-        let rules = stmt.query_map([], |row| Ok(json!({"id":row.get::<_,String>(0)?,"kind":row.get::<_,String>(1)?,"conditions":serde_json::from_str::<Value>(&row.get::<_,String>(2)?).unwrap_or(Value::Null),"directive":row.get::<_,String>(3)?,"absolute":row.get::<_,i64>(4)? != 0,"active":row.get::<_,i64>(5)? != 0}))).map_err(|e| e.to_string())?;
-        Ok(json!({"rules": rules.filter_map(Result::ok).collect::<Vec<_>>() }))
+        let mut stmt = state_sql(conn.prepare("SELECT id,kind,conditions,directive,absolute,active FROM strategy_rules ORDER BY id"), "prepare strategy")?;
+        let rules = stmt
+            .query_map([], read_strategy_row)
+            .expect("strategy query has no bind parameters");
+        Ok(json!({"rules": rules.filter_map(|row| {
+            row.ok().map(|(id, kind, conditions, directive, absolute, active)| {
+                json!({"id": id, "kind": kind, "conditions": conditions, "directive": directive, "absolute": absolute, "active": active})
+            })
+        }).collect::<Vec<_>>() }))
     }
 
     pub fn record_evidence(
@@ -102,20 +153,24 @@ impl StateDB {
         note: &str,
     ) -> Result<Value, String> {
         let conn = self.connection()?;
-        conn.execute(
-            "INSERT INTO strategy_evidence(rule_id,outcome,event_id,note) VALUES(?,?,?,?)",
-            params![rule_id, outcome, event_id, note],
-        )
-        .map_err(|e| e.to_string())?;
+        state_sql(
+            conn.execute(
+                "INSERT INTO strategy_evidence(rule_id,outcome,event_id,note) VALUES(?,?,?,?)",
+                params![rule_id, outcome, event_id, note],
+            ),
+            "strategy evidence",
+        )?;
         let active = !matches!(
             outcome.to_ascii_lowercase().as_str(),
             "failure" | "rejected" | "invalid"
         );
-        conn.execute(
-            "UPDATE strategy_rules SET active=? WHERE id=?",
-            params![active as i64, rule_id],
-        )
-        .map_err(|e| e.to_string())?;
+        state_sql(
+            conn.execute(
+                "UPDATE strategy_rules SET active=? WHERE id=?",
+                params![active as i64, rule_id],
+            ),
+            "strategy activation",
+        )?;
         Ok(
             json!({"rule_id":rule_id,"outcome":outcome,"event_id":event_id,"note":note,"active":active}),
         )
@@ -129,11 +184,13 @@ impl StateDB {
         confidence: f64,
     ) -> Result<Value, String> {
         let conn = self.connection()?;
-        conn.execute(
-            "INSERT INTO lessons(category,lesson,source,confidence) VALUES(?,?,?,?)",
-            params![category, lesson, source, confidence.clamp(0.0, 1.0)],
-        )
-        .map_err(|e| e.to_string())?;
+        state_sql(
+            conn.execute(
+                "INSERT INTO lessons(category,lesson,source,confidence) VALUES(?,?,?,?)",
+                params![category, lesson, source, confidence.clamp(0.0, 1.0)],
+            ),
+            "lesson",
+        )?;
         Ok(
             json!({"category":category,"lesson":lesson,"source":source,"confidence":confidence.clamp(0.0,1.0)}),
         )
@@ -152,17 +209,16 @@ impl StateDB {
             ((estimated - actual).abs() as f64 / actual.abs() as f64) * 100.0
         };
         let conn = self.connection()?;
-        conn.execute(
+        state_sql(conn.execute(
             "INSERT INTO estimates(hand_type,estimated,actual,error_pct,context) VALUES(?,?,?,?,?)",
             params![
                 hand_type,
                 estimated,
                 actual,
                 error_pct,
-                serde_json::to_string(context).map_err(|e| e.to_string())?
+                serde_json::to_string(context).expect("serde_json::Value is serializable")
             ],
-        )
-        .map_err(|e| e.to_string())?;
+        ), "estimate")?;
         Ok(
             json!({"hand_type":hand_type,"estimated":estimated,"actual":actual,"error_pct":error_pct,"context":context}),
         )
@@ -170,16 +226,14 @@ impl StateDB {
 
     pub fn estimation_report(&self) -> Result<Value, String> {
         let conn = self.connection()?;
-        let average: f64 = conn
-            .query_row(
-                "SELECT COALESCE(AVG(error_pct),0) FROM estimates",
+        let (count, average): (i64, f64) = state_sql(
+            conn.query_row(
+                "SELECT COUNT(*), COALESCE(AVG(error_pct),0) FROM estimates",
                 [],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM estimates", [], |row| row.get(0))
-            .map_err(|e| e.to_string())?;
+                read_estimate_report_row,
+            ),
+            "estimate report",
+        )?;
         Ok(json!({"count":count,"average_error_pct":average}))
     }
 }
@@ -192,6 +246,8 @@ mod tests {
 
     #[test]
     fn state_round_trip_and_strategy_workflow() {
+        assert!(state_sql::<()>(Ok(()), "ok").is_ok());
+        assert!(state_sql::<()>(Err(rusqlite::Error::QueryReturnedNoRows), "bad").is_err());
         let dir = tempdir().unwrap();
         let db = StateDB::new(dir.path());
         let checkpoint = db.checkpoint(&json!({"state":"SHOP"}), "test").unwrap();
@@ -206,6 +262,40 @@ mod tests {
             .unwrap();
         db.record_estimate("Pair", 100, 120, &json!({})).unwrap();
         assert_eq!(db.estimation_report().unwrap()["count"], 1);
+    }
+
+    #[test]
+    fn state_row_decoders_cover_every_field_error() {
+        macro_rules! assert_reader_error {
+            ($values:expr, $reader:path) => {{
+                let conn = Connection::open_in_memory().unwrap();
+                let mut stmt = conn
+                    .prepare(&format!("SELECT {}", $values.join(",")))
+                    .unwrap();
+                assert!(stmt.query_row([], $reader).is_err());
+            }};
+        }
+
+        let event_values = ["1", "'kind'", "'{}'", "'time'"];
+        for bad in 0..event_values.len() {
+            let mut values = event_values.map(str::to_owned);
+            values[bad] = "X'00'".into();
+            assert_reader_error!(values, read_event_row);
+        }
+
+        let strategy_values = ["'id'", "'kind'", "'{}'", "'directive'", "0", "1"];
+        for bad in 0..strategy_values.len() {
+            let mut values = strategy_values.map(str::to_owned);
+            values[bad] = "X'00'".into();
+            assert_reader_error!(values, read_strategy_row);
+        }
+
+        let estimate_values = ["1", "1.0"];
+        for bad in 0..estimate_values.len() {
+            let mut values = estimate_values.map(str::to_owned);
+            values[bad] = "X'00'".into();
+            assert_reader_error!(values, read_estimate_report_row);
+        }
     }
 
     #[test]
@@ -268,6 +358,15 @@ mod tests {
     }
 
     #[test]
+    fn locked_state_schema_is_reported() {
+        let dir = tempdir().unwrap();
+        let db = StateDB::new(dir.path());
+        let conn = db.connection().unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        assert!(db.current_run().is_err());
+    }
+
+    #[test]
     fn malformed_schema_errors_are_returned_by_every_workflow() {
         let dir = tempdir().unwrap();
         let db = StateDB::new(dir.path());
@@ -305,5 +404,36 @@ mod tests {
         drop(conn);
         assert!(db.current_run().is_err());
         assert!(db.events(10).is_ok());
+    }
+
+    #[test]
+    fn each_state_sql_failure_boundary_is_returned() {
+        fn bad_db(table: &str) -> (tempfile::TempDir, StateDB) {
+            let dir = tempdir().unwrap();
+            let db = StateDB::new(dir.path());
+            let conn = db.connection().unwrap();
+            conn.execute_batch(&format!(
+                "DROP TABLE {table}; CREATE TABLE {table} (wrong TEXT);"
+            ))
+            .unwrap();
+            (dir, db)
+        }
+
+        let (_dir, db) = bad_db("current_run");
+        assert!(db.checkpoint(&json!({}), "bad").is_err());
+        let (_dir, db) = bad_db("events");
+        assert!(db.events(1).is_err());
+        assert!(db.checkpoint(&json!({}), "bad").is_err());
+        let (_dir, db) = bad_db("strategy_rules");
+        assert!(db.add_rule("r", "k", &json!({}), "d", false).is_err());
+        assert!(db.strategy().is_err());
+        assert!(db.record_evidence("r", "success", "e", "n").is_err());
+        let (_dir, db) = bad_db("strategy_evidence");
+        assert!(db.record_evidence("r", "success", "e", "n").is_err());
+        let (_dir, db) = bad_db("lessons");
+        assert!(db.add_lesson("c", "l", "s", 0.5).is_err());
+        let (_dir, db) = bad_db("estimates");
+        assert!(db.record_estimate("Pair", 1, 2, &json!({})).is_err());
+        assert!(db.estimation_report().is_err());
     }
 }

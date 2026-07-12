@@ -17,13 +17,20 @@ fn compact_summary(data: &Value) -> Value {
     let game = data.get("game");
     let run = data.get("run");
     let areas = data.get("areas");
+    let chips = match run.and_then(|r| r.get("chips")).and_then(|r| r.as_i64()) {
+        Some(chips) => Some(chips),
+        None => run
+            .and_then(|r| r.get("blind"))
+            .and_then(|b| b.get("chips_required"))
+            .and_then(|c| c.as_i64()),
+    };
 
     serde_json::json!({
         "state": game.and_then(|g| g.get("state")).and_then(|g| g.as_str()),
         "ante": run.and_then(|r| r.get("ante")).and_then(|r| r.as_i64()),
         "round": run.and_then(|r| r.get("round")).and_then(|r| r.as_i64()),
         "blind": run.and_then(|r| r.get("blind")).and_then(|r| r.get("name")).and_then(|r| r.as_str()),
-        "chips": run.and_then(|r| r.get("chips")).and_then(|r| r.as_i64()).or_else(|| run.and_then(|r| r.get("blind")).and_then(|b| b.get("chips_required")).and_then(|c| c.as_i64())),
+        "chips": chips,
         "hands_left": run.and_then(|r| r.get("hands_left")).and_then(|r| r.as_i64()),
         "discards_left": run.and_then(|r| r.get("discards_left")).and_then(|r| r.as_i64()),
         "dollars": run.and_then(|r| r.get("dollars")).and_then(|r| r.as_i64()),
@@ -166,6 +173,11 @@ mod tests {
     fn test_compact_observation_summary_uses_blind_chip_fallback() {
         let r = compact_observation(&json!({"run":{"blind":{"chips_required":99}}}), "summary");
         assert_eq!(r["chips"], 99);
+        let r = compact_observation(
+            &json!({"run":{"chips":123,"blind":{"chips_required":99}}}),
+            "summary",
+        );
+        assert_eq!(r["chips"], 123);
     }
     #[test]
     fn test_compact_observation_hand() {
