@@ -46,7 +46,18 @@ pub fn build_policy_state(
         .get("game")
         .and_then(|g| g.get("state"))
         .and_then(|s| s.as_str())
+        .or_else(|| {
+            observation
+                .get("game")
+                .and_then(|g| g.get("state_name"))
+                .and_then(|s| s.as_str())
+        })
         .unwrap_or("");
+    let game = if game.eq_ignore_ascii_case("MAIN_MENU") {
+        "MENU"
+    } else {
+        game
+    };
     let run = observation
         .get("run")
         .and_then(|r| r.as_object())
@@ -338,7 +349,18 @@ fn generate_legal_actions(
         .get("game")
         .and_then(|g| g.get("state"))
         .and_then(|s| s.as_str())
+        .or_else(|| {
+            observation
+                .get("game")
+                .and_then(|g| g.get("state_name"))
+                .and_then(|s| s.as_str())
+        })
         .unwrap_or("");
+    let state = if state.eq_ignore_ascii_case("MAIN_MENU") {
+        "MENU"
+    } else {
+        state
+    };
     let run = observation
         .get("run")
         .and_then(|r| r.as_object())
@@ -692,6 +714,16 @@ mod tests {
             60,
         );
         assert_eq!(menu_saved["legal_actions"][0]["action"], "resume_run");
+        let numeric_main_menu = build_policy_state(
+            &json!({
+                "game":{"state":11,"state_name":"MAIN_MENU"},
+                "ready":{"saved_game_present":false}
+            }),
+            40,
+            40,
+            60,
+        );
+        assert_eq!(numeric_main_menu["legal_actions"][0]["action"], "ui_click");
         let menu_without_ready = build_policy_state(&json!({"game":{"state":"MENU"}}), 40, 40, 60);
         assert!(
             menu_without_ready["legal_actions"]

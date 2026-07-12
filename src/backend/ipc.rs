@@ -323,6 +323,46 @@ pub fn checkpoint_internal(paths: &IpcPaths, kind: &str) -> Result<Value, String
     Ok(response)
 }
 
+/// Recover from a non-target saved run and start the only permitted seed.
+/// The caller must have already performed the runtime and seed-recovery checks.
+pub fn start_new_run(paths: &IpcPaths) -> Result<Value, String> {
+    let setup_id = paths.next_command_id();
+    let setup = serde_json::json!({
+        "id": setup_id,
+        "action": "setup_new_run",
+    });
+    paths.write_command(&setup)?;
+    let setup_response = paths
+        .wait_for_response(&setup_id, 30.0)?
+        .ok_or("no response from bridge for setup_new_run")?;
+    if setup_response.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Err(setup_response
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("bridge rejected setup_new_run")
+            .to_string());
+    }
+
+    let start_id = paths.next_command_id();
+    let start = serde_json::json!({
+        "id": start_id,
+        "action": "start_run",
+        "seed": crate::models::SEED,
+    });
+    paths.write_command(&start)?;
+    let start_response = paths
+        .wait_for_response(&start_id, 30.0)?
+        .ok_or("no response from bridge for start_run")?;
+    if start_response.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Err(start_response
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("bridge rejected start_run")
+            .to_string());
+    }
+    Ok(start_response)
+}
+
 /// Execute a safe transition action from the pre-known list of safe actions.
 /// Picks the first safe action not yet executed.
 #[allow(dead_code)]

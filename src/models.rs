@@ -52,6 +52,9 @@ pub fn settle_timeout() -> f64 {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct StartNewRunParams {}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct AdvanceParams {
     #[serde(default = "advance_steps")]
     pub max_steps: u32,
