@@ -74,6 +74,46 @@ fn card_nominal(card: &Value) -> Option<i64> {
         })
 }
 
+fn scoring_card_positions(cards: &[Value], hand_name: &str) -> Vec<usize> {
+    let grouped_hand = matches!(
+        hand_name,
+        "Pair"
+            | "Two Pair"
+            | "Three of a Kind"
+            | "Full House"
+            | "Four of a Kind"
+            | "Five of a Kind"
+    );
+    if !grouped_hand {
+        return (0..cards.len()).collect();
+    }
+
+    let mut counts = std::collections::HashMap::<u8, usize>::new();
+    for card in cards {
+        let Some(rank) = card_rank(card) else {
+            return (0..cards.len()).collect();
+        };
+        *counts.entry(rank).or_default() += 1;
+    }
+    let minimum = match hand_name {
+        "Pair" | "Two Pair" => 2,
+        "Three of a Kind" => 3,
+        "Full House" => 2,
+        "Four of a Kind" => 4,
+        "Five of a Kind" => 5,
+        _ => unreachable!(),
+    };
+    cards
+        .iter()
+        .enumerate()
+        .filter_map(|(position, card)| {
+            card_rank(card)
+                .filter(|rank| counts.get(rank).copied().unwrap_or(0) >= minimum)
+                .map(|_| position)
+        })
+        .collect()
+}
+
 fn text_field(value: &Value, key: &str) -> Option<String> {
     value
         .get(key)
@@ -214,6 +254,7 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
         .filter_map(|index| hand.get(*index).cloned())
         .collect();
     let hand_name = classify_hand(&cards);
+    let scoring_positions = scoring_card_positions(&cards, &hand_name);
     let base = hand_value(contract, &hand_name);
     let (base_chips, mut mult) = base.unwrap_or((5, 1));
     let run = observation.get("run").or_else(|| observation.get("round"));
@@ -239,7 +280,10 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
         run_chips,
         blind_chips_required,
         blind_chips_remaining,
-        scoring_cards: indices.iter().map(|index| index + 1).collect(),
+        scoring_cards: scoring_positions
+            .iter()
+            .map(|position| indices[*position] + 1)
+            .collect(),
         chips: base_chips,
         mult,
         x_mult: 1.0,
@@ -249,7 +293,8 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
         unsupported_effects: Vec::new(),
         contributions: Vec::new(),
     };
-    for (position, card) in cards.iter().enumerate() {
+    for position in scoring_positions {
+        let card = &cards[position];
         if let Some(nominal) = card_nominal(card) {
             result.chips += nominal;
         }
@@ -641,6 +686,21 @@ mod tests {
     }
 
     #[test]
+    fn score_pair_ignores_non_scoring_cards_in_selected_hand() {
+        let observation = json!({
+            "areas": {"hand": [
+                card("A", "H"), card("A", "S"), card("K", "D"), card("Q", "C"), card("J", "H")
+            ]},
+            "poker_hands": {"values": {"Pair": {"chips": 10, "mult": 2}}}
+        });
+        let result = score_hand(&observation, Some(&[0, 1, 2, 3, 4]));
+        assert_eq!(result.hand_name, "Pair");
+        assert_eq!(result.scoring_cards, vec![1, 2]);
+        assert_eq!(result.chips, 32);
+        assert_eq!(result.estimated_score, 64);
+    }
+
+    #[test]
     fn score_full_live_hand_chooses_best_five_card_subset() {
         let observation = json!({
             "areas": {"hand": [
@@ -661,7 +721,7 @@ mod tests {
         let result = score_hand(&observation, None);
         assert_eq!(result.hand_name, "Pair");
         assert_eq!(result.score_scope, "best_play");
-        assert_eq!(result.scoring_cards.len(), 5);
+        assert_eq!(result.scoring_cards.len(), 2);
         assert!(result.scoring_cards.contains(&1));
         assert!(result.scoring_cards.contains(&2));
     }
@@ -726,7 +786,7 @@ mod tests {
             "poker_hands":{"values":{"High Card":{"chips":10,"mult":2}}}
         });
         let result = score_hand(&observation, Some(&[0, 99]));
-        assert_eq!(result.scoring_cards, vec![1, 100]);
+        assert_eq!(result.scoring_cards, vec![1]);
         assert!(result.x_mult > 1.0);
         assert!(result.unsupported_effects.iter().any(|x| x == "Unknown"));
         assert_eq!(result.estimate_quality, "partial_contract");
