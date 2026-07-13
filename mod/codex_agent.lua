@@ -361,19 +361,29 @@ local function card_summary(card, index)
     local base = card.base or {}
     local ability = card.ability or {}
     local center_key = config.center_key or center.key
-    local face_down = card.facing == "back"
+    local incomplete_identity = base.suit ~= nil
+        and base.nominal ~= nil
+        and base.value == nil
+        and base.id == nil
+    local face_down = card.facing == "back" or incomplete_identity
 
-    -- Mask identity fields when the card is face-down
-    local display_name = nil
-    if not face_down then
-        display_name = ability.name or center.name or base.name
+    if face_down then
+        return {
+            index = index,
+            instance_id = card.sort_id,
+            hidden = true,
+            face_down = true
+        }
     end
+
+    local display_name = ability.name or center.name or base.name
 
     return {
         index = index,
         id = card.sort_id,
+        face_down = false,
         name = display_name,
-        set = (not face_down and ability.set) or center.set,
+        set = ability.set or center.set,
         center_key = center_key,
         effect = raw_localization_summary(center.set or ability.set, center_key),
         center_config = primitive_summary(center.config, 2),
@@ -383,15 +393,15 @@ local function card_summary(card, index)
         debuffed = not not card.debuff,
         facing = card.facing,
         edition = edition_name(card.edition),
-        seal = (not face_down and card.seal) or nil,
+        seal = card.seal,
         pinned = not not card.pinned,
         ability = ability_summary(ability),
         base = {
-            name = (not face_down and base.name) or nil,
-            suit = (not face_down and base.suit) or nil,
-            value = (not face_down and base.value) or nil,
-            id = (not face_down and base.id) or nil,
-            nominal = (not face_down and base.nominal) or nil
+            name = base.name,
+            suit = base.suit,
+            value = base.value,
+            id = base.id,
+            nominal = base.nominal
         }
     }
 end
@@ -449,12 +459,16 @@ local function card_collection_summary(area)
     }
     for _, card in ipairs(area.cards) do
         -- Skip face-down cards to prevent identity leakage (e.g., The Fish boss)
-        if card.facing == "back" then
+        local base = card.base or {}
+        local incomplete_identity = base.suit ~= nil
+            and base.nominal ~= nil
+            and base.value == nil
+            and base.id == nil
+        if card.facing == "back" or incomplete_identity then
             summary.count = summary.count - 1
             goto continue
         end
         local config = card.config or {}
-        local base = card.base or {}
         increment_count(summary.by_suit, base.suit)
         increment_count(summary.by_rank, base.value or base.id)
         increment_count(summary.by_card_key, config.card_key)

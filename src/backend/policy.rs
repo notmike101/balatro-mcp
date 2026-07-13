@@ -1,7 +1,10 @@
 use serde_json::{Value, json};
 use std::sync::LazyLock;
 
-use super::{observation, scoring::score_hand};
+use super::{
+    observation,
+    scoring::{self, score_hand},
+};
 
 static EMPTY_VEC: [Value; 0] = [];
 static EMPTY_MAP: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(serde_json::Map::new);
@@ -205,6 +208,13 @@ pub fn build_policy_state(
 /// The full policy remains available for explicit analysis requests.
 pub fn compact_policy_state(full: &Value) -> Value {
     let compact_card = |card: &Value| {
+        if scoring::card_is_hidden(card) {
+            return json!({
+                "index": card.get("index"),
+                "instance_id": card.get("instance_id").or_else(|| card.get("id")),
+                "hidden": true
+            });
+        }
         json!({
             "index": card.get("index"),
             "instance_id": card.get("instance_id").or_else(|| card.get("id")),
@@ -991,6 +1001,29 @@ mod tests {
         );
         assert!(compact["decision_checks"].get("ordering").is_some());
         assert!(compact["decision_checks"].get("consumables").is_some());
+    }
+
+    #[test]
+    fn hidden_cards_do_not_drive_best_play_or_compact_identity() {
+        let mut hidden = observation("SELECTING_HAND");
+        hidden["run"]["blind"]["chips_required"] = json!(300);
+        hidden["areas"]["hand"] = json!([
+            {"index": 1, "instance_id": 101, "base": {"nominal": 11, "suit": "Diamonds"}},
+            {"index": 2, "instance_id": 102, "base": {"nominal": 10, "suit": "Spades"}},
+            {"index": 3, "instance_id": 103, "base": {"nominal": 10, "suit": "Hearts"}},
+            {"index": 4, "instance_id": 104, "base": {"nominal": 10, "suit": "Diamonds"}},
+            {"index": 5, "instance_id": 105, "base": {"nominal": 10, "suit": "Clubs"}}
+        ]);
+
+        let state = build_policy_state(&hidden, 5, 5, 60);
+        assert_eq!(state["score_pressure"]["best_play_estimated_score"], 0);
+        assert_eq!(state["score_pressure"]["best_play_clears_blind"], false);
+        assert_eq!(state["hand_analysis"]["best_play"]["hand_name"], "Unknown");
+
+        let compact = compact_policy_state(&state);
+        assert_eq!(compact["hand"][0]["hidden"], true);
+        assert!(compact["hand"][0].get("base").is_none());
+        assert!(compact["hand"][0].get("suit").is_none());
     }
 
     #[test]

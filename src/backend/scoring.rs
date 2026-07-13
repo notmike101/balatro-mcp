@@ -38,7 +38,35 @@ fn rank_value(rank: &str) -> Option<u8> {
     }
 }
 
+pub(crate) fn card_is_hidden(card: &Value) -> bool {
+    if matches!(card.get("hidden"), Some(Value::Bool(true)))
+        || matches!(card.get("face_down"), Some(Value::Bool(true)))
+        || matches!(card.get("facing"), Some(Value::String(value)) if value == "back")
+    {
+        return true;
+    }
+
+    let base = card.get("base").and_then(Value::as_object);
+    let has_authoritative_identity = ["rank", "value", "id"].iter().any(|key| {
+        base.and_then(|base| base.get(*key))
+            .is_some_and(|value| !value.is_null())
+    }) || ["rank", "value", "id"]
+        .iter()
+        .any(|key| card.get(*key).is_some_and(|value| !value.is_null()));
+    let has_partial_identity = base
+        .and_then(|base| base.get("suit"))
+        .is_some_and(|value| !value.is_null())
+        && base
+            .and_then(|base| base.get("nominal"))
+            .is_some_and(|value| !value.is_null());
+
+    has_partial_identity && !has_authoritative_identity
+}
+
 fn card_rank(card: &Value) -> Option<u8> {
+    if card_is_hidden(card) {
+        return None;
+    }
     card.pointer("/base/rank")
         .or_else(|| card.pointer("/base/value"))
         .or_else(|| card.pointer("/base/id"))
@@ -48,6 +76,9 @@ fn card_rank(card: &Value) -> Option<u8> {
 }
 
 fn card_suit(card: &Value) -> Option<String> {
+    if card_is_hidden(card) {
+        return None;
+    }
     card.pointer("/base/suit")
         .or_else(|| card.get("suit"))
         .and_then(Value::as_str)
@@ -63,6 +94,9 @@ fn card_suit(card: &Value) -> Option<String> {
 }
 
 fn card_nominal(card: &Value) -> Option<i64> {
+    if card_is_hidden(card) {
+        return None;
+    }
     card.pointer("/base/nominal")
         .and_then(Value::as_i64)
         .or_else(|| {
@@ -143,6 +177,9 @@ fn straight(ranks: &[u8]) -> bool {
 }
 
 pub fn classify_hand(cards: &[Value]) -> String {
+    if cards.iter().any(card_is_hidden) {
+        return "Unknown".into();
+    }
     let ranks: Vec<u8> = cards.iter().filter_map(card_rank).collect();
     let suits: Vec<String> = cards.iter().filter_map(card_suit).collect();
     let mut counts = HashMap::<u8, usize>::new();
@@ -253,10 +290,13 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
         .iter()
         .filter_map(|index| hand.get(*index).cloned())
         .collect();
-    let hand_name = classify_hand(&cards);
-    let scoring_positions = scoring_card_positions(&cards, &hand_name);
-    let base = hand_value(contract, &hand_name);
-    let (base_chips, mut mult) = base.unwrap_or((5, 1));
+    let score_scope = if card_indices.is_some() || highlighted_scope {
+        "selected_cards"
+    } else if best_subset_scope {
+        "best_play"
+    } else {
+        "current_hand"
+    };
     let run = observation.get("run").or_else(|| observation.get("round"));
     let run_most_played_hand = run
         .and_then(|run| run.get("most_played_poker_hand"))
@@ -266,16 +306,34 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
     let blind_chips_required = observation::blind_chips_required(observation);
     let blind_chips_remaining =
         blind_chips_required.map(|required| required.saturating_sub(run_chips.unwrap_or(0)).max(0));
+    if cards.iter().any(card_is_hidden) {
+        return ScoreResult {
+            hand_name: "Unknown".into(),
+            hand_key: "Unknown".into(),
+            score_scope: score_scope.into(),
+            run_most_played_hand,
+            run_chips,
+            blind_chips_required,
+            blind_chips_remaining,
+            scoring_cards: Vec::new(),
+            chips: 0,
+            mult: 0,
+            x_mult: 1.0,
+            exact_score: None,
+            estimated_score: 0,
+            estimate_quality: "hidden_cards".into(),
+            unsupported_effects: vec!["hidden card identity".into()],
+            contributions: Vec::new(),
+        };
+    }
+    let hand_name = classify_hand(&cards);
+    let scoring_positions = scoring_card_positions(&cards, &hand_name);
+    let base = hand_value(contract, &hand_name);
+    let (base_chips, mut mult) = base.unwrap_or((5, 1));
     let mut result = ScoreResult {
         hand_key: hand_name.clone(),
         hand_name,
-        score_scope: if card_indices.is_some() || highlighted_scope {
-            "selected_cards".into()
-        } else if best_subset_scope {
-            "best_play".into()
-        } else {
-            "current_hand".into()
-        },
+        score_scope: score_scope.into(),
         run_most_played_hand,
         run_chips,
         blind_chips_required,
@@ -579,6 +637,38 @@ mod tests {
             classify_hand(&[card("A", "H"), card("K", "S")]),
             "High Card"
         );
+    }
+
+    #[test]
+    fn hidden_nominals_never_form_a_poker_hand() {
+        let hidden_cards: Vec<Value> = [11, 10, 10, 10, 10, 9, 9, 2]
+            .into_iter()
+            .enumerate()
+            .map(|(index, nominal)| {
+                json!({
+                    "index": index + 1,
+                    "instance_id": index + 100,
+                    "base": {"nominal": nominal, "suit": "Diamonds"}
+                })
+            })
+            .collect();
+        let result = score_hand(
+            &json!({
+                "areas": {"hand": hidden_cards},
+                "poker_hands": {"values": {
+                    "High Card": {"chips": 5, "mult": 1},
+                    "Four of a Kind": {"chips": 60, "mult": 7}
+                }}
+            }),
+            Some(&[0, 1, 2, 3, 4]),
+        );
+
+        assert_eq!(result.hand_name, "Unknown");
+        assert_eq!(result.hand_key, "Unknown");
+        assert_eq!(result.estimated_score, 0);
+        assert_eq!(result.exact_score, None);
+        assert_eq!(result.estimate_quality, "hidden_cards");
+        assert!(result.scoring_cards.is_empty());
     }
 
     #[test]

@@ -9,6 +9,26 @@ pub fn value_state(data: &Value) -> Option<Value> {
         .or_else(|| data.get("state").cloned())
 }
 
+fn incomplete_card_identity(map: &Map<String, Value>) -> bool {
+    let base = map.get("base").and_then(Value::as_object);
+    let has_authoritative_identity = ["rank", "value", "id"].iter().any(|key| {
+        base.and_then(|base| base.get(*key))
+            .is_some_and(|value| !value.is_null())
+    }) || ["rank", "value", "id"]
+        .iter()
+        .any(|key| map.get(*key).is_some_and(|value| !value.is_null()));
+    let has_partial_identity = base
+        .and_then(|base| base.get("suit"))
+        .is_some_and(|value| !value.is_null())
+        && base
+            .and_then(|base| base.get("nominal"))
+            .is_some_and(|value| !value.is_null())
+        || map.get("suit").is_some_and(|value| !value.is_null())
+            && map.get("nominal").is_some_and(|value| !value.is_null());
+
+    has_partial_identity && !has_authoritative_identity
+}
+
 pub fn sanitize(value: Value) -> Value {
     match value {
         Value::Array(items) => Value::Array(items.into_iter().map(sanitize).collect()),
@@ -16,8 +36,9 @@ pub fn sanitize(value: Value) -> Value {
             map.remove("command");
             map.remove("raw_command");
             let hidden = matches!(map.get("face_down"), Some(Value::Bool(true)))
+                || matches!(map.get("hidden"), Some(Value::Bool(true)))
                 || matches!(map.get("facing"), Some(Value::String(x)) if x == "back");
-            if hidden {
+            if hidden || incomplete_card_identity(&map) {
                 return json!({"index": map.get("index"), "instance_id": map.get("instance_id"), "hidden": true});
             }
             Value::Object(
@@ -199,6 +220,20 @@ mod tests {
         let result = sanitize(input);
         assert_eq!(result["hidden"], true);
         assert!(result.get("facing").is_none());
+    }
+
+    #[test]
+    fn sanitize_hides_incomplete_nominal_card_identity() {
+        let input = json!({
+            "index": 4,
+            "instance_id": 99,
+            "base": {"nominal": 10, "suit": "Diamonds"}
+        });
+        let result = sanitize(input);
+        assert_eq!(result["index"], 4);
+        assert_eq!(result["instance_id"], 99);
+        assert_eq!(result["hidden"], true);
+        assert!(result.get("base").is_none());
     }
 
     #[test]
