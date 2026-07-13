@@ -70,6 +70,9 @@ pub struct ActionParams {
     /// Optional 1-based hand positions for play_selected/discard_selected.
     #[serde(default)]
     pub card_indices: Vec<usize>,
+    /// Optional 1-based hand positions targeted by a consumable.
+    #[serde(default)]
+    pub target_indices: Vec<usize>,
 }
 pub fn settle_timeout() -> f64 {
     12.0
@@ -178,12 +181,46 @@ pub struct ReplayLogParams {
     pub jokers: Vec<String>,
     #[serde(default)]
     pub steps: Vec<String>,
+    /// Structured replay steps; preferred over the legacy comma-delimited form.
+    #[serde(default)]
+    pub structured_steps: Vec<ReplayStepInput>,
     #[serde(default)]
     pub dollars_start: Option<i64>,
     #[serde(default)]
     pub dollars_end: Option<i64>,
     #[serde(default)]
     pub notes: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ReplayStepInput {
+    pub action_type: String,
+    #[serde(default)]
+    pub details: String,
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub hand_type: String,
+    #[serde(default)]
+    pub cards_held: Option<String>,
+    #[serde(default)]
+    pub cards_discarded: Option<String>,
+    #[serde(default)]
+    pub discard_count: i64,
+    #[serde(default)]
+    pub final_cards: Option<String>,
+    #[serde(default)]
+    pub base_chips: Option<i64>,
+    #[serde(default)]
+    pub base_mult: Option<i64>,
+    #[serde(default)]
+    pub final_score: Option<i64>,
+    #[serde(default)]
+    pub consumable_name: Option<String>,
+    #[serde(default)]
+    pub consumable_target_hand: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
 }
 pub fn default_replay_outcome() -> String {
     "fail".into()

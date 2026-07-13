@@ -528,6 +528,20 @@ mod tests {
         assert_eq!(non_contiguous_command["cards"], json!([4, 5]));
         assert_eq!(non_contiguous_command["card_ids"], json!(["1617", "1604"]));
 
+        let targeted_consumable = json!({
+            "action": "use_consumable",
+            "card_index": 1,
+            "targets": [2, 4]
+        });
+        let targeted_command = super::policy_action_command(
+            Some(&targeted_consumable),
+            "use_consumable_1",
+            "decision",
+        )
+        .unwrap();
+        assert_eq!(targeted_command["action"], "use");
+        assert_eq!(targeted_command["targets"], json!([2, 4]));
+
         let cases = [
             (json!({"action":"discard","card_indices":[1]}), "discard"),
             (

@@ -373,6 +373,7 @@ impl Server {
             .await
             .strategy()
             .unwrap_or_else(|_| json!({"rules":[]}));
+        let replay_context = self.replay_context(&state).await;
         let object = state
             .as_object_mut()
             .expect("policy state must be an object");
@@ -383,9 +384,65 @@ impl Server {
             "active_directives".into(),
             active_directives(&directives, &observation),
         );
+        object.insert("replay_context".into(), replay_context);
         object.insert("score_analysis".into(), score.clone());
         object.insert("estimate_quality".into(), score["estimate_quality"].clone());
         Ok(state)
+    }
+
+    async fn replay_context(&self, state: &Value) -> Value {
+        let game_state = state
+            .pointer("/game/state")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let run = state.get("run").and_then(Value::as_object);
+        let ante = run
+            .and_then(|value| value.get("ante"))
+            .and_then(Value::as_i64)
+            .unwrap_or(1);
+        let stake = run
+            .and_then(|value| value.get("stake"))
+            .and_then(Value::as_i64)
+            .unwrap_or(1);
+        let blind = run.and_then(|value| value.get("blind"));
+        let blind_key = blind.and_then(|value| {
+            ["key", "blind_key", "id", "name"]
+                .into_iter()
+                .find_map(|key| value.get(key).and_then(Value::as_str))
+        });
+        let review_required = matches!(game_state, "BLIND_SELECT" | "SELECTING_HAND");
+        let log_required = matches!(game_state, "ROUND_EVAL" | "GAME_OVER");
+        let query = self.replay_db.lock().await.query_replays(
+            Some(SEED),
+            Some(ante),
+            Some(stake),
+            blind_key,
+            None,
+            true,
+        );
+        match query {
+            Ok(replays) => json!({
+                "review_required": review_required,
+                "log_required_after_resolution": log_required,
+                "seed": SEED,
+                "ante": ante,
+                "stake": stake,
+                "blind_key": blind_key,
+                "matching_replays": replays,
+                "instruction": "Review matching clear/failure history before committing to this blind; log the outcome immediately after resolution."
+            }),
+            Err(error) => json!({
+                "review_required": review_required,
+                "log_required_after_resolution": log_required,
+                "seed": SEED,
+                "ante": ante,
+                "stake": stake,
+                "blind_key": blind_key,
+                "matching_replays": [],
+                "error": error,
+                "instruction": "Replay history could not be read; continue only with an explicit strategy decision and record the outcome after resolution."
+            }),
+        }
     }
 
     async fn compact_policy(&self, limit: u32) -> Result<Value, String> {
@@ -981,7 +1038,7 @@ impl Server {
                 })
             })
             .cloned();
-        let action = match selected {
+        let mut action = match selected {
             None => match resolve_encoded_selection_action(&current, &params.action_id) {
                 Some(action) => action,
                 None => {
@@ -1023,6 +1080,30 @@ impl Server {
                 }
             }
         };
+        if action.get("action").and_then(Value::as_str) == Some("use_consumable")
+            && !params.target_indices.is_empty()
+        {
+            let hand_len = current
+                .pointer("/hand")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let mut seen = HashSet::new();
+            if params
+                .target_indices
+                .iter()
+                .any(|index| *index == 0 || *index > hand_len || !seen.insert(*index))
+            {
+                return to_tool_result(envelope(
+                    false,
+                    current,
+                    "invalid_arguments",
+                    "target_indices must be distinct 1-based positions in the current hand",
+                ));
+            }
+            if let Some(object) = action.as_object_mut() {
+                object.insert("targets".into(), json!(params.target_indices));
+            }
+        }
         let ipc = self.ipc.clone();
         let action_id = params.action_id.clone();
         let decision_id = current_decision_id.clone();
@@ -1364,7 +1445,7 @@ impl Server {
         }
     }
     #[tool(
-        description = "Query prior replay lines for the required seed, ante, stake, blind, and outcome."
+        description = "Query prior fixed-seed replay evidence. Use before every blind with the current ante, stake, and blind; review clears and failures before choosing an action."
     )]
     async fn query_replays(
         &self,
@@ -1389,7 +1470,7 @@ impl Server {
         }
     }
     #[tool(
-        description = "Log a blind clear or failure for the required seed. Use immediately after resolution."
+        description = "Log a fixed-seed blind clear or failure immediately after resolution. Prefer structured_steps for durable replay evidence."
     )]
     async fn log_replay(
         &self,
@@ -1423,7 +1504,7 @@ impl Server {
                 })
                 .collect();
             // Parse steps into the complex tuple format
-            let steps: Vec<(
+            let mut steps: Vec<(
                 String,
                 String,
                 Option<String>,
@@ -1523,6 +1604,24 @@ impl Server {
                     )
                 })
                 .collect();
+            steps.extend(params.structured_steps.iter().map(|step| {
+                (
+                    step.action_type.clone(),
+                    step.details.clone(),
+                    step.rationale.clone(),
+                    step.hand_type.clone(),
+                    step.cards_held.clone(),
+                    step.cards_discarded.clone(),
+                    step.discard_count,
+                    step.final_cards.clone(),
+                    step.base_chips,
+                    step.base_mult,
+                    step.final_score,
+                    step.consumable_name.clone(),
+                    step.consumable_target_hand.clone(),
+                    step.notes.clone(),
+                )
+            }));
             // Parse vouchers from notes if present, otherwise empty
             let vouchers: Vec<&str> = vec![];
             // Parse hand levels from notes if present, otherwise empty
@@ -1801,7 +1900,7 @@ impl rmcp::ServerHandler for Server {
                 .with_description("Rust stdio boundary for safe Balatro gameplay."),
         )
         .with_instructions(
-            "Use only these MCP tools. Start with game_status, recover seed 2K9H9HN with start_new_run when needed, then get_decision. Execute only current legal actions with decision_id; refresh on stale_decision. Use play_selected/discard_selected with distinct 1-based card_indices. get_decision is compact by default; use detail=full only for analysis. Page actions until legal_actions_next_offset is null. observe summary/hand/build/blind are compact; all is diagnostic. In ROUND_EVAL use proceed_round, then next_round in SHOP.",
+            "Use only these MCP tools. Start with game_status, recover seed 2K9H9HN with start_new_run when needed, then get_decision. Before every strategic action inspect decision_checks.consumables: use_consumable actions are legal during active hand play and other non-terminal states, not only in SHOP or BLIND_SELECT. Execute only current legal actions with decision_id; refresh on stale_decision. Use target_indices for targeted consumables and 1-based card_indices for play_selected/discard_selected. Query replay_context and prior replay evidence before every blind; log the clear/failure immediately after resolution, then record durable lessons or strategy evidence when justified. get_decision is compact by default; detail=full is available for analysis. Page actions until legal_actions_next_offset is null. observe summary/hand/build/blind are compact; all is diagnostic. In ROUND_EVAL use proceed_round, then next_round in SHOP.",
         )
     }
     #[cfg_attr(coverage_nightly, coverage(off))]
@@ -1899,7 +1998,8 @@ mod tests {
                     action_id: String::new(),
                     decision_id: String::new(),
                     settle_timeout: 12.0,
-                    card_indices: vec![]
+                    card_indices: vec![],
+                    target_indices: vec![]
                 }))
                 .await
                 .is_ok()
@@ -1972,6 +2072,7 @@ mod tests {
                     decision_id: "d3-test".into(),
                     settle_timeout: 12.0,
                     card_indices: vec![],
+                    target_indices: vec![],
                 }))
                 .await
                 .is_ok()
@@ -2015,6 +2116,7 @@ mod tests {
                         blind_key: "Small".into(),
                         jokers: vec![],
                         steps: vec![],
+                        structured_steps: vec![],
                         dollars_start: None,
                         dollars_end: None,
                         notes: String::new(),
@@ -2040,6 +2142,7 @@ mod tests {
                     blind_key: "Boss".into(),
                     jokers: vec!["Joker,Foil,Bonus".into(), "Joker,,".into()],
                     steps: vec![step, sparse_step],
+                    structured_steps: vec![],
                     dollars_start: Some(10),
                     dollars_end: Some(20),
                     notes: "full fixture".into(),
@@ -2081,6 +2184,52 @@ mod tests {
         let all = all.structured_content.unwrap();
         assert_eq!(all["ok"], true);
         assert_eq!(all["data"]["replays"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn replay_context_and_structured_steps_are_available() {
+        let (_dir, server) = server();
+        let context = server
+            .replay_context(&json!({
+                "game": {"state": "BLIND_SELECT"},
+                "run": {"ante": 2, "stake": 1, "blind": {"key": "S_1"}}
+            }))
+            .await;
+        assert_eq!(context["review_required"], true);
+        assert_eq!(context["ante"], 2);
+        assert!(context["matching_replays"].is_array());
+
+        let result = server
+            .log_replay(Parameters(ReplayLogParams {
+                outcome: "clear".into(),
+                ante: 2,
+                stake: 1,
+                blind_key: "S_1".into(),
+                jokers: vec![],
+                steps: vec![],
+                structured_steps: vec![ReplayStepInput {
+                    action_type: "use_consumable".into(),
+                    details: "used Neptune".into(),
+                    rationale: Some("leveled Straight Flush".into()),
+                    hand_type: "Straight Flush".into(),
+                    cards_held: None,
+                    cards_discarded: None,
+                    discard_count: 0,
+                    final_cards: None,
+                    base_chips: None,
+                    base_mult: None,
+                    final_score: None,
+                    consumable_name: Some("Neptune".into()),
+                    consumable_target_hand: Some("Straight Flush".into()),
+                    notes: None,
+                }],
+                dollars_start: None,
+                dollars_end: None,
+                notes: String::new(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.structured_content.unwrap()["ok"], true);
     }
 
     #[tokio::test]
@@ -2496,7 +2645,8 @@ mod tests {
                     action_id: "play_a".into(),
                     decision_id: "stale".into(),
                     settle_timeout: 1.0,
-                    card_indices: vec![]
+                    card_indices: vec![],
+                    target_indices: vec![]
                 }))
                 .await
                 .is_ok()
@@ -2507,7 +2657,8 @@ mod tests {
                     action_id: "play_a".into(),
                     decision_id: decision.clone(),
                     settle_timeout: 1.0,
-                    card_indices: vec![]
+                    card_indices: vec![],
+                    target_indices: vec![]
                 }))
                 .await
                 .is_ok()
@@ -2536,7 +2687,8 @@ mod tests {
                     action_id: "play_a".into(),
                     decision_id: decision,
                     settle_timeout: 1.0,
-                    card_indices: vec![]
+                    card_indices: vec![],
+                    target_indices: vec![]
                 }))
                 .await
                 .is_ok()
@@ -2684,6 +2836,7 @@ mod tests {
                     blind_key: "x".into(),
                     jokers: vec![],
                     steps: vec![],
+                    structured_steps: vec![],
                     dollars_start: None,
                     dollars_end: None,
                     notes: String::new()
@@ -2700,6 +2853,7 @@ mod tests {
                     blind_key: "x".into(),
                     jokers: vec![],
                     steps: vec![],
+                    structured_steps: vec![],
                     dollars_start: None,
                     dollars_end: None,
                     notes: String::new()
@@ -2846,7 +3000,8 @@ mod tests {
                     action_id: "x".into(),
                     decision_id: "d".into(),
                     settle_timeout: 1.0,
-                    card_indices: vec![]
+                    card_indices: vec![],
+                    target_indices: vec![]
                 }))
                 .await
                 .is_ok()
@@ -2886,7 +3041,8 @@ mod tests {
                     action_id: "x".into(),
                     decision_id: "d".into(),
                     settle_timeout: 1.0,
-                    card_indices: vec![]
+                    card_indices: vec![],
+                    target_indices: vec![]
                 }))
                 .await
                 .is_ok()
@@ -2914,7 +3070,8 @@ mod tests {
                     action_id: "x".into(),
                     decision_id: "d".into(),
                     settle_timeout: 1.0,
-                    card_indices: vec![]
+                    card_indices: vec![],
+                    target_indices: vec![]
                 }))
                 .await
                 .is_ok()
