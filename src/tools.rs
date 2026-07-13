@@ -305,6 +305,7 @@ fn resolve_hand_selection_action(
     policy: &Value,
     template: &Value,
     card_indices: &[usize],
+    expected_card_ids: &[Value],
 ) -> Result<Value, String> {
     let action = template
         .get("action")
@@ -315,6 +316,9 @@ fn resolve_hand_selection_action(
     }
     if card_indices.is_empty() {
         return Err("card_indices must contain at least one 1-based hand position".into());
+    }
+    if !expected_card_ids.is_empty() && expected_card_ids.len() != card_indices.len() {
+        return Err("card_ids must contain one identifier for each card_indices entry".into());
     }
 
     let hand = policy
@@ -334,7 +338,7 @@ fn resolve_hand_selection_action(
 
     let mut seen = HashSet::with_capacity(card_indices.len());
     let mut card_ids = Vec::with_capacity(card_indices.len());
-    for index in card_indices {
+    for (position, index) in card_indices.iter().enumerate() {
         if *index == 0 || *index > hand.len() {
             return Err(format!(
                 "hand card index {index} is not available; indices are 1-based"
@@ -357,6 +361,24 @@ fn resolve_hand_selection_action(
             })
             .filter(|value| !value.is_empty())
             .ok_or_else(|| format!("hand card index {index} has no stable card id"))?;
+        if let Some(expected_id) = expected_card_ids.get(position) {
+            let expected_id = expected_id
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| (!expected_id.is_null()).then(|| expected_id.to_string()))
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "card_ids entry {} is not a usable card identifier",
+                        position + 1
+                    )
+                })?;
+            if expected_id != id {
+                return Err(format!(
+                    "card id mismatch at 1-based hand index {index}: expected {expected_id}, found {id}"
+                ));
+            }
+        }
         card_ids.push(id);
     }
 
@@ -1139,7 +1161,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Execute exactly one current legal action using action_id and a non-empty decision_id. Strategic actions require concise why_this_action rationale, with optional alternatives_considered, expected_outcome, and confidence (0..1); routine safe transitions do not. For play/discard, use the legal play_selected or discard_selected action with distinct 1-based card_indices. If the live state changes and stale_decision is returned, refresh and retry with the returned ids."
+        description = "Execute exactly one current legal action using action_id and a non-empty decision_id. Strategic actions require concise why_this_action rationale, with optional alternatives_considered, expected_outcome, and confidence (0..1); routine safe transitions do not. For play/discard, use the legal play_selected or discard_selected action with distinct 1-based card_indices and, when available, matching card_ids from the same current hand. If the live state changes and stale_decision is returned, refresh and retry with the returned ids."
     )]
     async fn take_action(
         &self,
@@ -1217,7 +1239,12 @@ impl Server {
                             "card_indices is required for play_selected/discard_selected",
                         ));
                     }
-                    match resolve_hand_selection_action(&current, &selected, &params.card_indices) {
+                    match resolve_hand_selection_action(
+                        &current,
+                        &selected,
+                        &params.card_indices,
+                        &params.card_ids,
+                    ) {
                         Ok(action) => action,
                         Err(error) => {
                             return to_tool_result(envelope(
@@ -2207,7 +2234,7 @@ impl rmcp::ServerHandler for Server {
                 .with_description("Rust stdio boundary for safe Balatro gameplay."),
         )
         .with_instructions(
-            "Use only these MCP tools. Start with game_status, recover seed 2K9H9HN with start_new_run when needed, then get_decision. Before every strategic action inspect decision_checks and replay_context, state why_this_action is preferred, and include alternatives_considered or expected_outcome when useful; missing rationale is rejected. use_consumable actions are legal during active hand play and other non-terminal states. Execute only current legal actions with decision_id; refresh on stale_decision. Use target_indices for targeted consumables and 1-based card_indices for play_selected/discard_selected. Review prior reasoning before every blind; log the clear/failure immediately after resolution, then record durable lessons or strategy evidence when justified. get_decision is compact by default; detail=full is available for analysis. Page actions until legal_actions_next_offset is null. observe summary/hand/build/blind are compact; all is diagnostic. In ROUND_EVAL use proceed_round, then next_round in SHOP. Shared-runtime mutations may return mutation_busy: wait and reread state instead of retrying an old action. A successful action with decision_record.stored=false has only a nonfatal audit warning.",
+            "Use only these MCP tools. Start with game_status, recover seed 2K9H9HN with start_new_run when needed, then get_decision. Before every strategic action inspect decision_checks and replay_context, state why_this_action is preferred, and include alternatives_considered or expected_outcome when useful; missing rationale is rejected. use_consumable actions are legal during active hand play and other non-terminal states. Execute only current legal actions with decision_id; refresh on stale_decision. Use target_indices for targeted consumables and exact 1-based card_indices for play_selected/discard_selected. When hand_analysis.best_play is used, card_indices is the complete evaluated selection; use its aligned card_ids and cards from the same decision, and do not confuse scoring_card_indices with the full selection. Review prior reasoning before every blind; log the clear/failure immediately after resolution, then record durable lessons or strategy evidence when justified. get_decision is compact by default; detail=full is available for analysis. Page actions until legal_actions_next_offset is null. observe summary/hand/build/blind are compact; all is diagnostic. In ROUND_EVAL use proceed_round, then next_round in SHOP. Shared-runtime mutations may return mutation_busy: wait and reread state instead of retrying an old action. A successful action with decision_record.stored=false has only a nonfatal audit warning.",
         )
     }
     #[cfg_attr(coverage_nightly, coverage(off))]
@@ -2332,6 +2359,7 @@ mod tests {
                     decision_id: String::new(),
                     settle_timeout: 12.0,
                     card_indices: vec![],
+                    card_ids: vec![],
                     target_indices: vec![],
                     why_this_action: String::new(),
                     alternatives_considered: None,
@@ -2409,6 +2437,7 @@ mod tests {
                     decision_id: "d3-test".into(),
                     settle_timeout: 12.0,
                     card_indices: vec![],
+                    card_ids: vec![],
                     target_indices: vec![],
                     why_this_action: "test action".into(),
                     alternatives_considered: None,
@@ -2987,6 +3016,7 @@ mod tests {
                     decision_id: "stale".into(),
                     settle_timeout: 1.0,
                     card_indices: vec![],
+                    card_ids: vec![],
                     target_indices: vec![],
                     why_this_action: "test action".into(),
                     alternatives_considered: None,
@@ -3003,6 +3033,7 @@ mod tests {
                     decision_id: decision.clone(),
                     settle_timeout: 1.0,
                     card_indices: vec![],
+                    card_ids: vec![],
                     target_indices: vec![],
                     why_this_action: "test action".into(),
                     alternatives_considered: None,
@@ -3037,6 +3068,7 @@ mod tests {
                     decision_id: decision,
                     settle_timeout: 1.0,
                     card_indices: vec![],
+                    card_ids: vec![],
                     target_indices: vec![],
                     why_this_action: "test action".into(),
                     alternatives_considered: None,
@@ -3315,14 +3347,25 @@ mod tests {
             .iter()
             .find(|action| action["action_id"] == "play_selected")
             .unwrap();
-        let resolved = resolve_hand_selection_action(&canonical, template, &[4, 5]).unwrap();
+        let resolved = resolve_hand_selection_action(&canonical, template, &[4, 5], &[]).unwrap();
         assert_eq!(resolved["card_indices"], json!([4, 5]));
         assert_eq!(resolved["card_ids"], json!(["d", "e"]));
+        let resolved_with_ids =
+            resolve_hand_selection_action(&canonical, template, &[4, 5], &[json!("d"), json!("e")])
+                .unwrap();
+        assert_eq!(resolved_with_ids["card_ids"], json!(["d", "e"]));
+        assert!(
+            resolve_hand_selection_action(&canonical, template, &[4, 5], &[json!("e"), json!("d")])
+                .is_err()
+        );
+        assert!(
+            resolve_hand_selection_action(&canonical, template, &[4, 5], &[json!("d")]).is_err()
+        );
         let encoded = resolve_encoded_selection_action(&canonical, "play_d_e").unwrap();
         assert_eq!(encoded["card_indices"], json!([4, 5]));
         assert_eq!(encoded["card_ids"], json!(["d", "e"]));
-        assert!(resolve_hand_selection_action(&canonical, template, &[0, 5]).is_err());
-        assert!(resolve_hand_selection_action(&canonical, template, &[4, 4]).is_err());
+        assert!(resolve_hand_selection_action(&canonical, template, &[0, 5], &[]).is_err());
+        assert!(resolve_hand_selection_action(&canonical, template, &[4, 4], &[]).is_err());
 
         let mut page = json!({
             "legal_actions": [
@@ -3354,6 +3397,7 @@ mod tests {
                     decision_id: "d".into(),
                     settle_timeout: 1.0,
                     card_indices: vec![],
+                    card_ids: vec![],
                     target_indices: vec![],
                     why_this_action: "test action".into(),
                     alternatives_considered: None,
@@ -3399,6 +3443,7 @@ mod tests {
                     decision_id: "d".into(),
                     settle_timeout: 1.0,
                     card_indices: vec![],
+                    card_ids: vec![],
                     target_indices: vec![],
                     why_this_action: "test action".into(),
                     alternatives_considered: None,
@@ -3432,6 +3477,7 @@ mod tests {
                     decision_id: "d".into(),
                     settle_timeout: 1.0,
                     card_indices: vec![],
+                    card_ids: vec![],
                     target_indices: vec![],
                     why_this_action: "test action".into(),
                     alternatives_considered: None,

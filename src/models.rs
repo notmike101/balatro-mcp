@@ -70,6 +70,10 @@ pub struct ActionParams {
     /// Optional 1-based hand positions for play_selected/discard_selected.
     #[serde(default)]
     pub card_indices: Vec<usize>,
+    /// Optional card identifiers aligned with card_indices; when supplied they
+    /// must match the current hand at those 1-based positions.
+    #[serde(default)]
+    pub card_ids: Vec<serde_json::Value>,
     /// Optional 1-based hand positions targeted by a consumable.
     #[serde(default)]
     pub target_indices: Vec<usize>,

@@ -62,6 +62,33 @@ fn card_id_value(card: &Value) -> Value {
         .unwrap_or(Value::Null)
 }
 
+fn recommendation_card(card: &Value, index: usize) -> Value {
+    if scoring::card_is_hidden(card) {
+        return json!({
+            "index": index + 1,
+            "instance_id": card_id_value(card),
+            "hidden": true
+        });
+    }
+
+    let base = card.get("base").and_then(Value::as_object);
+    json!({
+        "index": index + 1,
+        "instance_id": card_id_value(card),
+        "rank": card.get("rank").or_else(|| base.and_then(|base| base.get("rank"))),
+        "suit": card.get("suit").or_else(|| base.and_then(|base| base.get("suit"))),
+        "base": {
+            "rank": base.and_then(|base| base.get("rank")),
+            "value": base.and_then(|base| base.get("value")),
+            "id": base.and_then(|base| base.get("id")),
+            "suit": base.and_then(|base| base.get("suit")),
+            "nominal": base.and_then(|base| base.get("nominal"))
+        },
+        "name": card.get("name"),
+        "face_down": card.get("face_down")
+    })
+}
+
 pub fn build_policy_state(
     observation: &Value,
     play_limit: usize,
@@ -221,7 +248,8 @@ pub fn compact_policy_state(full: &Value) -> Value {
             "rank": card.get("rank").or_else(|| card.pointer("/base/rank")),
             "suit": card.get("suit").or_else(|| card.pointer("/base/suit")),
             "base": card.get("base").map(|base| json!({
-                "rank": base.get("rank"), "suit": base.get("suit"), "nominal": base.get("nominal")
+                "rank": base.get("rank"), "value": base.get("value"), "id": base.get("id"),
+                "suit": base.get("suit"), "nominal": base.get("nominal")
             })),
             "edition": card.get("edition"),
             "seal": card.get("seal"),
@@ -328,10 +356,28 @@ pub fn compact_policy_state(full: &Value) -> Value {
             "reroll_action_ids": action_refs("/decision_checks/boss_debuff/reroll_actions")
         }
     });
+    let compact_hand_analysis = full
+        .pointer("/hand_analysis/best_play")
+        .map(|best_play| {
+            json!({
+                "best_play": {
+                    "hand_name": best_play.get("hand_name"),
+                    "card_indices": best_play.get("card_indices"),
+                    "card_ids": best_play.get("card_ids"),
+                    "cards": best_play.get("cards"),
+                    "scoring_card_indices": best_play.get("scoring_card_indices"),
+                    "estimated_score": best_play.get("estimated_score"),
+                    "score_kind": best_play.get("score_kind"),
+                    "estimate_quality": best_play.get("estimate_quality")
+                }
+            })
+        })
+        .unwrap_or_else(|| json!({}));
     json!({
         "schema": "balatro-mcp/policy-compact/v1",
         "game": {"state": full.pointer("/game/state"), "ante": run.get("ante"), "round": run.get("round"), "dollars": run.get("dollars"), "hands_left": run.get("hands_left"), "discards_left": run.get("discards_left"), "blind": blind},
         "score_pressure": full.get("score_pressure"),
+        "hand_analysis": compact_hand_analysis,
         "slots": full.get("slots"),
         "hand": cards("hand"), "jokers": cards("jokers"), "consumables": cards("consumables"),
         "legal_actions": compact_actions("/legal_actions"),
@@ -499,10 +545,43 @@ fn analyze_hands(source: &Value) -> Value {
     }
     let (indices, score) = best_play_subset(source);
     let analysis = score_hand(source, Some(&indices));
+    let playable = analysis.hand_name != "Unknown" && analysis.estimate_quality != "hidden_cards";
+    let card_indices: Vec<usize> = if playable {
+        indices.iter().map(|index| index + 1).collect()
+    } else {
+        Vec::new()
+    };
+    let card_ids: Vec<Value> = if playable {
+        indices
+            .iter()
+            .filter_map(|index| source.pointer("/areas/hand")?.get(*index))
+            .map(card_id_value)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let cards: Vec<Value> = if playable {
+        indices
+            .iter()
+            .filter_map(|index| source.pointer("/areas/hand")?.get(*index))
+            .enumerate()
+            .map(|(position, card)| recommendation_card(card, indices[position]))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let scoring_card_indices = if playable {
+        analysis.scoring_cards.clone()
+    } else {
+        Vec::new()
+    };
     json!({
         "best_play": {
             "hand_name": analysis.hand_name,
-            "card_indices": analysis.scoring_cards,
+            "card_indices": card_indices,
+            "card_ids": card_ids,
+            "cards": cards,
+            "scoring_card_indices": scoring_card_indices,
             "estimated_score": score,
             "score_kind": "estimate",
             "estimate_quality": analysis.estimate_quality
@@ -1019,11 +1098,100 @@ mod tests {
         assert_eq!(state["score_pressure"]["best_play_estimated_score"], 0);
         assert_eq!(state["score_pressure"]["best_play_clears_blind"], false);
         assert_eq!(state["hand_analysis"]["best_play"]["hand_name"], "Unknown");
+        assert_eq!(
+            state["hand_analysis"]["best_play"]["card_indices"],
+            json!([])
+        );
+        assert_eq!(state["hand_analysis"]["best_play"]["card_ids"], json!([]));
+        assert_eq!(state["hand_analysis"]["best_play"]["cards"], json!([]));
 
         let compact = compact_policy_state(&state);
         assert_eq!(compact["hand"][0]["hidden"], true);
         assert!(compact["hand"][0].get("base").is_none());
         assert!(compact["hand"][0].get("suit").is_none());
+    }
+
+    #[test]
+    fn best_play_mapping_matches_exact_eight_card_hand() {
+        let mut hand = Vec::new();
+        for (index, (instance_id, rank, suit, nominal)) in [
+            ("a", "A", "Clubs", 11),
+            ("b", "8", "Spades", 8),
+            ("c", "8", "Hearts", 8),
+            ("d", "7", "Hearts", 7),
+            ("e", "6", "Hearts", 6),
+            ("f", "4", "Hearts", 4),
+            ("g", "3", "Spades", 3),
+            ("h", "2", "Spades", 2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            hand.push(json!({
+                "index": index + 1,
+                "instance_id": instance_id,
+                "base": {"rank": rank, "value": rank, "id": rank, "suit": suit, "nominal": nominal}
+            }));
+        }
+        let observation = json!({
+            "game": {"state": "SELECTING_HAND"},
+            "run": {"hands_left": 3, "discards_left": 2, "blind": {"chips_required": 300}},
+            "areas": {"hand": hand},
+            "poker_hands": {"values": {
+                "High Card": {"chips": 5, "mult": 1},
+                "Pair": {"chips": 20, "mult": 2},
+                "Flush": {"chips": 35, "mult": 4}
+            }}
+        });
+
+        let state = build_policy_state(&observation, 40, 40, 60);
+        let best = &state["hand_analysis"]["best_play"];
+        assert_eq!(best["hand_name"], "Pair");
+        assert_ne!(best["hand_name"], "Flush");
+
+        let indices = best["card_indices"].as_array().unwrap();
+        let ids = best["card_ids"].as_array().unwrap();
+        let cards = best["cards"].as_array().unwrap();
+        assert_eq!(indices.len(), ids.len());
+        assert_eq!(indices.len(), cards.len());
+        assert!(!indices.is_empty());
+        for (position, index) in indices.iter().enumerate() {
+            let index = index.as_u64().unwrap() as usize;
+            assert!((1..=8).contains(&index));
+            let expected = &observation["areas"]["hand"][index - 1];
+            assert_eq!(ids[position], expected["instance_id"]);
+            assert_eq!(cards[position]["index"], json!(index));
+            assert_eq!(cards[position]["instance_id"], expected["instance_id"]);
+        }
+        for index in best["scoring_card_indices"].as_array().unwrap() {
+            assert!(indices.contains(index));
+        }
+
+        let compact = compact_policy_state(&state);
+        assert_eq!(
+            compact["hand_analysis"]["best_play"]["card_indices"],
+            best["card_indices"]
+        );
+        assert_eq!(
+            compact["hand_analysis"]["best_play"]["card_ids"],
+            best["card_ids"]
+        );
+    }
+
+    #[test]
+    fn compact_visible_cards_keep_authoritative_identity_fields() {
+        let mut source = observation("SELECTING_HAND");
+        source["areas"]["hand"][0] = json!({
+            "index": 1,
+            "instance_id": 101,
+            "base": {"rank": "A", "value": "A", "id": "A", "suit": "Clubs", "nominal": 11}
+        });
+        let state = build_policy_state(&source, 5, 5, 60);
+        let compact = compact_policy_state(&state);
+        assert_eq!(compact["hand"][0]["base"]["rank"], "A");
+        assert_eq!(compact["hand"][0]["base"]["value"], "A");
+        assert_eq!(compact["hand"][0]["base"]["id"], "A");
+        assert_ne!(compact["hand"][0].get("hidden"), Some(&Value::Bool(true)));
     }
 
     #[test]
