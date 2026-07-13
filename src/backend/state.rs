@@ -65,7 +65,15 @@ impl StateDB {
             CREATE TABLE IF NOT EXISTS strategy_rules (id TEXT PRIMARY KEY, kind TEXT NOT NULL, conditions TEXT NOT NULL, directive TEXT NOT NULL, absolute INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
             CREATE TABLE IF NOT EXISTS strategy_evidence (id INTEGER PRIMARY KEY, rule_id TEXT NOT NULL, outcome TEXT NOT NULL, event_id TEXT NOT NULL, note TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
             CREATE TABLE IF NOT EXISTS lessons (id INTEGER PRIMARY KEY, category TEXT NOT NULL, lesson TEXT NOT NULL, source TEXT NOT NULL, confidence REAL NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-            CREATE TABLE IF NOT EXISTS estimates (id INTEGER PRIMARY KEY, hand_type TEXT NOT NULL, estimated INTEGER NOT NULL, actual INTEGER NOT NULL, error_pct REAL NOT NULL, context TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);"#), "state schema")?;
+            CREATE TABLE IF NOT EXISTS estimates (id INTEGER PRIMARY KEY, hand_type TEXT NOT NULL, estimated INTEGER NOT NULL, actual INTEGER NOT NULL, error_pct REAL NOT NULL, context TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+            CREATE TABLE IF NOT EXISTS decision_records (
+                id INTEGER PRIMARY KEY, seed TEXT NOT NULL, ante INTEGER NOT NULL, stake INTEGER NOT NULL,
+                blind_key TEXT NOT NULL, decision_id TEXT NOT NULL, action_id TEXT NOT NULL,
+                action_type TEXT NOT NULL, rationale TEXT NOT NULL, alternatives TEXT,
+                expected_outcome TEXT, confidence REAL, before_state TEXT NOT NULL,
+                after_state TEXT NOT NULL, observed_outcome TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );"#), "state schema")?;
         Ok(conn)
     }
 
@@ -90,6 +98,59 @@ impl StateDB {
         })
         .map(|text| serde_json::from_str(&text).unwrap_or(Value::Null))
         .map_err(|_| "current run not found".into())
+    }
+
+    pub fn record_decision(&self, record: &Value) -> Result<Value, String> {
+        let conn = self.connection()?;
+        let text = serde_json::to_string(record).expect("decision record is serializable");
+        state_sql(conn.execute(
+            "INSERT INTO decision_records (seed, ante, stake, blind_key, decision_id, action_id, action_type, rationale, alternatives, expected_outcome, confidence, before_state, after_state, observed_outcome) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![
+                record["seed"].as_str().unwrap_or(""),
+                record["ante"].as_i64().unwrap_or(0),
+                record["stake"].as_i64().unwrap_or(0),
+                record["blind_key"].as_str().unwrap_or(""),
+                record["decision_id"].as_str().unwrap_or(""),
+                record["action_id"].as_str().unwrap_or(""),
+                record["action_type"].as_str().unwrap_or(""),
+                record["why_this_action"].as_str().unwrap_or(""),
+                record["alternatives_considered"].as_str(),
+                record["expected_outcome"].as_str(),
+                record["confidence"].as_f64(),
+                serde_json::to_string(&record["before_state"]).unwrap(),
+                serde_json::to_string(&record["after_state"]).unwrap(),
+                record["observed_outcome"].as_str().unwrap_or("unknown"),
+            ],
+        ), "decision record")?;
+        Ok(
+            json!({"decision_record_id": conn.last_insert_rowid(), "record": record, "stored": true, "payload": text}),
+        )
+    }
+
+    pub fn decision_records(
+        &self,
+        seed: &str,
+        ante: i64,
+        stake: i64,
+        blind_key: Option<&str>,
+        limit: u32,
+    ) -> Result<Value, String> {
+        let conn = self.connection()?;
+        let mut stmt = state_sql(conn.prepare(
+            "SELECT seed, ante, stake, blind_key, decision_id, action_id, action_type, rationale, alternatives, expected_outcome, confidence, before_state, after_state, observed_outcome, created_at FROM decision_records WHERE seed=? AND ante=? AND stake=? AND (? IS NULL OR blind_key LIKE '%' || ? || '%') ORDER BY id LIMIT ?"
+        ), "prepare decision records")?;
+        let rows = stmt.query_map(params![seed, ante, stake, blind_key, blind_key, limit.clamp(1, 500)], |row| {
+            let before: String = row.get(11)?;
+            let after: String = row.get(12)?;
+            Ok(json!({
+                "seed": row.get::<_, String>(0)?, "ante": row.get::<_, i64>(1)?, "stake": row.get::<_, i64>(2)?, "blind_key": row.get::<_, String>(3)?,
+                "decision_id": row.get::<_, String>(4)?, "action_id": row.get::<_, String>(5)?, "action_type": row.get::<_, String>(6)?,
+                "why_this_action": row.get::<_, String>(7)?, "alternatives_considered": row.get::<_, Option<String>>(8)?, "expected_outcome": row.get::<_, Option<String>>(9)?,
+                "confidence": row.get::<_, Option<f64>>(10)?, "before_state": serde_json::from_str::<Value>(&before).unwrap_or(Value::Null),
+                "after_state": serde_json::from_str::<Value>(&after).unwrap_or(Value::Null), "observed_outcome": row.get::<_, String>(13)?, "created_at": row.get::<_, String>(14)?
+            }))
+        }).map_err(|e| format!("query decision records: {e}"))?;
+        Ok(Value::Array(rows.filter_map(Result::ok).collect()))
     }
 
     pub fn events(&self, limit: u32) -> Result<Value, String> {
@@ -262,6 +323,33 @@ mod tests {
             .unwrap();
         db.record_estimate("Pair", 100, 120, &json!({})).unwrap();
         assert_eq!(db.estimation_report().unwrap()["count"], 1);
+    }
+
+    #[test]
+    fn decision_records_round_trip_and_filter_by_blind() {
+        let dir = tempdir().unwrap();
+        let db = StateDB::new(dir.path());
+        db.record_decision(&json!({
+            "seed": "2K9H9HN", "ante": 1, "stake": 1, "blind_key": "Small",
+            "decision_id": "d1", "action_id": "play_selected", "action_type": "play",
+            "why_this_action": "Best margin", "alternatives_considered": "Discard",
+            "expected_outcome": "Clear", "confidence": 0.9,
+            "before_state": {"state": "SELECTING_HAND"}, "after_state": {"state": "ROUND_EVAL"},
+            "observed_outcome": "state_changed"
+        }))
+        .unwrap();
+        let records = db
+            .decision_records("2K9H9HN", 1, 1, Some("Small"), 10)
+            .unwrap();
+        assert_eq!(records[0]["why_this_action"], "Best margin");
+        assert_eq!(records[0]["after_state"]["state"], "ROUND_EVAL");
+        assert!(
+            db.decision_records("2K9H9HN", 1, 1, Some("Boss"), 10)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

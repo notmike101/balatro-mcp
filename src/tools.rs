@@ -33,6 +33,89 @@ const CANONICAL_DISCARD_LIMIT: usize = 40;
 const CANONICAL_TARGET_LIMIT: usize = 60;
 const MAX_ACTION_PAGE: usize = 256;
 
+fn rationale_required(action: &Value) -> bool {
+    matches!(
+        action.get("action").and_then(Value::as_str),
+        Some("select_blind")
+            | Some("play")
+            | Some("discard")
+            | Some("use_consumable")
+            | Some("buy_card")
+            | Some("sell_card")
+            | Some("move_card")
+            | Some("move_joker")
+            | Some("choose_pack")
+    )
+}
+
+fn blind_key_from_policy(policy: &Value) -> String {
+    policy
+        .pointer("/run/blind")
+        .and_then(|blind| {
+            ["key", "blind_key", "id", "name"]
+                .into_iter()
+                .find_map(|key| blind.get(key).and_then(Value::as_str))
+        })
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn decision_records_as_replay_steps(records: &Value) -> Vec<ReplayStepInput> {
+    records
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|record| ReplayStepInput {
+            action_type: record["action_type"].as_str().unwrap_or("unknown").into(),
+            details: record["action_id"].as_str().unwrap_or("").into(),
+            rationale: record["why_this_action"].as_str().map(str::to_owned),
+            hand_type: String::new(),
+            cards_held: None,
+            cards_discarded: None,
+            discard_count: 0,
+            final_cards: None,
+            base_chips: None,
+            base_mult: None,
+            final_score: None,
+            consumable_name: None,
+            consumable_target_hand: None,
+            notes: Some(
+                json!({
+                    "alternatives_considered": record["alternatives_considered"],
+                    "expected_outcome": record["expected_outcome"],
+                    "observed_outcome": record["observed_outcome"],
+                    "decision_id": record["decision_id"],
+                    "before_state": record["before_state"],
+                    "after_state": record["after_state"]
+                })
+                .to_string(),
+            ),
+        })
+        .collect()
+}
+
+fn compact_reasoning_comparisons(records: &Value) -> Value {
+    Value::Array(
+        records
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|record| {
+                let expected = record["expected_outcome"].clone();
+                let actual = record["observed_outcome"].clone();
+                json!({
+                    "action": record["action_id"],
+                    "why": record["why_this_action"],
+                    "alternative": record["alternatives_considered"],
+                    "expected": expected,
+                    "actual": actual,
+                    "lesson_needed": expected != Value::Null && expected != actual
+                })
+            })
+            .collect(),
+    )
+}
+
 fn canonical_json(value: &Value) -> String {
     match value {
         Value::Null => "null".into(),
@@ -420,6 +503,12 @@ impl Server {
             None,
             true,
         );
+        let decision_records = self
+            .state_db
+            .lock()
+            .await
+            .decision_records(SEED, ante, stake, blind_key, 40)
+            .unwrap_or_else(|_| json!([]));
         match query {
             Ok(replays) => json!({
                 "review_required": review_required,
@@ -429,7 +518,9 @@ impl Server {
                 "stake": stake,
                 "blind_key": blind_key,
                 "matching_replays": replays,
-                "instruction": "Review matching clear/failure history before committing to this blind; log the outcome immediately after resolution."
+                "prior_decisions": decision_records,
+                "reasoning_comparisons": compact_reasoning_comparisons(&decision_records),
+                "instruction": "Review matching clear/failure history and prior decision reasoning before committing to this blind; state why each strategic action is preferred, then log the outcome immediately after resolution."
             }),
             Err(error) => json!({
                 "review_required": review_required,
@@ -439,6 +530,8 @@ impl Server {
                 "stake": stake,
                 "blind_key": blind_key,
                 "matching_replays": [],
+                "prior_decisions": decision_records,
+                "reasoning_comparisons": compact_reasoning_comparisons(&decision_records),
                 "error": error,
                 "instruction": "Replay history could not be read; continue only with an explicit strategy decision and record the outcome after resolution."
             }),
@@ -977,7 +1070,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Execute exactly one current legal action using action_id and a non-empty decision_id. For play/discard, use the legal play_selected or discard_selected action with any distinct 1-based card_indices needed for the intended hand, up to the live play limit. If the live state changes and stale_decision is returned, use the returned current decision_id and legal_actions, then retry the action. The current legal action set is authoritative because bridge polling can refresh snapshots between tool calls; mutations are serialized and checkpointed."
+        description = "Execute exactly one current legal action using action_id and a non-empty decision_id. Strategic actions require concise why_this_action rationale, with optional alternatives_considered, expected_outcome, and confidence (0..1); routine safe transitions do not. For play/discard, use the legal play_selected or discard_selected action with distinct 1-based card_indices. If the live state changes and stale_decision is returned, refresh and retry with the returned ids."
     )]
     async fn take_action(
         &self,
@@ -1104,9 +1197,38 @@ impl Server {
                 object.insert("targets".into(), json!(params.target_indices));
             }
         }
+        if rationale_required(&action) {
+            if params.why_this_action.trim().is_empty() {
+                return to_tool_result(envelope(
+                    false,
+                    current,
+                    "missing_rationale",
+                    "why_this_action is required for strategic actions",
+                ));
+            }
+            if params
+                .confidence
+                .is_some_and(|value| !(0.0..=1.0).contains(&value))
+            {
+                return to_tool_result(envelope(
+                    false,
+                    current,
+                    "invalid_arguments",
+                    "confidence must be between 0 and 1",
+                ));
+            }
+        }
         let ipc = self.ipc.clone();
         let action_id = params.action_id.clone();
+        let record_action_id = action_id.clone();
+        let action_type = action
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        let record_action = action.clone();
         let decision_id = current_decision_id.clone();
+        let record_decision_id = decision_id.clone();
         let before_decision_id = current_decision_id.clone();
         let before_state = current
             .pointer("/game/state")
@@ -1176,6 +1298,33 @@ impl Server {
                         "action_failed",
                         "bridge acknowledged the action but the live decision did not change",
                     ));
+                }
+                if rationale_required(&record_action) {
+                    let run = current.get("run").and_then(Value::as_object);
+                    let record = json!({
+                        "seed": SEED,
+                        "ante": run.and_then(|value| value.get("ante")).and_then(Value::as_i64).unwrap_or(0),
+                        "stake": run.and_then(|value| value.get("stake")).and_then(Value::as_i64).unwrap_or(0),
+                        "blind_key": blind_key_from_policy(&current),
+                        "decision_id": record_decision_id,
+                        "action_id": record_action_id,
+                        "action_type": action_type,
+                        "why_this_action": params.why_this_action.trim(),
+                        "alternatives_considered": params.alternatives_considered,
+                        "expected_outcome": params.expected_outcome,
+                        "confidence": params.confidence,
+                        "before_state": current,
+                        "after_state": next,
+                        "observed_outcome": "state_changed"
+                    });
+                    if let Err(error) = self.state_db.lock().await.record_decision(&record) {
+                        return to_tool_result(envelope(
+                            false,
+                            next,
+                            "decision_record_failed",
+                            &error,
+                        ));
+                    }
                 }
                 to_tool_result(envelope(true, next, "", ""))
             }
@@ -1622,6 +1771,42 @@ impl Server {
                     step.notes.clone(),
                 )
             }));
+            if steps.is_empty() {
+                let records = self
+                    .state_db
+                    .lock()
+                    .await
+                    .decision_records(
+                        SEED,
+                        params.ante,
+                        params.stake,
+                        Some(&params.blind_key),
+                        500,
+                    )
+                    .unwrap_or_else(|_| json!([]));
+                steps.extend(
+                    decision_records_as_replay_steps(&records)
+                        .into_iter()
+                        .map(|step| {
+                            (
+                                step.action_type,
+                                step.details,
+                                step.rationale,
+                                step.hand_type,
+                                step.cards_held,
+                                step.cards_discarded,
+                                step.discard_count,
+                                step.final_cards,
+                                step.base_chips,
+                                step.base_mult,
+                                step.final_score,
+                                step.consumable_name,
+                                step.consumable_target_hand,
+                                step.notes,
+                            )
+                        }),
+                );
+            }
             // Parse vouchers from notes if present, otherwise empty
             let vouchers: Vec<&str> = vec![];
             // Parse hand levels from notes if present, otherwise empty
@@ -1662,11 +1847,45 @@ impl Server {
             }
         } else {
             // Fail outcome
-            match self.replay_db.lock().await.log_fail(
+            let records = self
+                .state_db
+                .lock()
+                .await
+                .decision_records(
+                    SEED,
+                    params.ante,
+                    params.stake,
+                    Some(&params.blind_key),
+                    500,
+                )
+                .unwrap_or_else(|_| json!([]));
+            let steps: Vec<_> = decision_records_as_replay_steps(&records)
+                .into_iter()
+                .map(|step| {
+                    (
+                        step.action_type,
+                        step.details,
+                        step.rationale,
+                        step.hand_type,
+                        step.cards_held,
+                        step.cards_discarded,
+                        step.discard_count,
+                        step.final_cards,
+                        step.base_chips,
+                        step.base_mult,
+                        step.final_score,
+                        step.consumable_name,
+                        step.consumable_target_hand,
+                        step.notes,
+                    )
+                })
+                .collect();
+            match self.replay_db.lock().await.log_fail_with_steps(
                 SEED,
                 params.ante,
                 params.stake,
                 &params.blind_key,
+                &steps,
             ) {
                 Ok(rid) => to_tool_result(envelope(
                     true,
@@ -1900,7 +2119,7 @@ impl rmcp::ServerHandler for Server {
                 .with_description("Rust stdio boundary for safe Balatro gameplay."),
         )
         .with_instructions(
-            "Use only these MCP tools. Start with game_status, recover seed 2K9H9HN with start_new_run when needed, then get_decision. Before every strategic action inspect decision_checks.consumables: use_consumable actions are legal during active hand play and other non-terminal states, not only in SHOP or BLIND_SELECT. Execute only current legal actions with decision_id; refresh on stale_decision. Use target_indices for targeted consumables and 1-based card_indices for play_selected/discard_selected. Query replay_context and prior replay evidence before every blind; log the clear/failure immediately after resolution, then record durable lessons or strategy evidence when justified. get_decision is compact by default; detail=full is available for analysis. Page actions until legal_actions_next_offset is null. observe summary/hand/build/blind are compact; all is diagnostic. In ROUND_EVAL use proceed_round, then next_round in SHOP.",
+            "Use only these MCP tools. Start with game_status, recover seed 2K9H9HN with start_new_run when needed, then get_decision. Before every strategic action inspect decision_checks and replay_context, state why_this_action is preferred, and include alternatives_considered or expected_outcome when useful; missing rationale is rejected. use_consumable actions are legal during active hand play and other non-terminal states. Execute only current legal actions with decision_id; refresh on stale_decision. Use target_indices for targeted consumables and 1-based card_indices for play_selected/discard_selected. Review prior reasoning before every blind; log the clear/failure immediately after resolution, then record durable lessons or strategy evidence when justified. get_decision is compact by default; detail=full is available for analysis. Page actions until legal_actions_next_offset is null. observe summary/hand/build/blind are compact; all is diagnostic. In ROUND_EVAL use proceed_round, then next_round in SHOP.",
         )
     }
     #[cfg_attr(coverage_nightly, coverage(off))]
@@ -1999,7 +2218,11 @@ mod tests {
                     decision_id: String::new(),
                     settle_timeout: 12.0,
                     card_indices: vec![],
-                    target_indices: vec![]
+                    target_indices: vec![],
+                    why_this_action: String::new(),
+                    alternatives_considered: None,
+                    expected_outcome: None,
+                    confidence: None
                 }))
                 .await
                 .is_ok()
@@ -2073,6 +2296,10 @@ mod tests {
                     settle_timeout: 12.0,
                     card_indices: vec![],
                     target_indices: vec![],
+                    why_this_action: "test action".into(),
+                    alternatives_considered: None,
+                    expected_outcome: None,
+                    confidence: None,
                 }))
                 .await
                 .is_ok()
@@ -2646,7 +2873,11 @@ mod tests {
                     decision_id: "stale".into(),
                     settle_timeout: 1.0,
                     card_indices: vec![],
-                    target_indices: vec![]
+                    target_indices: vec![],
+                    why_this_action: "test action".into(),
+                    alternatives_considered: None,
+                    expected_outcome: None,
+                    confidence: None
                 }))
                 .await
                 .is_ok()
@@ -2658,7 +2889,11 @@ mod tests {
                     decision_id: decision.clone(),
                     settle_timeout: 1.0,
                     card_indices: vec![],
-                    target_indices: vec![]
+                    target_indices: vec![],
+                    why_this_action: "test action".into(),
+                    alternatives_considered: None,
+                    expected_outcome: None,
+                    confidence: None
                 }))
                 .await
                 .is_ok()
@@ -2688,7 +2923,11 @@ mod tests {
                     decision_id: decision,
                     settle_timeout: 1.0,
                     card_indices: vec![],
-                    target_indices: vec![]
+                    target_indices: vec![],
+                    why_this_action: "test action".into(),
+                    alternatives_considered: None,
+                    expected_outcome: None,
+                    confidence: None
                 }))
                 .await
                 .is_ok()
@@ -3001,7 +3240,11 @@ mod tests {
                     decision_id: "d".into(),
                     settle_timeout: 1.0,
                     card_indices: vec![],
-                    target_indices: vec![]
+                    target_indices: vec![],
+                    why_this_action: "test action".into(),
+                    alternatives_considered: None,
+                    expected_outcome: None,
+                    confidence: None
                 }))
                 .await
                 .is_ok()
@@ -3042,7 +3285,11 @@ mod tests {
                     decision_id: "d".into(),
                     settle_timeout: 1.0,
                     card_indices: vec![],
-                    target_indices: vec![]
+                    target_indices: vec![],
+                    why_this_action: "test action".into(),
+                    alternatives_considered: None,
+                    expected_outcome: None,
+                    confidence: None
                 }))
                 .await
                 .is_ok()
@@ -3071,7 +3318,11 @@ mod tests {
                     decision_id: "d".into(),
                     settle_timeout: 1.0,
                     card_indices: vec![],
-                    target_indices: vec![]
+                    target_indices: vec![],
+                    why_this_action: "test action".into(),
+                    alternatives_considered: None,
+                    expected_outcome: None,
+                    confidence: None
                 }))
                 .await
                 .is_ok()
@@ -3085,5 +3336,18 @@ mod tests {
         )
         .unwrap();
         assert!(server.preflight().await.is_err());
+    }
+
+    #[test]
+    fn strategic_actions_require_reasoning_and_comparisons_mark_misses() {
+        assert!(rationale_required(&json!({"action": "play"})));
+        assert!(rationale_required(&json!({"action": "buy_card"})));
+        assert!(!rationale_required(&json!({"action": "next_round"})));
+        let comparisons = compact_reasoning_comparisons(&json!([{
+            "action_id": "play_selected", "why_this_action": "Clear now",
+            "alternatives_considered": "Discard", "expected_outcome": "clear",
+            "observed_outcome": "state_changed"
+        }]));
+        assert_eq!(comparisons[0]["lesson_needed"], true);
     }
 }
