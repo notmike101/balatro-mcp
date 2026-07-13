@@ -9,6 +9,7 @@ name = "balatro-mcp"
 path = "src/main.rs"
 
 [dependencies]
+fs2 = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rmcp = { version = "1.7.0", features = ["server", "transport-io"] }
 tokio = { version = "1.48.0", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }

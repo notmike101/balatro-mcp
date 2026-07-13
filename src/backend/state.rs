@@ -1,10 +1,15 @@
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 pub struct StateDB {
     path: PathBuf,
 }
+
+pub const MAX_DECISION_SNAPSHOT_BYTES: usize = 64 * 1024;
 
 type EventRow = (i64, String, Value, String);
 type StrategyRow = (String, String, Value, String, bool, bool);
@@ -41,6 +46,42 @@ fn state_sql<T>(result: rusqlite::Result<T>, context: &str) -> Result<T, String>
     }
 }
 
+fn snapshot_fallback(value: &Value, bytes: usize) -> Value {
+    json!({
+        "truncated": true,
+        "bytes": bytes,
+        "state": value
+            .pointer("/game/state")
+            .or_else(|| value.pointer("/state"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    })
+}
+
+fn normalize_snapshot(value: &Value) -> Value {
+    let value = if let Some(object) = value.as_object() {
+        let mut compact = object.clone();
+        compact.remove("replay_context");
+        Value::Object(compact)
+    } else {
+        value.clone()
+    };
+    let bytes = serde_json::to_vec(&value).map_or(usize::MAX, |data| data.len());
+    if bytes <= MAX_DECISION_SNAPSHOT_BYTES {
+        value
+    } else {
+        snapshot_fallback(&value, bytes)
+    }
+}
+
+fn decode_snapshot(length: i64, prefix: String) -> Value {
+    let bytes = usize::try_from(length).unwrap_or(usize::MAX);
+    if bytes > MAX_DECISION_SNAPSHOT_BYTES {
+        return json!({"truncated": true, "bytes": length});
+    }
+    serde_json::from_str(&prefix).unwrap_or(Value::Null)
+}
+
 impl StateDB {
     pub fn new(runtime_root: &Path) -> Self {
         Self {
@@ -73,7 +114,9 @@ impl StateDB {
                 expected_outcome TEXT, confidence REAL, before_state TEXT NOT NULL,
                 after_state TEXT NOT NULL, observed_outcome TEXT NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );"#), "state schema")?;
+            );
+            CREATE INDEX IF NOT EXISTS idx_decision_records_lookup
+                ON decision_records(seed, ante, stake, blind_key, id);"#), "state schema")?;
         Ok(conn)
     }
 
@@ -102,28 +145,37 @@ impl StateDB {
 
     pub fn record_decision(&self, record: &Value) -> Result<Value, String> {
         let conn = self.connection()?;
-        let text = serde_json::to_string(record).expect("decision record is serializable");
+        let mut stored_record = record.clone();
+        if let Some(object) = stored_record.as_object_mut() {
+            if let Some(before) = object.get("before_state").cloned() {
+                object.insert("before_state".into(), normalize_snapshot(&before));
+            }
+            if let Some(after) = object.get("after_state").cloned() {
+                object.insert("after_state".into(), normalize_snapshot(&after));
+            }
+        }
+        let text = serde_json::to_string(&stored_record).expect("decision record is serializable");
         state_sql(conn.execute(
             "INSERT INTO decision_records (seed, ante, stake, blind_key, decision_id, action_id, action_type, rationale, alternatives, expected_outcome, confidence, before_state, after_state, observed_outcome) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
-                record["seed"].as_str().unwrap_or(""),
-                record["ante"].as_i64().unwrap_or(0),
-                record["stake"].as_i64().unwrap_or(0),
-                record["blind_key"].as_str().unwrap_or(""),
-                record["decision_id"].as_str().unwrap_or(""),
-                record["action_id"].as_str().unwrap_or(""),
-                record["action_type"].as_str().unwrap_or(""),
-                record["why_this_action"].as_str().unwrap_or(""),
-                record["alternatives_considered"].as_str(),
-                record["expected_outcome"].as_str(),
-                record["confidence"].as_f64(),
-                serde_json::to_string(&record["before_state"]).unwrap(),
-                serde_json::to_string(&record["after_state"]).unwrap(),
-                record["observed_outcome"].as_str().unwrap_or("unknown"),
+                stored_record["seed"].as_str().unwrap_or(""),
+                stored_record["ante"].as_i64().unwrap_or(0),
+                stored_record["stake"].as_i64().unwrap_or(0),
+                stored_record["blind_key"].as_str().unwrap_or(""),
+                stored_record["decision_id"].as_str().unwrap_or(""),
+                stored_record["action_id"].as_str().unwrap_or(""),
+                stored_record["action_type"].as_str().unwrap_or(""),
+                stored_record["why_this_action"].as_str().unwrap_or(""),
+                stored_record["alternatives_considered"].as_str(),
+                stored_record["expected_outcome"].as_str(),
+                stored_record["confidence"].as_f64(),
+                serde_json::to_string(&stored_record["before_state"]).unwrap(),
+                serde_json::to_string(&stored_record["after_state"]).unwrap(),
+                stored_record["observed_outcome"].as_str().unwrap_or("unknown"),
             ],
         ), "decision record")?;
         Ok(
-            json!({"decision_record_id": conn.last_insert_rowid(), "record": record, "stored": true, "payload": text}),
+            json!({"decision_record_id": conn.last_insert_rowid(), "record": stored_record, "stored": true, "payload": text}),
         )
     }
 
@@ -137,20 +189,45 @@ impl StateDB {
     ) -> Result<Value, String> {
         let conn = self.connection()?;
         let mut stmt = state_sql(conn.prepare(
-            "SELECT seed, ante, stake, blind_key, decision_id, action_id, action_type, rationale, alternatives, expected_outcome, confidence, before_state, after_state, observed_outcome, created_at FROM decision_records WHERE seed=? AND ante=? AND stake=? AND (? IS NULL OR blind_key LIKE '%' || ? || '%') ORDER BY id LIMIT ?"
+            "SELECT seed, ante, stake, blind_key, decision_id, action_id, action_type, rationale, alternatives, expected_outcome, confidence, length(before_state), substr(before_state, 1, ?), length(after_state), substr(after_state, 1, ?), observed_outcome, created_at FROM decision_records WHERE seed=? AND ante=? AND stake=? AND (? IS NULL OR blind_key LIKE '%' || ? || '%') ORDER BY id LIMIT ?"
         ), "prepare decision records")?;
-        let rows = stmt.query_map(params![seed, ante, stake, blind_key, blind_key, limit.clamp(1, 500)], |row| {
-            let before: String = row.get(11)?;
-            let after: String = row.get(12)?;
+        let snapshot_limit = i64::try_from(MAX_DECISION_SNAPSHOT_BYTES).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![snapshot_limit, snapshot_limit, seed, ante, stake, blind_key, blind_key, limit.clamp(1, 500)], |row| {
+            let before_len: i64 = row.get(11)?;
+            let before: String = row.get(12)?;
+            let after_len: i64 = row.get(13)?;
+            let after: String = row.get(14)?;
             Ok(json!({
                 "seed": row.get::<_, String>(0)?, "ante": row.get::<_, i64>(1)?, "stake": row.get::<_, i64>(2)?, "blind_key": row.get::<_, String>(3)?,
                 "decision_id": row.get::<_, String>(4)?, "action_id": row.get::<_, String>(5)?, "action_type": row.get::<_, String>(6)?,
                 "why_this_action": row.get::<_, String>(7)?, "alternatives_considered": row.get::<_, Option<String>>(8)?, "expected_outcome": row.get::<_, Option<String>>(9)?,
-                "confidence": row.get::<_, Option<f64>>(10)?, "before_state": serde_json::from_str::<Value>(&before).unwrap_or(Value::Null),
-                "after_state": serde_json::from_str::<Value>(&after).unwrap_or(Value::Null), "observed_outcome": row.get::<_, String>(13)?, "created_at": row.get::<_, String>(14)?
+                "confidence": row.get::<_, Option<f64>>(10)?, "before_state": decode_snapshot(before_len, before),
+                "after_state": decode_snapshot(after_len, after), "observed_outcome": row.get::<_, String>(15)?, "created_at": row.get::<_, String>(16)?
             }))
         }).map_err(|e| format!("query decision records: {e}"))?;
         Ok(Value::Array(rows.filter_map(Result::ok).collect()))
+    }
+
+    pub fn health(&self) -> Result<Value, String> {
+        let bytes = fs::metadata(&self.path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let conn = self.connection()?;
+        let (count, max_before, max_after): (i64, i64, i64) = state_sql(
+            conn.query_row(
+                "SELECT COUNT(*), COALESCE(MAX(length(before_state)), 0), COALESCE(MAX(length(after_state)), 0) FROM decision_records",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ),
+            "decision health",
+        )?;
+        Ok(json!({
+            "database_bytes": bytes,
+            "decision_records": count,
+            "max_before_state_bytes": max_before,
+            "max_after_state_bytes": max_after,
+            "snapshot_limit_bytes": MAX_DECISION_SNAPSHOT_BYTES,
+        }))
     }
 
     pub fn events(&self, limit: u32) -> Result<Value, String> {
@@ -349,6 +426,50 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn decision_snapshots_are_bounded_for_repeated_records() {
+        let dir = tempdir().unwrap();
+        let db = StateDB::new(dir.path());
+        for index in 0..100 {
+            db.record_decision(&json!({
+                "seed": "2K9H9HN", "ante": 1, "stake": 1, "blind_key": "Small",
+                "decision_id": format!("d{index}"), "action_id": "play_selected",
+                "action_type": "play", "why_this_action": "bounded",
+                "before_state": {"state": "SELECTING_HAND", "replay_context": {"prior_decisions": ["ignored"]}},
+                "after_state": {"state": "ROUND_EVAL"}, "observed_outcome": "state_changed"
+            })).unwrap();
+        }
+        let health = db.health().unwrap();
+        assert_eq!(health["decision_records"], 100);
+        assert!(health["max_before_state_bytes"].as_i64().unwrap() < 1024);
+        assert!(health["max_after_state_bytes"].as_i64().unwrap() < 1024);
+        let records = db
+            .decision_records("2K9H9HN", 1, 1, Some("Small"), 500)
+            .unwrap();
+        assert_eq!(records.as_array().unwrap().len(), 100);
+        assert!(records[0]["before_state"].get("replay_context").is_none());
+    }
+
+    #[test]
+    fn legacy_oversized_snapshots_are_returned_as_truncated_metadata() {
+        let dir = tempdir().unwrap();
+        let db = StateDB::new(dir.path());
+        let conn = db.connection().unwrap();
+        let oversized = "x".repeat(MAX_DECISION_SNAPSHOT_BYTES + 1);
+        conn.execute(
+            "INSERT INTO decision_records (seed, ante, stake, blind_key, decision_id, action_id, action_type, rationale, before_state, after_state, observed_outcome) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params!["2K9H9HN", 1, 1, "Small", "d1", "a1", "play", "why", oversized, "{}", "state_changed"],
+        ).unwrap();
+        let records = db
+            .decision_records("2K9H9HN", 1, 1, Some("Small"), 10)
+            .unwrap();
+        assert_eq!(records[0]["before_state"]["truncated"], true);
+        assert_eq!(
+            records[0]["before_state"]["bytes"],
+            (MAX_DECISION_SNAPSHOT_BYTES + 1) as i64
         );
     }
 

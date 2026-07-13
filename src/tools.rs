@@ -15,9 +15,11 @@ use crate::backend::{
     ipc::{IpcPaths, advance_safe_internal, execute_policy_action, start_new_run},
     policy::{SAFE_TRANSITION_ACTIONS, build_policy_state, compact_policy_state},
     replay::ReplayDB,
-    runtime::{self, balatro_processes, observation_age},
+    runtime::{
+        self, RuntimeMutationGuard, RuntimeMutationLock, balatro_processes, observation_age,
+    },
     scoring::score_hand,
-    state::StateDB,
+    state::{MAX_DECISION_SNAPSHOT_BYTES, StateDB},
 };
 use crate::crash;
 use crate::guide::{GUIDE_TOPICS, guide};
@@ -32,6 +34,74 @@ const CANONICAL_PLAY_LIMIT: usize = 40;
 const CANONICAL_DISCARD_LIMIT: usize = 40;
 const CANONICAL_TARGET_LIMIT: usize = 60;
 const MAX_ACTION_PAGE: usize = 256;
+const POLICY_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn compact_decision_snapshot(policy: &Value) -> Value {
+    let run = policy.get("run").or_else(|| policy.get("round"));
+    let game = policy.get("game");
+    let blind = run.and_then(|value| value.get("blind"));
+    let score = policy.get("score_pressure");
+    let legal_action_ids: Vec<Value> = policy
+        .get("legal_actions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|action| action.get("action_id"))
+        .take(MAX_ACTION_PAGE)
+        .cloned()
+        .collect();
+    let snapshot = json!({
+        "state": game.and_then(|value| value.get("state")),
+        "ante": run.and_then(|value| value.get("ante")),
+        "round": run.and_then(|value| value.get("round")),
+        "blind": blind.and_then(|value| {
+            value.get("key").or_else(|| value.get("blind_key")).or_else(|| value.get("name"))
+        }),
+        "current_chips": score.and_then(|value| value.get("current_chips")),
+        "blind_chips_required": score.and_then(|value| value.get("blind_chips_required")),
+        "chips_remaining": score.and_then(|value| value.get("chips_remaining")),
+        "hands_left": run.and_then(|value| value.get("hands_left")),
+        "discards_left": run.and_then(|value| value.get("discards_left")),
+        "dollars": run.and_then(|value| value.get("dollars")),
+        "decision_id": policy.get("decision_id"),
+        "observation_id": policy.get("observation_id"),
+        "legal_action_ids": legal_action_ids,
+    });
+    let bytes = serde_json::to_vec(&snapshot).map_or(usize::MAX, |data| data.len());
+    if bytes <= MAX_DECISION_SNAPSHOT_BYTES {
+        snapshot
+    } else {
+        json!({
+            "truncated": true,
+            "bytes": bytes,
+            "state": game.and_then(|value| value.get("state")),
+            "ante": run.and_then(|value| value.get("ante")),
+            "round": run.and_then(|value| value.get("round")),
+            "blind": blind.and_then(|value| value.get("name")),
+            "decision_id": policy.get("decision_id"),
+            "observation_id": policy.get("observation_id"),
+        })
+    }
+}
+
+fn mutation_busy_result() -> Result<CallToolResult, rmcp::ErrorData> {
+    to_tool_result(envelope(
+        false,
+        Value::Null,
+        "mutation_busy",
+        "another mutation is already in progress for the shared Balatro runtime",
+    ))
+}
+
+fn decision_record_status(result: Result<Value, String>) -> Value {
+    match result {
+        Ok(data) => json!({
+            "stored": true,
+            "decision_record_id": data.get("decision_record_id")
+        }),
+        Err(error) => json!({"stored": false, "error": error}),
+    }
+}
 
 fn rationale_required(action: &Value) -> bool {
     matches!(
@@ -398,7 +468,7 @@ pub struct Server {
     pub root: PathBuf,
     pub runtime_root: PathBuf,
     pub ipc: IpcPaths,
-    pub mutations: Arc<Mutex<()>>,
+    pub runtime_lock: Arc<RuntimeMutationLock>,
     pub replay_db: Arc<Mutex<ReplayDB>>,
     pub state_db: Arc<Mutex<StateDB>>,
     pub rules_db: Arc<RulesDb>,
@@ -414,13 +484,14 @@ impl Server {
             .map(PathBuf::from)
             .unwrap_or_else(|| root.clone());
         let ipc = IpcPaths::new(&runtime_root);
+        let runtime_lock = Arc::new(RuntimeMutationLock::new(&runtime_root));
         let replay_db = Arc::new(Mutex::new(ReplayDB::new(&runtime_root)));
         let state_db = Arc::new(Mutex::new(StateDB::new(&runtime_root)));
         Ok(Self {
             root: root.clone(),
             runtime_root,
             ipc,
-            mutations: Arc::new(Mutex::new(())),
+            runtime_lock,
             replay_db,
             state_db,
             rules_db: Arc::new(RulesDb::new(default_db_path(&root))),
@@ -434,6 +505,10 @@ impl Server {
     /// Read the observation JSON from the Lua bridge.
     pub fn read_observation(&self) -> Result<Value, String> {
         self.ipc.read_observation()
+    }
+
+    fn try_mutation(&self) -> Result<RuntimeMutationGuard, String> {
+        self.runtime_lock.try_acquire()
     }
 
     async fn policy(&self, limit: u32) -> Result<Value, String> {
@@ -539,7 +614,15 @@ impl Server {
     }
 
     async fn compact_policy(&self, limit: u32) -> Result<Value, String> {
-        Ok(compact_policy_state(&self.policy(limit).await?))
+        Ok(compact_policy_state(
+            &self.policy_with_timeout(limit).await?,
+        ))
+    }
+
+    async fn policy_with_timeout(&self, limit: u32) -> Result<Value, String> {
+        tokio::time::timeout(POLICY_TIMEOUT, self.policy(limit))
+            .await
+            .map_err(|_| "decision generation timed out".to_string())?
     }
 
     async fn status(&self) -> Value {
@@ -917,16 +1000,9 @@ impl Server {
         description = "Verify that the fixed Balatro.exe is running and report bridge/seed safety. This tool never launches Balatro, performs UI actions, or creates a new run; it refuses multiple processes."
     )]
     async fn ensure_runtime(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let _guard = match self.mutations.try_lock() {
+        let _guard = match self.try_mutation() {
             Ok(guard) => guard,
-            Err(_) => {
-                return to_tool_result(envelope(
-                    false,
-                    Value::Null,
-                    "mutation_busy",
-                    "another mutation is already in progress",
-                ));
-            }
+            Err(_) => return mutation_busy_result(),
         };
         match self.ensure_runtime_impl().await {
             Ok(data) => to_tool_result(envelope(true, data, "", "")),
@@ -941,16 +1017,9 @@ impl Server {
         &self,
         Parameters(params): Parameters<StartNewRunParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let _guard = match self.mutations.try_lock() {
+        let _guard = match self.try_mutation() {
             Ok(guard) => guard,
-            Err(_) => {
-                return to_tool_result(envelope(
-                    false,
-                    Value::Null,
-                    "mutation_busy",
-                    "another mutation is already in progress",
-                ));
-            }
+            Err(_) => return mutation_busy_result(),
         };
         if let Err(problem) = self.preflight_new_run(params.confirm_override).await {
             return to_tool_result(problem);
@@ -963,7 +1032,7 @@ impl Server {
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
                 let mut next = Value::Null;
                 loop {
-                    if let Ok(policy) = self.policy(40).await {
+                    if let Ok(policy) = self.policy_with_timeout(40).await {
                         let state = policy
                             .pointer("/game/state")
                             .and_then(Value::as_str)
@@ -1025,7 +1094,7 @@ impl Server {
                 Err(e) => to_tool_result(envelope(false, Value::Null, "observe_failed", &e)),
             };
         }
-        match self.policy(40).await {
+        match self.policy_with_timeout(40).await {
             Ok(data) => to_tool_result(envelope(
                 true,
                 compact_observation(data, &params.section),
@@ -1052,7 +1121,7 @@ impl Server {
             ));
         }
         match if params.detail == "full" {
-            self.policy(params.limit).await
+            self.policy_with_timeout(params.limit).await
         } else {
             self.compact_policy(params.limit).await
         } {
@@ -1084,21 +1153,14 @@ impl Server {
                 "action_id and decision_id are required",
             ));
         }
-        let _guard = match self.mutations.try_lock() {
+        let _guard = match self.try_mutation() {
             Ok(guard) => guard,
-            Err(_) => {
-                return to_tool_result(envelope(
-                    false,
-                    Value::Null,
-                    "mutation_busy",
-                    "another mutation is already in progress",
-                ));
-            }
+            Err(_) => return mutation_busy_result(),
         };
         if let Err(problem) = self.preflight().await {
             return to_tool_result(problem);
         }
-        let current = self.policy(40).await.unwrap_or(Value::Null);
+        let current = self.policy_with_timeout(40).await.unwrap_or(Value::Null);
         let current_decision_id = current
             .get("decision_id")
             .and_then(Value::as_str)
@@ -1313,17 +1375,14 @@ impl Server {
                         "alternatives_considered": params.alternatives_considered,
                         "expected_outcome": params.expected_outcome,
                         "confidence": params.confidence,
-                        "before_state": current,
-                        "after_state": next,
+                        "before_state": compact_decision_snapshot(&current),
+                        "after_state": compact_decision_snapshot(&next),
                         "observed_outcome": "state_changed"
                     });
-                    if let Err(error) = self.state_db.lock().await.record_decision(&record) {
-                        return to_tool_result(envelope(
-                            false,
-                            next,
-                            "decision_record_failed",
-                            &error,
-                        ));
+                    let decision_record =
+                        decision_record_status(self.state_db.lock().await.record_decision(&record));
+                    if let Some(object) = next.as_object_mut() {
+                        object.insert("decision_record".into(), decision_record);
                     }
                 }
                 to_tool_result(envelope(true, next, "", ""))
@@ -1347,22 +1406,15 @@ impl Server {
         &self,
         Parameters(params): Parameters<AdvanceParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let _guard = match self.mutations.try_lock() {
+        let _guard = match self.try_mutation() {
             Ok(guard) => guard,
-            Err(_) => {
-                return to_tool_result(envelope(
-                    false,
-                    Value::Null,
-                    "mutation_busy",
-                    "another mutation is already in progress",
-                ));
-            }
+            Err(_) => return mutation_busy_result(),
         };
         if let Err(problem) = self.preflight().await {
             return to_tool_result(problem);
         }
         let steps = params.max_steps.clamp(1, 20) as u32;
-        let before_policy = match self.policy(20).await {
+        let before_policy = match self.policy_with_timeout(20).await {
             Ok(value) => value,
             Err(error) => {
                 return to_tool_result(envelope(false, Value::Null, "advance_failed", &error));
@@ -1400,9 +1452,13 @@ impl Server {
             if !available.iter().any(|candidate| candidate == action) {
                 continue;
             }
-            match advance_safe_internal(&self.ipc, action, steps) {
-                Ok(bridge_data) => {
-                    match self.policy(40).await {
+            let ipc = self.ipc.clone();
+            let action = action.to_owned();
+            match tokio::task::spawn_blocking(move || advance_safe_internal(&ipc, &action, steps))
+                .await
+            {
+                Ok(Ok(bridge_data)) => {
+                    match self.policy_with_timeout(40).await {
                         Ok(policy_data) => {
                             let after_state =
                                 policy_data.pointer("/game/state").and_then(Value::as_str);
@@ -1424,7 +1480,7 @@ impl Server {
                         }
                     };
                 }
-                Err(_) => continue,
+                Ok(Err(_)) | Err(_) => continue,
             }
         }
         to_tool_result(envelope(
@@ -1464,7 +1520,7 @@ impl Server {
             .await
             {
                 if wait_state_matches(&observation, &params.state) {
-                    return match self.policy(20).await {
+                    return match self.policy_with_timeout(20).await {
                         Ok(data) => {
                             to_tool_result(envelope(true, wait_state_summary(data), "", ""))
                         }
@@ -1491,16 +1547,9 @@ impl Server {
         &self,
         Parameters(params): Parameters<CheckpointParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let _guard = match self.mutations.try_lock() {
+        let _guard = match self.try_mutation() {
             Ok(guard) => guard,
-            Err(_) => {
-                return to_tool_result(envelope(
-                    false,
-                    Value::Null,
-                    "mutation_busy",
-                    "another mutation is already in progress",
-                ));
-            }
+            Err(_) => return mutation_busy_result(),
         };
         if let Err(problem) = self.preflight().await {
             return to_tool_result(problem);
@@ -1625,7 +1674,10 @@ impl Server {
         &self,
         Parameters(params): Parameters<ReplayLogParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let _guard = self.mutations.lock().await;
+        let _guard = match self.try_mutation() {
+            Ok(guard) => guard,
+            Err(_) => return mutation_busy_result(),
+        };
         if params.outcome == "clear" {
             // Parse jokers
             let jokers: Vec<(i64, &str, Option<&str>, Option<&str>, Option<&str>)> = params
@@ -1965,6 +2017,10 @@ impl Server {
         &self,
         Parameters(params): Parameters<StrategyRuleParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let _guard = match self.try_mutation() {
+            Ok(guard) => guard,
+            Err(_) => return mutation_busy_result(),
+        };
         if params.id.is_empty() || params.directive.is_empty() {
             return to_tool_result(envelope(
                 false,
@@ -1992,6 +2048,10 @@ impl Server {
         &self,
         Parameters(params): Parameters<StrategyEvidenceParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let _guard = match self.try_mutation() {
+            Ok(guard) => guard,
+            Err(_) => return mutation_busy_result(),
+        };
         match self.state_db.lock().await.record_evidence(
             &params.rule_id,
             &params.outcome,
@@ -2013,6 +2073,10 @@ impl Server {
         &self,
         Parameters(params): Parameters<LessonParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let _guard = match self.try_mutation() {
+            Ok(guard) => guard,
+            Err(_) => return mutation_busy_result(),
+        };
         match self.state_db.lock().await.add_lesson(
             &params.category,
             &params.lesson,
@@ -2029,6 +2093,10 @@ impl Server {
         &self,
         Parameters(params): Parameters<EstimateParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let _guard = match self.try_mutation() {
+            Ok(guard) => guard,
+            Err(_) => return mutation_busy_result(),
+        };
         match self.state_db.lock().await.record_estimate(
             &params.hand_type,
             params.estimated,
@@ -2061,6 +2129,10 @@ impl Server {
         if params.kind == "read" {
             return state_result(self.state_db.lock().await.current_run());
         }
+        let _guard = match self.try_mutation() {
+            Ok(guard) => guard,
+            Err(_) => return mutation_busy_result(),
+        };
         match self.read_observation() {
             Ok(observation) => state_result(
                 self.state_db
@@ -2099,6 +2171,22 @@ impl Server {
             &self.runtime_root.join("agent").join("mcp_crash.log"),
             params.lines,
         );
+        data["runtime_lock"] = json!({
+            "available": self.runtime_lock.available(),
+            "file": runtime::MUTATION_LOCK_FILE,
+        });
+        data["state_database"] = self
+            .state_db
+            .lock()
+            .await
+            .health()
+            .unwrap_or_else(|error| json!({"error": error}));
+        data["replay_database"] = self
+            .replay_db
+            .lock()
+            .await
+            .health()
+            .unwrap_or_else(|error| json!({"error": error}));
         data["status"] = sanitize(self.status().await);
         to_tool_result(envelope(true, data, "", ""))
     }
@@ -2119,7 +2207,7 @@ impl rmcp::ServerHandler for Server {
                 .with_description("Rust stdio boundary for safe Balatro gameplay."),
         )
         .with_instructions(
-            "Use only these MCP tools. Start with game_status, recover seed 2K9H9HN with start_new_run when needed, then get_decision. Before every strategic action inspect decision_checks and replay_context, state why_this_action is preferred, and include alternatives_considered or expected_outcome when useful; missing rationale is rejected. use_consumable actions are legal during active hand play and other non-terminal states. Execute only current legal actions with decision_id; refresh on stale_decision. Use target_indices for targeted consumables and 1-based card_indices for play_selected/discard_selected. Review prior reasoning before every blind; log the clear/failure immediately after resolution, then record durable lessons or strategy evidence when justified. get_decision is compact by default; detail=full is available for analysis. Page actions until legal_actions_next_offset is null. observe summary/hand/build/blind are compact; all is diagnostic. In ROUND_EVAL use proceed_round, then next_round in SHOP.",
+            "Use only these MCP tools. Start with game_status, recover seed 2K9H9HN with start_new_run when needed, then get_decision. Before every strategic action inspect decision_checks and replay_context, state why_this_action is preferred, and include alternatives_considered or expected_outcome when useful; missing rationale is rejected. use_consumable actions are legal during active hand play and other non-terminal states. Execute only current legal actions with decision_id; refresh on stale_decision. Use target_indices for targeted consumables and 1-based card_indices for play_selected/discard_selected. Review prior reasoning before every blind; log the clear/failure immediately after resolution, then record durable lessons or strategy evidence when justified. get_decision is compact by default; detail=full is available for analysis. Page actions until legal_actions_next_offset is null. observe summary/hand/build/blind are compact; all is diagnostic. In ROUND_EVAL use proceed_round, then next_round in SHOP. Shared-runtime mutations may return mutation_busy: wait and reread state instead of retrying an old action. A successful action with decision_record.stored=false has only a nonfatal audit warning.",
         )
     }
     #[cfg_attr(coverage_nightly, coverage(off))]
@@ -2186,6 +2274,32 @@ mod tests {
         );
         assert_eq!(response["state"], "HAND_PLAYED");
         assert_eq!(response["message"], "queued");
+    }
+
+    #[test]
+    fn compact_decision_snapshot_excludes_recursive_context() {
+        let snapshot = compact_decision_snapshot(&json!({
+            "game": {"state": "SELECTING_HAND"},
+            "run": {"ante": 1, "round": 2, "hands_left": 3, "discards_left": 2, "dollars": 4,
+                "blind": {"name": "Small"}},
+            "score_pressure": {"current_chips": 10, "blind_chips_required": 300, "chips_remaining": 290},
+            "decision_id": "d1", "observation_id": "o1",
+            "legal_actions": [{"action_id": "play_selected"}],
+            "replay_context": {"prior_decisions": [{"before_state": {"replay_context": "recursive"}}]}
+        }));
+        assert!(snapshot.get("replay_context").is_none());
+        assert_eq!(snapshot["legal_action_ids"][0], "play_selected");
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() <= MAX_DECISION_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn failed_audit_is_reported_without_turning_action_into_failure() {
+        let warning = decision_record_status(Err("database is unavailable".into()));
+        assert_eq!(warning["stored"], false);
+        assert_eq!(warning["error"], "database is unavailable");
+        let stored = decision_record_status(Ok(json!({"decision_record_id": 7})));
+        assert_eq!(stored["stored"], true);
+        assert_eq!(stored["decision_record_id"], 7);
     }
 
     #[tokio::test]

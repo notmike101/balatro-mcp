@@ -1,7 +1,9 @@
-use std::path::PathBuf;
+use fs2::FileExt;
+use std::fs::{self, File, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 static EMPTY_READY: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(serde_json::Map::new);
 
 use serde_json::Value;
@@ -9,6 +11,110 @@ use serde_json::Value;
 pub const ALLOWED_SEED: &str = "2K9H9HN";
 pub const MAX_OBSERVATION_AGE_SECONDS: f64 = 2.0;
 pub const EXPECTED_BRIDGE_VERSION: &str = "0.6.0";
+pub const MUTATION_LOCK_FILE: &str = "mcp_runtime.lock";
+
+pub struct RuntimeMutationLock {
+    path: PathBuf,
+}
+
+pub struct RuntimeMutationGuard {
+    file: File,
+}
+
+impl RuntimeMutationLock {
+    pub fn new(runtime_root: &Path) -> Self {
+        Self {
+            path: runtime_root.join("agent").join(MUTATION_LOCK_FILE),
+        }
+    }
+
+    pub fn try_acquire(&self) -> Result<RuntimeMutationGuard, String> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create runtime lock directory: {error}"))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .map_err(|error| format!("cannot open runtime mutation lock: {error}"))?;
+        file.try_lock_exclusive().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                "runtime mutation lock is held by another MCP process".into()
+            } else {
+                format!("cannot acquire runtime mutation lock: {error}")
+            }
+        })?;
+        Ok(RuntimeMutationGuard { file })
+    }
+
+    pub fn available(&self) -> bool {
+        self.try_acquire().is_ok()
+    }
+}
+
+impl Drop for RuntimeMutationGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+pub fn reset_runtime_databases(runtime_root: &Path, confirmed: bool) -> Result<Value, String> {
+    if !confirmed {
+        return Err("state reset requires --confirm".into());
+    }
+    let lock = RuntimeMutationLock::new(runtime_root);
+    let _guard = lock.try_acquire()?;
+    let agent_root = runtime_root.join("agent");
+    fs::create_dir_all(&agent_root)
+        .map_err(|error| format!("cannot create runtime agent directory: {error}"))?;
+    let archive_root = agent_root.join(format!(
+        "archive-state-reset-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("clock error: {error}"))?
+            .as_millis()
+    ));
+    fs::create_dir_all(&archive_root)
+        .map_err(|error| format!("cannot create reset archive: {error}"))?;
+
+    let mut archived = Vec::new();
+    for database in ["rust_state.db", "replays.db"] {
+        for suffix in ["", "-wal", "-shm"] {
+            let source = agent_root.join(format!("{database}{suffix}"));
+            if !source.exists() {
+                continue;
+            }
+            let destination = archive_root.join(format!("{database}{suffix}"));
+            fs::rename(&source, &destination).map_err(|error| {
+                format!(
+                    "cannot archive {} to {}: {error}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+            archived.push(destination.display().to_string());
+        }
+    }
+    Ok(serde_json::json!({
+        "reset": true,
+        "archive_directory": archive_root.display().to_string(),
+        "archived": archived,
+        "databases": ["rust_state.db", "replays.db"]
+    }))
+}
+
+pub fn cli(runtime_root: &Path, args: &[String]) -> Result<Option<Value>, String> {
+    if args.first().map(String::as_str) != Some("state") {
+        return Ok(None);
+    }
+    if args.get(1).map(String::as_str) != Some("reset") {
+        return Err("usage: state reset --confirm".into());
+    }
+    let confirmed = args.iter().any(|arg| arg == "--confirm");
+    Ok(Some(reset_runtime_databases(runtime_root, confirmed)?))
+}
 
 #[derive(Debug, Clone)]
 pub struct SafetyError(pub String);
@@ -217,6 +323,32 @@ mod tests {
     #[test]
     fn test_allowed_seed() {
         assert_eq!(ALLOWED_SEED, "2K9H9HN");
+    }
+
+    #[test]
+    fn runtime_mutation_lock_is_exclusive_until_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = RuntimeMutationLock::new(dir.path());
+        let second = RuntimeMutationLock::new(dir.path());
+        let guard = first.try_acquire().unwrap();
+        assert!(second.try_acquire().is_err());
+        drop(guard);
+        assert!(second.try_acquire().is_ok());
+    }
+
+    #[test]
+    fn reset_requires_confirmation_and_archives_both_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join("rust_state.db"), b"state").unwrap();
+        std::fs::write(agent.join("replays.db"), b"replays").unwrap();
+        assert!(reset_runtime_databases(dir.path(), false).is_err());
+        let result = reset_runtime_databases(dir.path(), true).unwrap();
+        assert_eq!(result["reset"], true);
+        assert!(!agent.join("rust_state.db").exists());
+        assert!(!agent.join("replays.db").exists());
+        assert_eq!(result["archived"].as_array().unwrap().len(), 2);
     }
     #[test]
     fn test_max_observation_age() {

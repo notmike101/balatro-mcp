@@ -45,6 +45,17 @@ There are no Python, Node.js, or JavaScript subprocesses. Runtime files and the 
 - Treat `exact_score` and `estimated_score` separately; unsupported effects must remain visible in `unsupported_effects`.
 - Strategy, lessons, estimation feedback, current-run state, and event history are Rust-owned MCP capabilities backed by `agent/rust_state.db`.
 - Preserve hidden-card sanitization and never expose arbitrary filesystem contents.
+- Shared-runtime mutations are serialized across MCP processes by the OS-backed
+  `agent/mcp_runtime.lock`; the lock covers bridge waiting, settling, and
+  persistence. Read-only tools remain available while another process owns it.
+- Treat `mutation_busy` as a coordination result: wait and reread current state
+  before choosing an action; never retry an old action. A successful action
+  with `decision_record.stored=false` has already applied and only has a
+  nonfatal audit warning.
+- Persistence reset is explicit and operator-triggered only. Stop stale MCP
+  processes, then run `balatro-mcp state reset --confirm`; it archives both
+  runtime databases and SQLite sidecars under `agent/archive-state-reset-*`.
+- Stop stale MCP processes before reset or `cargo build --release`.
 
 ## Validation
 
