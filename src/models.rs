@@ -7,6 +7,12 @@ fn object_value_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::
     schemars::json_schema!({"type": "object"})
 }
 
+fn card_id_array_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    // Card identifiers are opaque values at runtime, but MCP hosts should see
+    // them as strings instead of the unsupported boolean item schema.
+    schemars::json_schema!({"type": "array", "items": {"type": "string"}})
+}
+
 pub const SEED: &str = "2K9H9HN";
 pub const INFO_TYPES: &[&str] = &[
     "joker",
@@ -73,6 +79,7 @@ pub struct ActionParams {
     /// Optional card identifiers aligned with card_indices; when supplied they
     /// must match the current hand at those 1-based positions.
     #[serde(default)]
+    #[schemars(schema_with = "card_id_array_schema")]
     pub card_ids: Vec<serde_json::Value>,
     /// Optional 1-based hand positions targeted by a consumable.
     #[serde(default)]
@@ -472,6 +479,17 @@ mod tests {
     }
 
     #[test]
+    fn action_params_accepts_string_and_numeric_card_ids() {
+        let params: ActionParams = serde_json::from_value(json!({
+            "action_id": "play_selected",
+            "decision_id": "d:1",
+            "card_ids": ["card-a", 42]
+        }))
+        .unwrap();
+        assert_eq!(params.card_ids, vec![json!("card-a"), json!(42)]);
+    }
+
+    #[test]
     fn advance_params_defaults_to_8() {
         let json = json!({});
         let params: AdvanceParams = serde_json::from_value(json).unwrap();
@@ -601,8 +619,11 @@ mod tests {
     fn arbitrary_json_tool_fields_use_object_schemas() {
         let strategy = serde_json::to_value(schemars::schema_for!(StrategyRuleParams)).unwrap();
         let estimate = serde_json::to_value(schemars::schema_for!(EstimateParams)).unwrap();
+        let action = serde_json::to_value(schemars::schema_for!(ActionParams)).unwrap();
 
         assert_eq!(strategy["properties"]["conditions"]["type"], "object");
         assert_eq!(estimate["properties"]["context"]["type"], "object");
+        assert_eq!(action["properties"]["card_ids"]["type"], "array");
+        assert_eq!(action["properties"]["card_ids"]["items"]["type"], "string");
     }
 }
