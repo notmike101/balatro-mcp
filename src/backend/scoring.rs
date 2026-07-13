@@ -3,6 +3,8 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use super::observation;
+
 static EMPTY_OBJECT: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(serde_json::Map::new);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,10 +221,8 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
         .and_then(|run| run.get("most_played_poker_hand"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let run_chips = run.and_then(|run| run.get("chips")).and_then(Value::as_i64);
-    let blind_chips_required = run
-        .and_then(|run| run.pointer("/blind/chips_required"))
-        .and_then(Value::as_i64);
+    let run_chips = observation::current_chips(observation);
+    let blind_chips_required = observation::blind_chips_required(observation);
     let blind_chips_remaining =
         blind_chips_required.map(|required| required.saturating_sub(run_chips.unwrap_or(0)).max(0));
     let mut result = ScoreResult {
@@ -573,6 +573,20 @@ mod tests {
         assert_eq!(result.run_chips, Some(120));
         assert_eq!(result.blind_chips_required, Some(300));
         assert_eq!(result.blind_chips_remaining, Some(180));
+    }
+
+    #[test]
+    fn score_metadata_resolves_root_blind_without_using_target_as_score() {
+        let observation = json!({
+            "round": {"chips": 1200},
+            "blind": {"chips": 1600},
+            "areas": {"hand": [card("A", "H")]},
+            "poker_hands": {"values": {"High Card": {"chips": 10, "mult": 2}}}
+        });
+        let result = score_hand(&observation, None);
+        assert_eq!(result.run_chips, Some(1200));
+        assert_eq!(result.blind_chips_required, Some(1600));
+        assert_eq!(result.blind_chips_remaining, Some(400));
     }
 
     #[test]

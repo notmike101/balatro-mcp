@@ -73,11 +73,9 @@ pub fn compact_observation(data: Value, section: &str) -> Value {
         .or_else(|| data.get("round"))
         .cloned()
         .unwrap_or(Value::Null);
-    let blind = data
-        .get("blind")
-        .cloned()
-        .or_else(|| run.get("blind").cloned())
-        .unwrap_or(Value::Null);
+    let blind = crate::backend::observation::active_blind(&data).unwrap_or(Value::Null);
+    let current_chips = crate::backend::observation::current_chips(&data);
+    let chips_required = crate::backend::observation::blind_chips_required(&data);
     let observation_id = get("observation_id");
     match section {
         "hand" => {
@@ -93,7 +91,7 @@ pub fn compact_observation(data: Value, section: &str) -> Value {
             json!({"game": get("game"), "run": run, "poker_hand_values": get("poker_hand_values"), "decision_id": get("decision_id"), "observation_id": observation_id})
         }
         _ => {
-            json!({"state": data.pointer("/game/state").or_else(|| data.pointer("/game/state_name")).cloned().unwrap_or(Value::Null), "ante": run.get("ante").cloned().unwrap_or(Value::Null), "round": run.get("round").cloned().unwrap_or(Value::Null), "blind": blind.get("name").cloned().unwrap_or(Value::Null), "chips": run.get("chips").cloned().or_else(|| blind.get("chips_required").cloned()).unwrap_or(Value::Null), "hands_left": run.get("hands_left").cloned().unwrap_or(Value::Null), "discards_left": run.get("discards_left").cloned().unwrap_or(Value::Null), "discards_used": run.get("discards_used").cloned().unwrap_or(Value::Null), "discard_limit": run.pointer("/starting_params/discard_limit").cloned().unwrap_or(Value::Null), "discard_status": data.get("discard_status").cloned().unwrap_or(Value::Null), "dollars": run.get("dollars").cloned().unwrap_or(Value::Null), "ready": get("ready"), "estimate_quality": get("estimate_quality"), "decision_id": get("decision_id"), "observation_id": observation_id})
+            json!({"state": data.pointer("/game/state").or_else(|| data.pointer("/game/state_name")).cloned().unwrap_or(Value::Null), "ante": run.get("ante").cloned().unwrap_or(Value::Null), "round": run.get("round").cloned().unwrap_or(Value::Null), "blind": blind.get("name").cloned().unwrap_or(Value::Null), "chips": current_chips, "chips_required": chips_required, "hands_left": run.get("hands_left").cloned().unwrap_or(Value::Null), "discards_left": run.get("discards_left").cloned().unwrap_or(Value::Null), "discards_used": run.get("discards_used").cloned().unwrap_or(Value::Null), "discard_limit": run.pointer("/starting_params/discard_limit").cloned().unwrap_or(Value::Null), "discard_status": data.get("discard_status").cloned().unwrap_or(Value::Null), "dollars": run.get("dollars").cloned().unwrap_or(Value::Null), "ready": get("ready"), "estimate_quality": get("estimate_quality"), "decision_id": get("decision_id"), "observation_id": observation_id})
         }
     }
 }
@@ -407,7 +405,8 @@ mod tests {
         assert_eq!(result["state"], "SHOP");
         assert_eq!(result["ante"], 2);
         assert_eq!(result["blind"], "Stung");
-        assert_eq!(result["chips"], 100);
+        assert_eq!(result["chips"], Value::Null);
+        assert_eq!(result["chips_required"], 100);
         assert_eq!(result["ready"], true);
         assert_eq!(result["estimate_quality"], 0.85);
         assert!(result.get("legal_actions").is_none());

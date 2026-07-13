@@ -1,5 +1,77 @@
 use serde_json::Value;
 
+fn run_value(data: &Value) -> Option<&Value> {
+    data.get("run").or_else(|| data.get("round"))
+}
+
+fn parse_chip_value(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        .or_else(|| {
+            value
+                .as_str()
+                .map(|value| value.replace([',', ' '], ""))
+                .and_then(|value| value.parse::<i64>().ok())
+        })
+}
+
+/// Return the current score only; the blind target is never a score fallback.
+pub fn current_chips(data: &Value) -> Option<i64> {
+    run_value(data)
+        .and_then(|run| run.get("chips"))
+        .and_then(parse_chip_value)
+        .or_else(|| {
+            data.pointer("/run_info/chips_total")
+                .and_then(parse_chip_value)
+        })
+}
+
+/// Resolve the active blind's numeric chip requirement across bridge schemas.
+pub fn blind_chips_required(data: &Value) -> Option<i64> {
+    run_value(data)
+        .and_then(|run| {
+            run.pointer("/blind/chips_required")
+                .or_else(|| run.pointer("/blind/chips"))
+        })
+        .and_then(parse_chip_value)
+        .or_else(|| {
+            data.pointer("/blind/chips_required")
+                .or_else(|| data.pointer("/blind/chips"))
+                .and_then(parse_chip_value)
+        })
+        .or_else(|| {
+            data.pointer("/run_info/target_chips")
+                .and_then(parse_chip_value)
+        })
+}
+
+/// Return a normalized active-blind object, including numeric chips_required.
+pub fn active_blind(data: &Value) -> Option<Value> {
+    let mut blind = run_value(data)
+        .and_then(|run| run.get("blind"))
+        .cloned()
+        .or_else(|| data.get("blind").cloned())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let required = blind_chips_required(data);
+    if let Some(object) = blind.as_object_mut() {
+        if object
+            .get("chips_required")
+            .and_then(parse_chip_value)
+            .is_none()
+        {
+            if let Some(required) = required {
+                object.insert("chips_required".into(), serde_json::json!(required));
+            }
+        }
+    }
+    if blind.is_object() && !blind.as_object().is_some_and(|object| object.is_empty()) {
+        Some(blind)
+    } else {
+        required.map(|required| serde_json::json!({"chips_required": required}))
+    }
+}
+
 /// Extract a compact section of the observation/policy state.
 pub fn compact_observation(data: &Value, section: &str) -> Value {
     match section {
@@ -15,22 +87,17 @@ pub fn compact_observation(data: &Value, section: &str) -> Value {
 
 fn compact_summary(data: &Value) -> Value {
     let game = data.get("game");
-    let run = data.get("run");
+    let run = run_value(data);
     let areas = data.get("areas");
-    let chips = match run.and_then(|r| r.get("chips")).and_then(|r| r.as_i64()) {
-        Some(chips) => Some(chips),
-        None => run
-            .and_then(|r| r.get("blind"))
-            .and_then(|b| b.get("chips_required"))
-            .and_then(|c| c.as_i64()),
-    };
+    let blind = active_blind(data);
 
     serde_json::json!({
         "state": game.and_then(|g| g.get("state")).and_then(|g| g.as_str()),
         "ante": run.and_then(|r| r.get("ante")).and_then(|r| r.as_i64()),
         "round": run.and_then(|r| r.get("round")).and_then(|r| r.as_i64()),
-        "blind": run.and_then(|r| r.get("blind")).and_then(|r| r.get("name")).and_then(|r| r.as_str()),
-        "chips": chips,
+        "blind": blind.as_ref().and_then(|b| b.get("name")).and_then(|r| r.as_str()),
+        "chips": current_chips(data),
+        "chips_required": blind_chips_required(data),
         "hands_left": run.and_then(|r| r.get("hands_left")).and_then(|r| r.as_i64()),
         "discards_left": run.and_then(|r| r.get("discards_left")).and_then(|r| r.as_i64()),
         "dollars": run.and_then(|r| r.get("dollars")).and_then(|r| r.as_i64()),
@@ -95,13 +162,13 @@ fn compact_build(data: &Value) -> Value {
 }
 
 fn compact_blind(data: &Value) -> Value {
-    let run = data.get("run").and_then(|r| r.get("blind"));
+    let run = active_blind(data);
     serde_json::json!({
-        "name": run.and_then(|b| b.get("name")).and_then(|b| b.as_str()),
-        "boss": run.and_then(|b| b.get("boss")).and_then(|b| b.as_str()),
-        "chips_required": run.and_then(|b| b.get("chips_required")).and_then(|b| b.as_i64()),
-        "effect": run.and_then(|b| b.get("effect")).and_then(|b| b.get("name")).and_then(|b| b.as_str()),
-        "disabled": run.and_then(|b| b.get("disabled")).and_then(|b| b.as_str()),
+        "name": run.as_ref().and_then(|b| b.get("name")).and_then(|b| b.as_str()),
+        "boss": run.as_ref().and_then(|b| b.get("boss")).and_then(|b| b.as_str()),
+        "chips_required": blind_chips_required(data),
+        "effect": run.as_ref().and_then(|b| b.get("effect")).and_then(|b| b.get("name")).and_then(|b| b.as_str()),
+        "disabled": run.as_ref().and_then(|b| b.get("disabled")).and_then(|b| b.as_str()),
     })
 }
 
@@ -154,13 +221,38 @@ mod tests {
         assert_eq!(r["ante"].as_i64().unwrap(), 3);
         assert_eq!(r["round"].as_i64().unwrap(), 2);
         assert_eq!(r["blind"].as_str().unwrap(), "Cerebral");
-        assert_eq!(r["chips"].as_i64().unwrap(), 2850);
+        assert_eq!(r["chips"], Value::Null);
+        assert_eq!(r["chips_required"].as_i64().unwrap(), 2850);
         assert_eq!(r["hands_left"].as_i64().unwrap(), 3);
         assert_eq!(r["discards_left"].as_i64().unwrap(), 2);
         assert_eq!(r["dollars"].as_i64().unwrap(), 15);
         assert_eq!(
             r["jokers"].as_array().unwrap()[0].as_str().unwrap(),
             "Joker"
+        );
+    }
+
+    #[test]
+    fn chip_helpers_separate_current_score_from_blind_target() {
+        let root_blind = json!({
+            "round": {"chips": 1200},
+            "blind": {"name": "The Wall", "chips": 1600},
+            "run_info": {"target_chips": "1,600"}
+        });
+        assert_eq!(current_chips(&root_blind), Some(1200));
+        assert_eq!(blind_chips_required(&root_blind), Some(1600));
+        assert_eq!(active_blind(&root_blind).unwrap()["chips_required"], 1600);
+
+        let target_only = json!({"run_info": {"target_chips": "1,600"}});
+        assert_eq!(current_chips(&target_only), None);
+        assert_eq!(blind_chips_required(&target_only), Some(1600));
+        assert_eq!(
+            compact_observation(&target_only, "summary")["chips"],
+            Value::Null
+        );
+        assert_eq!(
+            compact_observation(&target_only, "summary")["chips_required"],
+            1600
         );
     }
     #[test]
@@ -171,9 +263,10 @@ mod tests {
         assert_eq!(r["ante"].as_i64(), None);
     }
     #[test]
-    fn test_compact_observation_summary_uses_blind_chip_fallback() {
+    fn test_compact_observation_summary_keeps_chip_fields_separate() {
         let r = compact_observation(&json!({"run":{"blind":{"chips_required":99}}}), "summary");
-        assert_eq!(r["chips"], 99);
+        assert_eq!(r["chips"], Value::Null);
+        assert_eq!(r["chips_required"], 99);
         let r = compact_observation(
             &json!({"run":{"chips":123,"blind":{"chips_required":99}}}),
             "summary",
