@@ -35,6 +35,9 @@ const CANONICAL_DISCARD_LIMIT: usize = 40;
 const CANONICAL_TARGET_LIMIT: usize = 60;
 const MAX_ACTION_PAGE: usize = 256;
 const POLICY_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_REPLAY_CONTEXT_BYTES: usize = 24 * 1024;
+const MAX_REPLAY_STEP_SUMMARIES: usize = 4;
+const MAX_REPLAY_TEXT_BYTES: usize = 256;
 
 fn compact_decision_snapshot(policy: &Value) -> Value {
     let run = policy.get("run").or_else(|| policy.get("round"));
@@ -186,6 +189,178 @@ fn compact_reasoning_comparisons(records: &Value) -> Value {
     )
 }
 
+fn bounded_text(value: &Value, max_bytes: usize) -> Value {
+    let Some(text) = value.as_str() else {
+        return value.clone();
+    };
+    if text.len() <= max_bytes {
+        return value.clone();
+    }
+    let mut truncated = text
+        .char_indices()
+        .take_while(|(index, _)| *index < max_bytes.saturating_sub(3))
+        .map(|(_, character)| character)
+        .collect::<String>();
+    truncated.push_str("...");
+    Value::String(truncated)
+}
+
+fn compact_replay(replay: &Value) -> Value {
+    let steps = replay
+        .get("steps")
+        .and_then(Value::as_array)
+        .map(|steps| {
+            steps
+                .iter()
+                .take(MAX_REPLAY_STEP_SUMMARIES)
+                .map(|step| {
+                    json!({
+                        "step_order": step.get("step_order"),
+                        "action_type": step.get("action_type"),
+                        "details": bounded_text(step.get("details").unwrap_or(&Value::Null), MAX_REPLAY_TEXT_BYTES),
+                        "hand_type": step.get("hand_type"),
+                        "final_score": step.get("final_score"),
+                        "consumable_name": step.get("consumable_name"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "replay_id": replay.get("replay_id"),
+        "seed": replay.get("seed"),
+        "ante": replay.get("ante"),
+        "stake": replay.get("stake"),
+        "blind_key": replay.get("blind_key"),
+        "outcome": replay.get("outcome"),
+        "chips_required": replay.get("chips_required"),
+        "max_chips_gained": replay.get("max_chips_gained"),
+        "step_count": replay.get("steps").and_then(Value::as_array).map(Vec::len),
+        "step_summaries": steps,
+    })
+}
+
+fn compact_prior_decision(record: &Value) -> Value {
+    json!({
+        "decision_id": record.get("decision_id"),
+        "action_id": record.get("action_id"),
+        "action_type": record.get("action_type"),
+        "why_this_action": bounded_text(record.get("why_this_action").unwrap_or(&Value::Null), MAX_REPLAY_TEXT_BYTES),
+        "alternatives_considered": bounded_text(record.get("alternatives_considered").unwrap_or(&Value::Null), MAX_REPLAY_TEXT_BYTES),
+        "expected_outcome": bounded_text(record.get("expected_outcome").unwrap_or(&Value::Null), MAX_REPLAY_TEXT_BYTES),
+        "observed_outcome": record.get("observed_outcome"),
+        "confidence": record.get("confidence"),
+        "created_at": record.get("created_at"),
+    })
+}
+
+fn compact_replay_context(
+    replays: &Value,
+    decision_records: &Value,
+    review_required: bool,
+    log_required: bool,
+    seed: &str,
+    ante: i64,
+    stake: i64,
+    blind_key: Option<&str>,
+    error: Option<&str>,
+) -> Value {
+    let replay_values = replays
+        .as_array()
+        .map(|items| items.iter().map(compact_replay).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let decision_values = decision_records
+        .as_array()
+        .map(|items| items.iter().map(compact_prior_decision).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    let build = |replay_count: usize, decision_count: usize, truncated: bool| {
+        let included_decisions = Value::Array(decision_values[..decision_count].to_vec());
+        let reasoning_comparisons = compact_reasoning_comparisons(&included_decisions);
+        let mut context = json!({
+            "review_required": review_required,
+            "log_required_after_resolution": log_required,
+            "seed": seed,
+            "ante": ante,
+            "stake": stake,
+            "blind_key": blind_key,
+            "matching_replays": replay_values[..replay_count].to_vec(),
+            "prior_decisions": included_decisions,
+            "reasoning_comparisons": reasoning_comparisons,
+            "instruction": "Review matching clear/failure history and prior decision reasoning before committing to this blind; state why each strategic action is preferred, then log the outcome immediately after resolution."
+        });
+        if let Some(error) = error {
+            context["error"] =
+                bounded_text(&Value::String(error.to_owned()), MAX_REPLAY_TEXT_BYTES);
+        }
+        if truncated {
+            context["truncation"] = json!({
+                "truncated": true,
+                "max_bytes": MAX_REPLAY_CONTEXT_BYTES,
+                "matching_replays_total": replay_values.len(),
+                "matching_replays_included": replay_count,
+                "prior_decisions_total": decision_values.len(),
+                "prior_decisions_included": decision_count,
+            });
+        }
+        context
+    };
+
+    let complete = build(replay_values.len(), decision_values.len(), false);
+    let complete_bytes = serde_json::to_vec(&complete).map_or(usize::MAX, |bytes| bytes.len());
+    if complete_bytes <= MAX_REPLAY_CONTEXT_BYTES {
+        return complete;
+    }
+
+    let mut replay_count = 0;
+    let mut decision_count = 0;
+    loop {
+        let mut added = false;
+        if replay_count < replay_values.len()
+            && serde_json::to_vec(&build(replay_count + 1, decision_count, true))
+                .map_or(false, |bytes| bytes.len() <= MAX_REPLAY_CONTEXT_BYTES)
+        {
+            replay_count += 1;
+            added = true;
+        }
+        if decision_count < decision_values.len()
+            && serde_json::to_vec(&build(replay_count, decision_count + 1, true))
+                .map_or(false, |bytes| bytes.len() <= MAX_REPLAY_CONTEXT_BYTES)
+        {
+            decision_count += 1;
+            added = true;
+        }
+        if !added {
+            break;
+        }
+    }
+    let mut bounded = build(replay_count, decision_count, true);
+    let bounded_bytes = serde_json::to_vec(&bounded).map_or(usize::MAX, |bytes| bytes.len());
+    if bounded_bytes > MAX_REPLAY_CONTEXT_BYTES {
+        bounded = json!({
+            "review_required": review_required,
+            "log_required_after_resolution": log_required,
+            "seed": seed,
+            "ante": ante,
+            "stake": stake,
+            "blind_key": blind_key,
+            "matching_replays": [],
+            "prior_decisions": [],
+            "reasoning_comparisons": [],
+            "instruction": "Replay context exceeded its byte budget; use query_replays for deliberate detailed history inspection.",
+            "truncation": {
+                "truncated": true,
+                "max_bytes": MAX_REPLAY_CONTEXT_BYTES,
+                "matching_replays_total": replay_values.len(),
+                "matching_replays_included": 0,
+                "prior_decisions_total": decision_values.len(),
+                "prior_decisions_included": 0,
+            }
+        });
+    }
+    bounded
+}
+
 fn canonical_json(value: &Value) -> String {
     match value {
         Value::Null => "null".into(),
@@ -236,7 +411,17 @@ fn decision_id_for(observation: &Value) -> String {
     digest("d3", &basis)
 }
 
-fn semantic_decision_id_for(policy: &Value) -> String {
+fn bridge_session_id(observation: &Value) -> Option<&str> {
+    observation
+        .pointer("/bridge/session_id")
+        .and_then(Value::as_str)
+        .filter(|session_id| !session_id.is_empty())
+}
+
+fn semantic_decision_id_for_with_session(
+    policy: &Value,
+    bridge_session_id: Option<&str>,
+) -> String {
     let basis = json!({
         "game": policy.get("game"),
         "legal_actions": policy.get("legal_actions"),
@@ -245,8 +430,13 @@ fn semantic_decision_id_for(policy: &Value) -> String {
         "slots": policy.get("slots"),
         "run_phase": policy.get("run_phase"),
         "score_pressure": policy.get("score_pressure"),
+        "bridge_session_id": bridge_session_id,
     });
     digest("d4", &basis)
+}
+
+fn semantic_decision_id_for(policy: &Value) -> String {
+    semantic_decision_id_for_with_session(policy, None)
 }
 
 fn canonical_policy_decision_id(observation: &Value) -> String {
@@ -256,7 +446,7 @@ fn canonical_policy_decision_id(observation: &Value) -> String {
         CANONICAL_DISCARD_LIMIT,
         CANONICAL_TARGET_LIMIT,
     );
-    semantic_decision_id_for(&state)
+    semantic_decision_id_for_with_session(&state, bridge_session_id(observation))
 }
 
 fn page_legal_actions(
@@ -607,31 +797,28 @@ impl Server {
             .decision_records(SEED, ante, stake, blind_key, 40)
             .unwrap_or_else(|_| json!([]));
         match query {
-            Ok(replays) => json!({
-                "review_required": review_required,
-                "log_required_after_resolution": log_required,
-                "seed": SEED,
-                "ante": ante,
-                "stake": stake,
-                "blind_key": blind_key,
-                "matching_replays": replays,
-                "prior_decisions": decision_records,
-                "reasoning_comparisons": compact_reasoning_comparisons(&decision_records),
-                "instruction": "Review matching clear/failure history and prior decision reasoning before committing to this blind; state why each strategic action is preferred, then log the outcome immediately after resolution."
-            }),
-            Err(error) => json!({
-                "review_required": review_required,
-                "log_required_after_resolution": log_required,
-                "seed": SEED,
-                "ante": ante,
-                "stake": stake,
-                "blind_key": blind_key,
-                "matching_replays": [],
-                "prior_decisions": decision_records,
-                "reasoning_comparisons": compact_reasoning_comparisons(&decision_records),
-                "error": error,
-                "instruction": "Replay history could not be read; continue only with an explicit strategy decision and record the outcome after resolution."
-            }),
+            Ok(replays) => compact_replay_context(
+                &replays,
+                &decision_records,
+                review_required,
+                log_required,
+                SEED,
+                ante,
+                stake,
+                blind_key,
+                None,
+            ),
+            Err(error) => compact_replay_context(
+                &json!([]),
+                &decision_records,
+                review_required,
+                log_required,
+                SEED,
+                ante,
+                stake,
+                blind_key,
+                Some(&error),
+            ),
         }
     }
 
@@ -706,6 +893,13 @@ impl Server {
                     .unwrap_or("unknown"),
                 runtime::EXPECTED_BRIDGE_VERSION
             ));
+        }
+        if bridge
+            .get("session_id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            problems.push("bridge session_id missing; restart the bridge before mutation".into());
         }
         json!({
             "schema": "balatro-agent-status/v2.0",
@@ -1191,7 +1385,7 @@ impl Server {
         if current_decision_id.is_empty() {
             return to_tool_result(envelope(
                 false,
-                current,
+                compact_policy_state(&current),
                 "decision_failed",
                 "current observation has no decision_id",
             ));
@@ -1199,7 +1393,7 @@ impl Server {
         if params.decision_id != current_decision_id {
             return to_tool_result(envelope(
                 false,
-                current,
+                compact_policy_state(&current),
                 "stale_decision",
                 "decision_id is stale because the live state changed; use the returned current decision_id and legal_actions, and do not retry the previous action",
             ));
@@ -1221,7 +1415,7 @@ impl Server {
                 None => {
                     return to_tool_result(envelope(
                         false,
-                        current,
+                        compact_policy_state(&current),
                         "action_not_found",
                         "action_id is not in the current legal action set",
                     ));
@@ -1234,7 +1428,7 @@ impl Server {
                     if params.card_indices.is_empty() {
                         return to_tool_result(envelope(
                             false,
-                            current,
+                            compact_policy_state(&current),
                             "invalid_arguments",
                             "card_indices is required for play_selected/discard_selected",
                         ));
@@ -1249,7 +1443,7 @@ impl Server {
                         Err(error) => {
                             return to_tool_result(envelope(
                                 false,
-                                current,
+                                compact_policy_state(&current),
                                 "invalid_arguments",
                                 &error,
                             ));
@@ -1277,7 +1471,7 @@ impl Server {
             {
                 return to_tool_result(envelope(
                     false,
-                    current,
+                    compact_policy_state(&current),
                     "invalid_arguments",
                     "target_indices must be distinct 1-based positions in the current hand",
                 ));
@@ -1290,7 +1484,7 @@ impl Server {
             if params.why_this_action.trim().is_empty() {
                 return to_tool_result(envelope(
                     false,
-                    current,
+                    compact_policy_state(&current),
                     "missing_rationale",
                     "why_this_action is required for strategic actions",
                 ));
@@ -1301,7 +1495,7 @@ impl Server {
             {
                 return to_tool_result(envelope(
                     false,
-                    current,
+                    compact_policy_state(&current),
                     "invalid_arguments",
                     "confidence must be between 0 and 1",
                 ));
@@ -1357,7 +1551,10 @@ impl Server {
                 loop {
                     if let Ok(observation) = self.read_observation() {
                         let semantic_state = build_policy_state(&observation, 40, 40, 60);
-                        let decision_id = semantic_decision_id_for(&semantic_state);
+                        let decision_id = semantic_decision_id_for_with_session(
+                            &semantic_state,
+                            bridge_session_id(&observation),
+                        );
                         changed = decision_id != before_decision_id
                             || observation_state(&observation) != before_state;
                         if changed {
@@ -2602,6 +2799,80 @@ mod tests {
         assert_eq!(result.structured_content.unwrap()["ok"], true);
     }
 
+    #[test]
+    fn replay_context_is_compact_and_deterministically_bounded() {
+        let replays = Value::Array(
+            (0..80)
+                .map(|id| {
+                    json!({
+                        "replay_id": id,
+                        "seed": SEED,
+                        "ante": 1,
+                        "stake": 1,
+                        "blind_key": "S_1",
+                        "outcome": "clear",
+                        "chips_required": 300,
+                        "max_chips_gained": 500,
+                        "steps": [{
+                            "step_order": 1,
+                            "action_type": "play",
+                            "details": "x".repeat(20_000),
+                            "rationale": "do not include this blob",
+                            "notes": "do not include this blob",
+                            "hand_type": "Pair",
+                            "final_score": 500
+                        }]
+                    })
+                })
+                .collect(),
+        );
+        let decisions = Value::Array(
+            (0..80)
+                .map(|id| {
+                    json!({
+                        "decision_id": format!("d-{id}"),
+                        "action_id": "play_selected",
+                        "action_type": "play",
+                        "why_this_action": "w".repeat(20_000),
+                        "alternatives_considered": "a".repeat(20_000),
+                        "expected_outcome": "e".repeat(20_000),
+                        "observed_outcome": "unknown",
+                        "before_state": {"huge": "snapshot"},
+                        "after_state": {"huge": "snapshot"}
+                    })
+                })
+                .collect(),
+        );
+        let context = compact_replay_context(
+            &replays,
+            &decisions,
+            true,
+            false,
+            SEED,
+            1,
+            1,
+            Some("S_1"),
+            None,
+        );
+        assert!(serde_json::to_vec(&context).unwrap().len() <= MAX_REPLAY_CONTEXT_BYTES);
+        assert_eq!(context["truncation"]["truncated"], true);
+        assert!(context.get("steps").is_none());
+        assert!(context.get("rationale").is_none());
+        assert!(context.get("before_state").is_none());
+        assert!(
+            context["matching_replays"][0]
+                .get("step_summaries")
+                .is_some()
+        );
+        assert!(
+            context["matching_replays"][0]["step_summaries"][0]["details"]
+                .as_str()
+                .unwrap()
+                .len()
+                < 20_000
+        );
+    }
+
     #[tokio::test]
     async fn every_tool_route_has_a_no_game_boundary_path() {
         let (_dir, server) = server();
@@ -2850,6 +3121,183 @@ mod tests {
         let age_path = server.runtime_root.join("Balatro/codex_observation.json");
         std::fs::create_dir_all(age_path.parent().unwrap()).unwrap();
         std::fs::write(age_path, b"{}").unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_bridge_session_is_unsafe_for_mutation() {
+        let (_dir, server) = server();
+        write_fixture(&server);
+        *server.process_override.lock().await = Some(vec![json!({
+            "pid": 1234,
+            "name": "Balatro.exe"
+        })]);
+        let mut observation: Value =
+            serde_json::from_slice(&std::fs::read(&server.ipc.observation_path).unwrap()).unwrap();
+        observation["bridge"]["session_id"] = Value::String(String::new());
+        std::fs::write(
+            &server.ipc.observation_path,
+            serde_json::to_vec(&observation).unwrap(),
+        )
+        .unwrap();
+
+        let status = server.status().await;
+        assert_eq!(status["safe_for_mutation"], false);
+        assert!(
+            status["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|problem| problem.as_str().unwrap().contains("session_id"))
+        );
+        let error = server.preflight().await.unwrap_err();
+        assert_eq!(error["error"]["code"], "unsafe_runtime");
+    }
+
+    #[tokio::test]
+    async fn pre_restart_decision_is_rejected_with_compact_current_decision() {
+        let (_dir, server) = server();
+        write_fixture(&server);
+        *server.process_override.lock().await = Some(vec![json!({
+            "pid": 1234,
+            "name": "Balatro.exe"
+        })]);
+        let first = server
+            .get_decision(Parameters(DecisionParams {
+                action_type: String::new(),
+                limit: 40,
+                action_limit: 80,
+                action_offset: 0,
+                detail: "compact".into(),
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        let old_decision_id = first["data"]["decision_id"].as_str().unwrap().to_owned();
+
+        let mut restarted: Value =
+            serde_json::from_slice(&std::fs::read(&server.ipc.observation_path).unwrap()).unwrap();
+        restarted["bridge"]["session_id"] = json!("after-restart");
+        std::fs::write(
+            &server.ipc.observation_path,
+            serde_json::to_vec(&restarted).unwrap(),
+        )
+        .unwrap();
+        let fresh = server
+            .get_decision(Parameters(DecisionParams {
+                action_type: String::new(),
+                limit: 40,
+                action_limit: 80,
+                action_offset: 0,
+                detail: "compact".into(),
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        let new_decision_id = fresh["data"]["decision_id"].as_str().unwrap();
+        assert_ne!(old_decision_id, new_decision_id);
+
+        let stale = server
+            .take_action(Parameters(ActionParams {
+                action_id: "play_a".into(),
+                decision_id: old_decision_id,
+                settle_timeout: 1.0,
+                card_indices: vec![],
+                card_ids: vec![],
+                target_indices: vec![],
+                why_this_action: "test stale recovery".into(),
+                alternatives_considered: None,
+                expected_outcome: None,
+                confidence: None,
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(stale["error"]["code"], "stale_decision");
+        assert_eq!(stale["data"]["decision_id"], new_decision_id);
+        assert!(stale["data"]["legal_actions"].is_array());
+        assert!(stale["data"].get("replay_context").is_none());
+        assert!(serde_json::to_vec(&stale).unwrap().len() < 50_000);
+    }
+
+    #[tokio::test]
+    async fn full_and_compact_decisions_stay_bounded_with_replay_history() {
+        let (_dir, server) = server();
+        write_fixture(&server);
+        let replay_db = server.replay_db.lock().await;
+        for _ in 0..40 {
+            let steps = vec![(
+                "play".to_string(),
+                "d".repeat(2_000),
+                Some("r".repeat(2_000)),
+                "Pair".to_string(),
+                None,
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("n".repeat(2_000)),
+            )];
+            replay_db
+                .log_clear(
+                    SEED,
+                    1,
+                    1,
+                    "S_1",
+                    &[],
+                    &[],
+                    &[],
+                    None,
+                    None,
+                    "",
+                    "",
+                    &steps,
+                    &[],
+                    "",
+                )
+                .unwrap();
+        }
+        drop(replay_db);
+
+        let full = server
+            .get_decision(Parameters(DecisionParams {
+                action_type: String::new(),
+                limit: 40,
+                action_limit: 80,
+                action_offset: 0,
+                detail: "full".into(),
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        let compact = server
+            .get_decision(Parameters(DecisionParams {
+                action_type: String::new(),
+                limit: 40,
+                action_limit: 80,
+                action_offset: 0,
+                detail: "compact".into(),
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert!(serde_json::to_vec(&full).unwrap().len() < 50_000);
+        assert!(serde_json::to_vec(&compact).unwrap().len() < 50_000);
+        assert!(
+            serde_json::to_vec(&full["data"]["replay_context"])
+                .unwrap()
+                .len()
+                <= MAX_REPLAY_CONTEXT_BYTES
+        );
+        assert!(compact["data"].get("replay_context").is_none());
     }
 
     #[tokio::test]
@@ -3339,6 +3787,27 @@ mod tests {
         assert_ne!(
             semantic_decision_id_for(&limited),
             semantic_decision_id_for(&canonical)
+        );
+
+        let session_one = json!({
+            "game": {"state": "SELECTING_HAND"},
+            "bridge": {"session_id": "before-restart", "observation_seq": 1}
+        });
+        let session_one_polled = json!({
+            "game": {"state": "SELECTING_HAND"},
+            "bridge": {"session_id": "before-restart", "observation_seq": 2}
+        });
+        let session_two = json!({
+            "game": {"state": "SELECTING_HAND"},
+            "bridge": {"session_id": "after-restart", "observation_seq": 1}
+        });
+        assert_eq!(
+            canonical_policy_decision_id(&session_one),
+            canonical_policy_decision_id(&session_one_polled)
+        );
+        assert_ne!(
+            canonical_policy_decision_id(&session_one),
+            canonical_policy_decision_id(&session_two)
         );
 
         let template = canonical["legal_actions"]
