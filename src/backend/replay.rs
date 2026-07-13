@@ -1,9 +1,24 @@
 use rusqlite::{Connection, OpenFlags, Row, TransactionBehavior};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 const CLEAR: &str = "clear";
 const FAIL: &str = "fail";
+pub const MAX_REPLAY_NOTE_BYTES: usize = 64 * 1024;
+
+fn bounded_replay_note(note: Option<&String>) -> Option<String> {
+    let note = note?;
+    if note.len() <= MAX_REPLAY_NOTE_BYTES {
+        return Some(note.clone());
+    }
+    Some(
+        json!({
+            "truncated": true,
+            "bytes": note.len(),
+        })
+        .to_string(),
+    )
+}
 
 type ReplayRow = (
     i64,
@@ -291,6 +306,27 @@ impl ReplayDB {
         }
     }
 
+    pub fn health(&self) -> Result<Value, String> {
+        let bytes = fs::metadata(&self.db_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let conn = self.open()?;
+        self.init_db(&conn)?;
+        let (replays, steps, max_notes): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM replay), (SELECT COUNT(*) FROM replay_step), COALESCE((SELECT MAX(length(notes)) FROM replay_step), 0)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .context("replay health")?;
+        Ok(json!({
+            "database_bytes": bytes,
+            "replays": replays,
+            "replay_steps": steps,
+            "max_step_notes_bytes": max_notes,
+        }))
+    }
+
     fn load_replay_detail(&self, conn: &Connection, replay_id: i64) -> Result<Value, String> {
         let mut jokers = Vec::new();
         let mut stmt = conn.prepare("SELECT slot_order, joker_name, edition, enhancement, notes FROM replay_joker_config WHERE replay_id=? ORDER BY slot_order").map_err(|e| e.to_string())?;
@@ -505,8 +541,9 @@ impl ReplayDB {
         for (idx, (action, details, rationale, ht, ch, cd, dc, fc, bc, bm, fs, cn, th, nt)) in
             steps.iter().enumerate()
         {
+            let bounded_notes = bounded_replay_note(nt.as_ref());
             tx.execute("INSERT INTO replay_step (replay_id, step_order, action_type, details, rationale, hand_type, cards_held, cards_discarded, discard_count, final_cards, base_chips, base_mult, final_score, consumable_name, consumable_target_hand, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                rusqlite::params![rid, idx + 1, action, details, rationale, ht, ch, cd, dc, fc, bc, bm, fs, cn, th, nt])
+                rusqlite::params![rid, idx + 1, action, details, rationale, ht, ch, cd, dc, fc, bc, bm, fs, cn, th, bounded_notes])
                 .context("insert step")?;
         }
         for (slot, name, edition, enh, notes) in jokers {
@@ -586,8 +623,9 @@ impl ReplayDB {
         for (idx, (action, details, rationale, ht, ch, cd, dc, fc, bc, bm, fs, cn, th, nt)) in
             steps.iter().enumerate()
         {
+            let bounded_notes = bounded_replay_note(nt.as_ref());
             conn.execute("INSERT INTO replay_step (replay_id, step_order, action_type, details, rationale, hand_type, cards_held, cards_discarded, discard_count, final_cards, base_chips, base_mult, final_score, consumable_name, consumable_target_hand, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                rusqlite::params![rid, idx + 1, action, details, rationale, ht, ch, cd, dc, fc, bc, bm, fs, cn, th, nt])
+                rusqlite::params![rid, idx + 1, action, details, rationale, ht, ch, cd, dc, fc, bc, bm, fs, cn, th, bounded_notes])
                 .context("insert failed replay step")?;
         }
         Ok(rid)
@@ -729,6 +767,37 @@ mod tests {
             .query_replays(None, None, None, None, Some("fail"), false)
             .unwrap();
         assert!(text["text"].as_str().unwrap().contains("FAILED"));
+    }
+
+    #[test]
+    fn oversized_replay_notes_are_reduced_to_bounded_summaries() {
+        let (db, _dir) = make_db();
+        let oversized = "x".repeat(MAX_REPLAY_NOTE_BYTES + 1);
+        let steps = vec![(
+            "play".to_string(),
+            "details".to_string(),
+            None,
+            "Flush".to_string(),
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(oversized),
+        )];
+        db.log_fail_with_steps("2K9H9HN", 1, 1, "Small", &steps)
+            .unwrap();
+        let health = db.health().unwrap();
+        assert!(health["max_step_notes_bytes"].as_i64().unwrap() <= 64);
+        let conn = db.open().unwrap();
+        let note: String = conn
+            .query_row("SELECT notes FROM replay_step", [], |row| row.get(0))
+            .unwrap();
+        assert!(note.contains("truncated"));
     }
 
     #[test]

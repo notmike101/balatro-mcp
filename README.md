@@ -35,4 +35,29 @@ Begin with `game_status`; use `start_new_run(confirm_override=true)` to always s
 
 The MCP exposes no raw controller commands, coordinates, arbitrary filesystem reads, database rebuilds, or face-down-card identities. See [`AGENTS.md`](AGENTS.md) for the strict gameplay workflow.
 
+## Shared runtime and recovery
+
+Multiple configured MCP sessions may remain connected, but mutations of the
+shared Balatro runtime are serialized by `agent/mcp_runtime.lock` across
+processes. A `mutation_busy` result means another mutation is still in
+progress: wait, reread `game_status`/`get_decision`, and never retry an old
+action. After a successful bridge action, `take_action` may include
+`data.decision_record.stored=false`; this is a nonfatal audit warning and the
+action has already been applied.
+
+For a deliberate persistence reset, stop stale `balatro-mcp.exe` processes
+first, then run the release binary with the configured runtime root:
+
+```powershell
+$env:BALATRO_RUNTIME_ROOT = "C:\Users\me\AppData\Roaming\Balatro"
+& "D:\balatro-mcp\target\release\balatro-mcp.exe" state reset --confirm
+```
+
+The command refuses missing confirmation or an owned runtime lock, and archives
+both `rust_state.db` and `replays.db` (including SQLite sidecars) under a UTC
+timestamped `agent\archive-state-reset-*` directory. It does not delete the
+archives or start Balatro. Stop stale MCP processes before reset and before a
+release rebuild. `runtime_diagnostics` reports capped database sizes, row
+counts, largest snapshots/notes, and lock availability.
+
 The static rules database is managed by the Rust binary. Use `balatro-mcp rules build`, `balatro-mcp rules lookup`, `balatro-mcp rules list`, and `balatro-mcp rules stats` for local maintenance and inspection.

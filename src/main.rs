@@ -10,6 +10,7 @@ mod protocol;
 mod rules;
 mod tools;
 
+use backend::runtime;
 use rmcp::ServiceExt;
 
 #[tokio::main]
@@ -23,6 +24,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     crash::install(runtime_root.join("agent").join("mcp_crash.log"));
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(value) = rules::cli(&root, &args)? {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    if let Some(value) = runtime::cli(&runtime_root, &args)? {
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
