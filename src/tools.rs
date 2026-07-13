@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 
 use crate::backend::{
     ipc::{IpcPaths, advance_safe_internal, execute_policy_action, start_new_run},
-    policy::{SAFE_TRANSITION_ACTIONS, build_policy_state},
+    policy::{SAFE_TRANSITION_ACTIONS, build_policy_state, compact_policy_state},
     replay::ReplayDB,
     runtime::{self, balatro_processes, observation_age},
     scoring::score_hand,
@@ -386,6 +386,10 @@ impl Server {
         object.insert("score_analysis".into(), score.clone());
         object.insert("estimate_quality".into(), score["estimate_quality"].clone());
         Ok(state)
+    }
+
+    async fn compact_policy(&self, limit: u32) -> Result<Value, String> {
+        Ok(compact_policy_state(&self.policy(limit).await?))
     }
 
     async fn status(&self) -> Value {
@@ -849,7 +853,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Read targeted live state. This is read-only and does not return a decision_id or legal_actions; call get_decision for actionable state. Valid sections: summary, hand, build, blind, hand_values, all."
+        description = "Read compact targeted state. Use summary, hand, build, blind, or hand_values for normal play; all is verbose diagnostic state. This is read-only; call get_decision for actions."
     )]
     async fn observe(
         &self,
@@ -883,13 +887,25 @@ impl Server {
     }
 
     #[tool(
-        description = "Return the current decision_id, a compact legal-action list with caller-supplied play_selected/discard_selected templates for arbitrary positions, rankings, and strategy analysis. When legal_actions_truncated is true, call get_decision again with action_offset set to legal_actions_next_offset and an explicit action_limit; repeat until legal_actions_next_offset is null. The same pagination contract applies after action_type filtering. In GAME_OVER, from_game_over is a game-specific ui_click and return_to_menu is also available as a safe_transition. Examine decision_checks.ordering.hand_order and decision_checks.ordering.joker_order when jokers are present and trigger sequence can affect scoring. Examine decision_checks.consumables when Tarot/Planet/Spectral cards are owned or available in shop; use or sell before exiting or advancing. Examine decision_checks.shop and decision_checks.slots during SHOP state to track remaining items and indexes after each purchase."
+        description = "Return current decision_id, compact legal actions, hand context, score pressure, and safety flags. detail=full opts into expanded analysis. Page with action_offset/action_limit until legal_actions_next_offset is null; refresh on stale_decision."
     )]
     async fn get_decision(
         &self,
         Parameters(params): Parameters<DecisionParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        match self.policy(params.limit).await {
+        if !["compact", "full"].contains(&params.detail.as_str()) {
+            return to_tool_result(envelope(
+                false,
+                Value::Null,
+                "invalid_arguments",
+                "detail must be compact or full",
+            ));
+        }
+        match if params.detail == "full" {
+            self.policy(params.limit).await
+        } else {
+            self.compact_policy(params.limit).await
+        } {
             Ok(mut data) => {
                 page_legal_actions(
                     &mut data,
@@ -904,7 +920,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Execute exactly one current legal action using action_id and a non-empty decision_id. For arbitrary play/discard selections, use the legal play_selected or discard_selected action with 1-based card_indices. If the live state changes and stale_decision is returned, use the returned current decision_id and legal_actions, then retry the action. The current legal action set is authoritative because bridge polling can refresh snapshots between tool calls; mutations are serialized and checkpointed."
+        description = "Execute exactly one current legal action using action_id and a non-empty decision_id. For play/discard, use the legal play_selected or discard_selected action with any distinct 1-based card_indices needed for the intended hand, up to the live play limit. If the live state changes and stale_decision is returned, use the returned current decision_id and legal_actions, then retry the action. The current legal action set is authoritative because bridge polling can refresh snapshots between tool calls; mutations are serialized and checkpointed."
     )]
     async fn take_action(
         &self,
@@ -1036,7 +1052,7 @@ impl Server {
                         .get("message")
                         .and_then(Value::as_str)
                         .unwrap_or("bridge rejected the policy action");
-                    let current = self.policy(40).await.unwrap_or(Value::Null);
+                    let current = self.compact_policy(40).await.unwrap_or(Value::Null);
                     return to_tool_result(envelope(
                         false,
                         current,
@@ -1062,7 +1078,7 @@ impl Server {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 let mut next = if changed {
-                    self.policy(40)
+                    self.compact_policy(40)
                         .await
                         .unwrap_or_else(|_| json!({"legal_actions": []}))
                 } else {
@@ -1083,7 +1099,7 @@ impl Server {
                 to_tool_result(envelope(true, next, "", ""))
             }
             Ok(Err(error)) => {
-                let current = self.policy(40).await.unwrap_or(Value::Null);
+                let current = self.compact_policy(40).await.unwrap_or(Value::Null);
                 let code = action_error_code(&error);
                 to_tool_result(envelope(false, current, code, &error))
             }
@@ -1785,7 +1801,7 @@ impl rmcp::ServerHandler for Server {
                 .with_description("Rust stdio boundary for safe Balatro gameplay."),
         )
         .with_instructions(
-            "Use only these MCP tools for Balatro. Start with game_status; if the main menu has a non-target saved seed, use start_new_run to recover to 2K9H9HN; then get_decision. Examine decision_checks.ordering when jokers are present; examine decision_checks.consumables for owned or shop Tarot/Planet/Spectral; examine decision_checks.shop and decision_checks.slots during SHOP state; execute only a current legal action_id with its decision_id, refreshing and retrying on stale_decision. In ROUND_EVAL use proceed_round, then next_round in SHOP. For arbitrary hand selections, use play_selected or discard_selected with 1-based card_indices. score_hand also uses 1-based indices and hand_values returns the live contract. observe is read-only and wait_for_state returns next_step=get_decision; page get_decision from legal_actions_next_offset until it is null, including after action_type filtering. Use run_state(kind=checkpoint) before event_history when current live history is needed.",
+            "Use only these MCP tools. Start with game_status, recover seed 2K9H9HN with start_new_run when needed, then get_decision. Execute only current legal actions with decision_id; refresh on stale_decision. Use play_selected/discard_selected with distinct 1-based card_indices. get_decision is compact by default; use detail=full only for analysis. Page actions until legal_actions_next_offset is null. observe summary/hand/build/blind are compact; all is diagnostic. In ROUND_EVAL use proceed_round, then next_round in SHOP.",
         )
     }
     #[cfg_attr(coverage_nightly, coverage(off))]
@@ -2078,7 +2094,8 @@ mod tests {
                     action_type: String::new(),
                     limit: 1,
                     action_limit: 80,
-                    action_offset: 0
+                    action_offset: 0,
+                    detail: "compact".into()
                 }))
                 .await
                 .is_ok()
@@ -2089,7 +2106,8 @@ mod tests {
                     action_type: "play".into(),
                     limit: 10,
                     action_limit: 80,
-                    action_offset: 0
+                    action_offset: 0,
+                    detail: "compact".into()
                 }))
                 .await
                 .is_ok()
@@ -2335,6 +2353,7 @@ mod tests {
                 limit: 10,
                 action_limit: 2,
                 action_offset: 0,
+                detail: "compact".into(),
             }))
             .await
             .unwrap()
@@ -2351,13 +2370,30 @@ mod tests {
                 .iter()
                 .any(|action| action["action_id"] == "discard_selected")
         );
+        assert!(decision["data"]["schema"] == "balatro-mcp/policy-compact/v1");
+        assert!(decision.get("legal_actions").is_none());
+        let full_decision = server
+            .get_decision(Parameters(DecisionParams {
+                action_type: String::new(),
+                limit: 10,
+                action_limit: 2,
+                action_offset: 0,
+                detail: "full".into(),
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(full_decision["data"]["schema"], "balatro-mcp/policy/v3");
+        assert!(full_decision["data"]["decision_checks"]["ordering"]["instruction"].is_string());
         assert!(
             server
                 .get_decision(Parameters(DecisionParams {
                     action_type: "play".into(),
                     limit: 10,
                     action_limit: 80,
-                    action_offset: 0
+                    action_offset: 0,
+                    detail: "compact".into()
                 }))
                 .await
                 .is_ok()

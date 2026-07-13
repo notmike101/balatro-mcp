@@ -34,18 +34,21 @@ pub fn envelope(ok: bool, data: Value, code: &str, message: &str) -> Value {
     let data = sanitize(data);
     let state = value_state(&data).unwrap_or(Value::Null);
     let decision_id = data.get("decision_id").cloned().unwrap_or(Value::Null);
-    let legal = data
-        .get("legal_actions")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
     let mut answer = Map::new();
-    answer.insert("schema".into(), json!("balatro-mcp/envelope/v3"));
+    answer.insert("schema".into(), json!("balatro-mcp/envelope/v4"));
     answer.insert("ok".into(), Value::Bool(ok));
     answer.insert("state".into(), state);
     answer.insert("decision_id".into(), decision_id);
-    answer.insert("legal_actions".into(), legal);
     answer.insert("data".into(), data);
     if !ok {
+        if let Some(legal) = answer
+            .get("data")
+            .and_then(|data| data.get("legal_actions"))
+        {
+            if legal.as_array().is_some_and(|items| !items.is_empty()) {
+                answer.insert("legal_actions".into(), legal.clone());
+            }
+        }
         answer.insert("error".into(), json!({"code": code, "message": message}));
     }
     Value::Object(answer)
@@ -257,7 +260,6 @@ mod tests {
         assert_eq!(result["ok"], true);
         assert!(result.get("state").is_some());
         assert!(result.get("decision_id").is_some());
-        assert!(result.get("legal_actions").is_some());
         assert!(result.get("data").is_some());
         assert!(!result.get("error").is_some());
     }
@@ -285,16 +287,28 @@ mod tests {
     }
 
     #[test]
-    fn envelope_defaults_legal_actions_to_empty_array() {
+    fn envelope_does_not_duplicate_empty_legal_actions() {
         let result = envelope(true, json!({}), "", "");
-        assert_eq!(result["legal_actions"], json!([]));
+        assert!(result.get("legal_actions").is_none());
     }
 
     #[test]
     fn envelope_preserves_data_legal_actions() {
         let data = json!({"legal_actions": [{"id": "play:1"}]});
         let result = envelope(true, data, "", "");
-        assert_eq!(result["legal_actions"][0]["id"], "play:1");
+        assert_eq!(result["data"]["legal_actions"][0]["id"], "play:1");
+        assert!(result.get("legal_actions").is_none());
+    }
+
+    #[test]
+    fn envelope_keeps_legal_actions_for_error_recovery_only() {
+        let result = envelope(
+            false,
+            json!({"legal_actions": [{"id": "retry"}]}),
+            "stale_decision",
+            "stale",
+        );
+        assert_eq!(result["legal_actions"][0]["id"], "retry");
     }
 
     #[test]

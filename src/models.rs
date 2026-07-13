@@ -47,12 +47,18 @@ pub struct DecisionParams {
     /// Zero-based offset into the filtered legal-action list.
     #[serde(default)]
     pub action_offset: u32,
+    /// Response detail: compact by default, or full for expanded analysis.
+    #[serde(default = "decision_detail")]
+    pub detail: String,
 }
 pub fn decision_limit() -> u32 {
     40
 }
 pub fn decision_action_limit() -> u32 {
     256
+}
+pub fn decision_detail() -> String {
+    "compact".into()
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -364,17 +370,18 @@ mod tests {
         assert_eq!(params.limit, 40);
         assert_eq!(params.action_limit, 256);
         assert_eq!(params.action_offset, 0);
+        assert_eq!(params.detail, "compact");
     }
 
     #[test]
     fn decision_params_accepts_custom_values() {
-        let json =
-            json!({"action_type": "play", "limit": 100, "action_limit": 12, "action_offset": 24});
+        let json = json!({"action_type": "play", "limit": 100, "action_limit": 12, "action_offset": 24, "detail": "full"});
         let params: DecisionParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.action_type, "play");
         assert_eq!(params.limit, 100);
         assert_eq!(params.action_limit, 12);
         assert_eq!(params.action_offset, 24);
+        assert_eq!(params.detail, "full");
     }
 
     #[test]
