@@ -549,6 +549,32 @@ impl ReplayDB {
         stake: i64,
         blind_key: &str,
     ) -> Result<i64, String> {
+        self.log_fail_with_steps(seed, ante, stake, blind_key, &[])
+    }
+
+    pub fn log_fail_with_steps(
+        &self,
+        seed: &str,
+        ante: i64,
+        stake: i64,
+        blind_key: &str,
+        steps: &[(
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )],
+    ) -> Result<i64, String> {
         let conn = self.open()?;
         self.init_db(&conn)?;
         conn.execute(
@@ -556,7 +582,15 @@ impl ReplayDB {
             rusqlite::params![seed, ante, stake, blind_key, FAIL],
         )
         .context("insert replay")?;
-        Ok(conn.last_insert_rowid())
+        let rid = conn.last_insert_rowid();
+        for (idx, (action, details, rationale, ht, ch, cd, dc, fc, bc, bm, fs, cn, th, nt)) in
+            steps.iter().enumerate()
+        {
+            conn.execute("INSERT INTO replay_step (replay_id, step_order, action_type, details, rationale, hand_type, cards_held, cards_discarded, discard_count, final_cards, base_chips, base_mult, final_score, consumable_name, consumable_target_hand, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                rusqlite::params![rid, idx + 1, action, details, rationale, ht, ch, cd, dc, fc, bc, bm, fs, cn, th, nt])
+                .context("insert failed replay step")?;
+        }
+        Ok(rid)
     }
 }
 

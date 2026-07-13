@@ -73,6 +73,15 @@ pub struct ActionParams {
     /// Optional 1-based hand positions targeted by a consumable.
     #[serde(default)]
     pub target_indices: Vec<usize>,
+    /// Required for strategic actions; keep this concise and agent-authored.
+    #[serde(default)]
+    pub why_this_action: String,
+    #[serde(default)]
+    pub alternatives_considered: Option<String>,
+    #[serde(default)]
+    pub expected_outcome: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
 }
 pub fn settle_timeout() -> f64 {
     12.0
@@ -427,6 +436,27 @@ mod tests {
         let params: ActionParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.settle_timeout, 12.0);
         assert!(params.card_indices.is_empty());
+        assert!(params.why_this_action.is_empty());
+        assert!(params.alternatives_considered.is_none());
+        assert!(params.expected_outcome.is_none());
+        assert!(params.confidence.is_none());
+    }
+
+    #[test]
+    fn action_params_accepts_structured_rationale() {
+        let params: ActionParams = serde_json::from_value(json!({
+            "action_id": "play_selected", "decision_id": "d:1",
+            "why_this_action": "Clear the blind with the highest margin",
+            "alternatives_considered": "Discarding risks the draw",
+            "expected_outcome": "The blind clears",
+            "confidence": 0.85
+        }))
+        .unwrap();
+        assert_eq!(
+            params.why_this_action,
+            "Clear the blind with the highest margin"
+        );
+        assert_eq!(params.confidence, Some(0.85));
     }
 
     #[test]
