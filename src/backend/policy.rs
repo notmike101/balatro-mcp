@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use std::sync::LazyLock;
 
-use super::scoring::score_hand;
+use super::{observation, scoring::score_hand};
 
 static EMPTY_VEC: [Value; 0] = [];
 static EMPTY_MAP: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(serde_json::Map::new);
@@ -76,11 +76,18 @@ pub fn build_policy_state(
     } else {
         game
     };
-    let run = observation
+    let run_source = observation
         .get("run")
         .or_else(|| observation.get("round"))
         .and_then(|r| r.as_object())
         .unwrap_or(&EMPTY_MAP);
+    let mut normalized_run = run_source.clone();
+    if !normalized_run.contains_key("blind") {
+        if let Some(blind) = observation::active_blind(observation) {
+            normalized_run.insert("blind".into(), blind);
+        }
+    }
+    let run = &normalized_run;
     let areas = observation
         .get("areas")
         .and_then(|a| a.as_object())
@@ -104,11 +111,8 @@ pub fn build_policy_state(
         std::cmp::max(0i64, dollars.saturating_sub(10))
     };
 
-    let blind_chips = run
-        .get("blind")
-        .and_then(|b| b.get("chips_required"))
-        .and_then(|c| c.as_i64())
-        .unwrap_or(0);
+    let blind_chips = observation::blind_chips_required(observation).unwrap_or(0);
+    let current_chips = observation::current_chips(observation);
     let hands_left = run.get("hands_left").and_then(|h| h.as_i64()).unwrap_or(0);
     let discards_left = run
         .get("discards_left")
@@ -125,7 +129,7 @@ pub fn build_policy_state(
     let current_discard_limit = configured_discard_limit
         .map(|limit| limit.saturating_sub(discards_used).max(0))
         .unwrap_or(discards_left);
-    let chips_remaining = std::cmp::max(0i64, blind_chips);
+    let chips_remaining = current_chips.map(|current| blind_chips.saturating_sub(current).max(0));
 
     let best_play_estimated = estimate_best_play(observation);
     let best_play_clears = best_play_estimated >= blind_chips && blind_chips > 0;
@@ -137,7 +141,8 @@ pub fn build_policy_state(
     let estimated_plays_needed = if best_play_estimated > 0 && blind_chips > 0 {
         std::cmp::max(
             1,
-            (chips_remaining + best_play_estimated - 1) / best_play_estimated,
+            (chips_remaining.unwrap_or(blind_chips) + best_play_estimated - 1)
+                / best_play_estimated,
         )
     } else {
         0
@@ -174,7 +179,7 @@ pub fn build_policy_state(
             "spendable_without_losing_full_interest": dollars.saturating_sub(full_interest_floor).max(0),
         },
         "score_pressure": {
-            "blind_chips_required": blind_chips, "hands_left": hands_left, "chips_remaining": chips_remaining,
+            "blind_chips_required": blind_chips, "current_chips": current_chips, "hands_left": hands_left, "chips_remaining": chips_remaining,
             "best_play_estimated_score": best_play_estimated, "best_play_clears_blind": best_play_clears,
             "best_play_surplus": best_play_surplus, "estimated_best_plays_needed": estimated_plays_needed,
         },
@@ -1227,6 +1232,33 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|a| a["action_id"] == "next_round")
+        );
+    }
+
+    #[test]
+    fn policy_reports_current_chips_and_boss_requirement_separately() {
+        let observation = json!({
+            "game": {"state": "SELECTING_HAND"},
+            "round": {
+                "chips": 1200,
+                "hands_left": 1,
+                "discards_left": 0
+            },
+            "blind": {"name": "The Wall", "boss": true, "chips": 1600},
+            "areas": {"hand": []}
+        });
+        let state = build_policy_state(&observation, 40, 40, 60);
+        assert_eq!(state["score_pressure"]["blind_chips_required"], 1600);
+        assert_eq!(state["score_pressure"]["current_chips"], 1200);
+        assert_eq!(state["score_pressure"]["chips_remaining"], 400);
+        assert_eq!(state["score_pressure"]["best_play_clears_blind"], false);
+        assert_eq!(state["run"]["blind"]["chips_required"], 1600);
+
+        let mut cleared = observation.clone();
+        cleared["round"]["chips"] = json!(1600);
+        assert_eq!(
+            build_policy_state(&cleared, 40, 40, 60)["score_pressure"]["chips_remaining"],
+            0
         );
     }
 
