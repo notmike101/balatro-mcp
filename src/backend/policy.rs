@@ -5,10 +5,6 @@ use super::scoring::score_hand;
 
 static EMPTY_VEC: [Value; 0] = [];
 static EMPTY_MAP: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(serde_json::Map::new);
-// The caller-supplied selection templates cover arbitrary positions; keep only
-// a compact prefix of concrete combinations in the default decision payload.
-const MAX_EXPLICIT_HAND_SELECTIONS: usize = 32;
-
 pub const DECISION_STATES: &[&str] = &[
     "BLIND_SELECT",
     "SELECTING_HAND",
@@ -19,6 +15,7 @@ pub const DECISION_STATES: &[&str] = &[
     "SPECTRAL_PACK",
     "STANDARD_PACK",
     "BUFFOON_PACK",
+    "SMODS_BOOSTER_OPENED",
 ];
 
 pub const SAFE_TRANSITION_ACTIONS: &[&str] = &[
@@ -92,11 +89,6 @@ pub fn build_policy_state(
     let hand_array = get_array(areas, "hand");
     let jokers_array = get_array(areas, "jokers");
     let consumables_array = get_array(areas, "consumables");
-    let poker_hands = observation
-        .get("poker_hands")
-        .cloned()
-        .unwrap_or(Value::Null);
-
     let dollars = run.get("dollars").and_then(|d| d.as_i64()).unwrap_or(0);
     let full_interest_floor = 25;
     let interest_cap = 5;
@@ -168,7 +160,7 @@ pub fn build_policy_state(
         areas,
         &legal_actions,
     );
-    let hand_analysis = analyze_hands(hand_array, &poker_hands);
+    let hand_analysis = analyze_hands(&observation);
     let joker_order_hint = classify_jokers(jokers_array);
 
     json!({
@@ -199,46 +191,140 @@ pub fn build_policy_state(
     })
 }
 
+/// Reduce a policy snapshot to the fields needed for the normal gameplay loop.
+/// The full policy remains available for explicit analysis requests.
+pub fn compact_policy_state(full: &Value) -> Value {
+    let compact_card = |card: &Value| {
+        json!({
+            "index": card.get("index"),
+            "instance_id": card.get("instance_id").or_else(|| card.get("id")),
+            "rank": card.get("rank").or_else(|| card.pointer("/base/rank")),
+            "suit": card.get("suit").or_else(|| card.pointer("/base/suit")),
+            "base": card.get("base").map(|base| json!({
+                "rank": base.get("rank"), "suit": base.get("suit"), "nominal": base.get("nominal")
+            })),
+            "edition": card.get("edition"),
+            "seal": card.get("seal"),
+            "enhancement": card.get("enhancement"),
+            "face_down": card.get("face_down"),
+            "name": card.get("name"),
+            "type": card.get("type")
+        })
+    };
+    let cards =
+        |key: &str| {
+            full.pointer(&format!("/areas/{key}"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    Value::Array(items.iter().map(|card| match key {
+                    "hand" => compact_card(card),
+                    "jokers" => json!({
+                        "name": card.get("name"), "edition": card.get("edition"),
+                        "seal": card.get("seal"), "enhancement": card.get("enhancement"),
+                        "slot_order": card.get("slot_order")
+                    }),
+                    _ => json!({"name": card.get("name"), "type": card.get("type")})
+                }).collect())
+                })
+                .unwrap_or_else(|| json!([]))
+        };
+    let compact_action = |action: &Value| {
+        let action_name = action.get("action").and_then(Value::as_str).unwrap_or("");
+        let mut compact = serde_json::Map::new();
+        if let Some(value) = action.get("action_id") {
+            compact.insert("action_id".into(), value.clone());
+        }
+        if let Some(value) = action.get("action") {
+            compact.insert("action".into(), value.clone());
+        }
+        if matches!(action_name, "play" | "discard") {
+            for key in ["selection", "card_index_base", "max_cards"] {
+                if let Some(value) = action.get(key) {
+                    compact.insert(key.into(), value.clone());
+                }
+            }
+        }
+        Value::Object(compact)
+    };
+    let compact_actions = |pointer: &str| {
+        full.pointer(pointer)
+            .and_then(Value::as_array)
+            .map(|items| Value::Array(items.iter().map(&compact_action).collect()))
+            .unwrap_or_else(|| json!([]))
+    };
+    let action_refs = |pointer: &str| {
+        full.pointer(pointer)
+            .and_then(Value::as_array)
+            .map(|items| {
+                Value::Array(
+                    items
+                        .iter()
+                        .filter_map(|item| item.get("action_id"))
+                        .cloned()
+                        .collect(),
+                )
+            })
+            .unwrap_or_else(|| json!([]))
+    };
+    let run = full.get("run").cloned().unwrap_or(Value::Null);
+    let blind = run
+        .get("blind")
+        .map(|b| {
+            json!({
+                "name": b.get("name"), "boss": b.get("boss"),
+                "chips_required": b.get("chips_required"), "effect": b.get("effect"),
+                "disabled": b.get("disabled")
+            })
+        })
+        .unwrap_or(Value::Null);
+    let checks = full.get("decision_checks").cloned().unwrap_or(Value::Null);
+    let compact_checks = json!({
+        "ordering": {
+            "required_before_close_play": checks.pointer("/ordering/required_before_close_play"),
+            "joker_order": checks.pointer("/ordering/joker_order"),
+            "move_joker_actions": checks.pointer("/ordering/move_joker_actions")
+        },
+        "consumables": {
+            "required": checks.pointer("/consumables/required"),
+            "owned": checks.pointer("/consumables/owned"),
+            "use_action_ids": action_refs("/decision_checks/consumables/use_actions"),
+            "sell_action_ids": action_refs("/decision_checks/consumables/sell_actions")
+        },
+        "shop": {"required": checks.pointer("/shop/required")},
+        "slots": checks.get("slots").cloned().unwrap_or(Value::Null),
+        "boss_debuff": {
+            "required": checks.pointer("/boss_debuff/required"),
+            "current_blind": checks.pointer("/boss_debuff/current_blind"),
+            "debuffed_cards": checks.pointer("/boss_debuff/debuffed_cards"),
+            "debuffed_jokers": checks.pointer("/boss_debuff/debuffed_jokers"),
+            "reroll_action_ids": action_refs("/decision_checks/boss_debuff/reroll_actions")
+        }
+    });
+    json!({
+        "schema": "balatro-mcp/policy-compact/v1",
+        "game": {"state": full.pointer("/game/state"), "ante": run.get("ante"), "round": run.get("round"), "dollars": run.get("dollars"), "hands_left": run.get("hands_left"), "discards_left": run.get("discards_left"), "blind": blind},
+        "score_pressure": full.get("score_pressure"),
+        "slots": full.get("slots"),
+        "hand": cards("hand"), "jokers": cards("jokers"), "consumables": cards("consumables"),
+        "legal_actions": compact_actions("/legal_actions"),
+        "decision_checks": compact_checks,
+        "most_played_poker_hand": full.get("most_played_poker_hand"),
+        "run_phase": full.get("run_phase"),
+        "decision_id": full.get("decision_id"), "observation_id": full.get("observation_id"),
+        "estimate_quality": full.get("estimate_quality")
+    })
+}
+
 fn estimate_best_play(observation: &Value) -> i64 {
     let areas = observation
         .get("areas")
         .and_then(|a| a.as_object())
         .unwrap_or(&EMPTY_MAP);
     let hand_array = get_array(areas, "hand");
-    let poker_hands = observation.get("poker_hands");
-    let mut card_counts = std::collections::HashMap::new();
-    let mut suits = std::collections::HashMap::new();
-    for card in hand_array {
-        if let Some(base) = card.get("base").and_then(|b| b.as_object()) {
-            let rank = base
-                .get("rank")
-                .or_else(|| base.get("value"))
-                .or_else(|| base.get("id"))
-                .and_then(|r| r.as_str())
-                .unwrap_or("");
-            *card_counts.entry(rank).or_insert(0i64) += 1;
-        }
-        if let Some(sv) = card.get("suits").and_then(|s| s.as_array()) {
-            for suit in sv {
-                if let Some(s) = suit.get("key").and_then(|k| k.as_str()) {
-                    *suits.entry(s).or_insert(0i64) += 1;
-                }
-            }
-        }
+    if hand_array.is_empty() || observation.pointer("/poker_hands/values").is_none() {
+        return 5;
     }
-    let best_hand = determine_best_hand(&card_counts, &suits);
-    if let Some(po) = poker_hands.and_then(|p| p.as_object()) {
-        let vals = po
-            .get("values")
-            .and_then(|v| v.as_object())
-            .unwrap_or(&EMPTY_MAP);
-        if let Some(hv) = vals.get(&best_hand).and_then(|h| h.as_object()) {
-            let chips = hv.get("chips").and_then(|c| c.as_i64()).unwrap_or(5);
-            let mult = hv.get("mult").and_then(|m| m.as_i64()).unwrap_or(1);
-            return chips * mult;
-        }
-    }
-    5
+    best_play_subset(observation).1
 }
 
 fn determine_best_hand(
@@ -373,108 +459,80 @@ fn classify_run_phase(run: &serde_json::Map<String, Value>) -> &'static str {
     }
 }
 
-fn analyze_hands(hand_array: &[Value], poker_hands: &Value) -> Value {
+fn analyze_hands(source: &Value) -> Value {
+    let hand_array = source
+        .pointer("/areas/hand")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     if hand_array.is_empty() {
         return json!({});
     }
-    let best_score = estimate_best_play_raw(hand_array, poker_hands);
-    json!({ "best_play": { "estimated_score": best_score, "score_kind": "estimate" } })
+    let (indices, score) = best_play_subset(source);
+    let analysis = score_hand(source, Some(&indices));
+    json!({
+        "best_play": {
+            "hand_name": analysis.hand_name,
+            "card_indices": analysis.scoring_cards,
+            "estimated_score": score,
+            "score_kind": "estimate",
+            "estimate_quality": analysis.estimate_quality
+        }
+    })
 }
 
-fn hand_selection_combinations(
-    hand_array: &[Value],
-    max_cards: usize,
-    max_actions: usize,
-) -> Vec<(Vec<usize>, Vec<String>)> {
-    if max_cards == 0 || max_actions == 0 {
-        return Vec::new();
+fn best_play_subset(observation: &Value) -> (Vec<usize>, i64) {
+    let hand_len = observation
+        .pointer("/areas/hand")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let max_cards = hand_len.min(5);
+    let mut best = (Vec::new(), 0);
+    for size in 1..=max_cards {
+        let mut selected = Vec::with_capacity(size);
+        collect_best_play(observation, size, 0, &mut selected, &mut best);
     }
-    let Some(card_ids) = hand_array.iter().map(card_id).collect::<Option<Vec<_>>>() else {
-        return Vec::new();
-    };
-    let mut combinations = Vec::new();
-    let mut selected = Vec::new();
-    let mut selected_ids = Vec::new();
+    best
+}
 
-    fn visit(
-        start: usize,
-        card_ids: &[String],
-        max_cards: usize,
-        max_actions: usize,
-        selected: &mut Vec<usize>,
-        selected_ids: &mut Vec<String>,
-        combinations: &mut Vec<(Vec<usize>, Vec<String>)>,
-    ) {
-        if combinations.len() >= max_actions {
-            return;
+fn collect_best_play(
+    observation: &Value,
+    target_size: usize,
+    start: usize,
+    selected: &mut Vec<usize>,
+    best: &mut (Vec<usize>, i64),
+) {
+    let hand_len = observation
+        .pointer("/areas/hand")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    if selected.len() == target_size {
+        let score = score_hand(observation, Some(selected)).estimated_score;
+        if score > best.1 || (score == best.1 && selected.len() > best.0.len()) {
+            best.0 = selected.clone();
+            best.1 = score;
         }
-        if !selected.is_empty() {
-            combinations.push((selected.clone(), selected_ids.clone()));
-        }
-        if selected.len() >= max_cards || combinations.len() >= max_actions {
-            return;
-        }
-        for index in start..card_ids.len() {
-            selected.push(index);
-            selected_ids.push(card_ids[index].clone());
-            visit(
-                index + 1,
-                card_ids,
-                max_cards,
-                max_actions,
-                selected,
-                selected_ids,
-                combinations,
-            );
-            selected.pop();
-            selected_ids.pop();
-            if combinations.len() >= max_actions {
-                return;
-            }
-        }
+        return;
     }
-
-    visit(
-        0,
-        &card_ids,
-        max_cards.min(hand_array.len()),
-        max_actions,
-        &mut selected,
-        &mut selected_ids,
-        &mut combinations,
-    );
-    combinations
+    let remaining = target_size - selected.len();
+    for index in start..=hand_len.saturating_sub(remaining) {
+        selected.push(index);
+        collect_best_play(observation, target_size, index + 1, selected, best);
+        selected.pop();
+    }
 }
 
 fn estimate_best_play_raw(hand_array: &[Value], poker_hands: &Value) -> i64 {
-    let mut card_counts = std::collections::HashMap::new();
-    let mut suits = std::collections::HashMap::new();
-    for card in hand_array {
-        if let Some(base) = card.get("base").and_then(|b| b.as_object()) {
-            let rank = base.get("rank").and_then(|r| r.as_str()).unwrap_or("");
-            *card_counts.entry(rank).or_insert(0i64) += 1;
-        }
-        if let Some(sv) = card.get("suits").and_then(|s| s.as_array()) {
-            for suit in sv {
-                if let Some(s) = suit.get("key").and_then(|k| k.as_str()) {
-                    *suits.entry(s).or_insert(0i64) += 1;
-                }
-            }
-        }
+    if hand_array.is_empty() || poker_hands.pointer("/values").is_none() {
+        return 5;
     }
-    let best_hand = determine_best_hand(&card_counts, &suits);
-    if let Some(po) = poker_hands.as_object() {
-        let vals = po
-            .get("values")
-            .and_then(|v| v.as_object())
-            .unwrap_or(&EMPTY_MAP);
-        if let Some(hv) = vals.get(&best_hand).and_then(|h| h.as_object()) {
-            let chips = hv.get("chips").and_then(|c| c.as_i64()).unwrap_or(5);
-            let mult = hv.get("mult").and_then(|m| m.as_i64()).unwrap_or(1);
-            return chips * mult;
-        }
-    }
-    5
+    let observation = json!({
+        "areas": {"hand": hand_array},
+        "poker_hands": poker_hands
+    });
+    best_play_subset(&observation).1
 }
 
 fn generate_legal_actions(
@@ -560,7 +618,7 @@ fn generate_legal_actions(
             let hands_left = run.get("hands_left").and_then(|h| h.as_i64()).unwrap_or(0) as usize;
             if hands_left > 0 && hand_count > 0 {
                 let hand_has_ids = hand_array.iter().all(|card| card_id(card).is_some());
-                let max_play_cards = std::cmp::min(hand_count, play_limit);
+                let max_play_cards = std::cmp::min(hand_count, play_limit).min(5);
                 if hand_has_ids && max_play_cards > 0 {
                     actions.push(json!({
                         "action_id": "play_selected",
@@ -571,7 +629,7 @@ fn generate_legal_actions(
                         "selection": "caller_supplied",
                         "card_index_base": 1,
                         "max_cards": max_play_cards,
-                        "reason": "play any distinct hand positions supplied in card_indices"
+                        "reason": "select only the cards needed for the hand; any distinct 1-based positions are allowed"
                     }));
                 }
             }
@@ -594,44 +652,6 @@ fn generate_legal_actions(
                         "max_cards": max_discard_cards,
                         "reason": "discard any distinct hand positions supplied in card_indices"
                     }));
-                }
-            }
-            let hands_left = run.get("hands_left").and_then(|h| h.as_i64()).unwrap_or(0) as usize;
-            if hands_left > 0 && hand_count > 0 {
-                let hand_has_ids = hand_array.iter().all(|card| card_id(card).is_some());
-                let max_play_cards = std::cmp::min(hand_count, play_limit);
-                if hand_has_ids && max_play_cards > 0 {
-                    for (zero_based, ids) in hand_selection_combinations(
-                        hand_array,
-                        max_play_cards,
-                        MAX_EXPLICIT_HAND_SELECTIONS,
-                    ) {
-                        let score = score_hand(observation, Some(&zero_based));
-                        let indices: Vec<usize> =
-                            zero_based.iter().map(|index| index + 1).collect();
-                        let card_count = indices.len();
-                        actions.push(json!({ "action_id": format!("play_{}", ids.join("_")), "action": "play", "cards": indices, "card_indices": indices, "card_ids": ids, "estimated_score": score.estimated_score, "score_quality": score.estimate_quality, "reason": format!("play {} cards ({} hands left)", card_count, hands_left) }));
-                    }
-                }
-            }
-            let discards_left = run
-                .get("discards_left")
-                .and_then(|d| d.as_i64())
-                .unwrap_or(0) as usize;
-            if discards_left > 0 && hand_count > 1 {
-                let hand_has_ids = hand_array.iter().all(|card| card_id(card).is_some());
-                let max_discard_cards = std::cmp::min(hand_count - 1, discard_limit);
-                if hand_has_ids && max_discard_cards > 0 {
-                    for (zero_based, ids) in hand_selection_combinations(
-                        hand_array,
-                        max_discard_cards,
-                        MAX_EXPLICIT_HAND_SELECTIONS,
-                    ) {
-                        let indices: Vec<usize> =
-                            zero_based.iter().map(|index| index + 1).collect();
-                        let card_count = indices.len();
-                        actions.push(json!({ "action_id": format!("discard_{}", ids.join("_")), "action": "discard", "cards": indices, "card_indices": indices, "card_ids": ids, "reason": format!("discard {} cards ({} discards left)", card_count, discards_left) }));
-                    }
                 }
             }
         }
@@ -684,17 +704,28 @@ fn generate_legal_actions(
             }
             actions.push(json!({"action_id":"next_round","action":"next_round","reason":"leave the shop and continue to the next blind"}));
         }
-        "TAROT_PACK" | "PLANET_PACK" | "SPECTRAL_PACK" | "STANDARD_PACK" | "BUFFOON_PACK" => {
+        "TAROT_PACK"
+        | "PLANET_PACK"
+        | "SPECTRAL_PACK"
+        | "STANDARD_PACK"
+        | "BUFFOON_PACK"
+        | "SMODS_BOOSTER_OPENED" => {
             let choices = observation
                 .pointer("/areas/pack")
                 .and_then(Value::as_array)
+                .or_else(|| {
+                    observation
+                        .pointer("/areas/pack_cards")
+                        .and_then(Value::as_array)
+                })
                 .or_else(|| observation.pointer("/pack/cards").and_then(Value::as_array))
                 .map(|v| v.as_slice())
                 .unwrap_or(&EMPTY_VEC);
             for (index, card) in choices.iter().enumerate().take(target_limit.max(1)) {
-                actions.push(json!({"action_id":format!("pack_{}", index),"action":"choose_pack","card_index":index,"name":card.get("name")}));
+                let card_index = index + 1;
+                actions.push(json!({"action_id":format!("pack_{}", card_index),"action":"choose_pack","card_index":card_index,"name":card.get("name")}));
             }
-            actions.push(json!({"action_id":"skip_booster","action":"ui_click","ui_id":"next_round_button","reason":"skip the opened booster pack"}));
+            actions.push(json!({"action_id":"skip_booster","action":"ui_click","button":"skip_booster","reason":"skip the opened booster pack"}));
         }
         "GAME_OVER" => {
             actions.push(json!({"action_id":"from_game_over","action":"ui_click","ui_id":"from_game_over","reason":"return to the main menu after game over"}));
@@ -899,6 +930,41 @@ mod tests {
     }
 
     #[test]
+    fn compact_policy_state_preserves_actions_and_reduces_payload() {
+        let full = build_policy_state(&observation("SELECTING_HAND"), 40, 40, 60);
+        let compact = compact_policy_state(&full);
+        let full_bytes = serde_json::to_vec(&full).unwrap().len();
+        let compact_bytes = serde_json::to_vec(&compact).unwrap().len();
+        assert!(
+            compact_bytes < full_bytes,
+            "compact={compact_bytes} full={full_bytes}"
+        );
+        assert!(
+            compact_bytes * 2 <= full_bytes,
+            "compact={compact_bytes} full={full_bytes}"
+        );
+        let compact_ids: Vec<_> = compact["legal_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["action_id"].clone())
+            .collect();
+        let full_ids: Vec<_> = full["legal_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["action_id"].clone())
+            .collect();
+        assert_eq!(compact_ids, full_ids);
+        assert_eq!(
+            compact["decision_id"],
+            full.get("decision_id").cloned().unwrap_or(Value::Null)
+        );
+        assert!(compact["decision_checks"].get("ordering").is_some());
+        assert!(compact["decision_checks"].get("consumables").is_some());
+    }
+
+    #[test]
     fn policy_state_covers_play_discard_ordering_and_checks() {
         let state = build_policy_state(&observation("SELECTING_HAND"), 2, 1, 60);
         assert_eq!(state["legal_actions"][0]["action"], "play");
@@ -920,13 +986,16 @@ mod tests {
         assert_eq!(play_selected["selection"], "caller_supplied");
         assert_eq!(play_selected["card_index_base"], 1);
         assert_eq!(play_selected["max_cards"], 2);
-        let non_contiguous_play = state["legal_actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|action| action["action_id"] == "play_d_e")
-            .unwrap();
-        assert_eq!(non_contiguous_play["card_indices"], json!([4, 5]));
+        assert!(
+            state["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|action| {
+                    let action_id = action["action_id"].as_str().unwrap_or("");
+                    action_id == "play_selected" || !action_id.starts_with("play_")
+                })
+        );
         assert!(
             state["legal_actions"]
                 .as_array()
@@ -942,13 +1011,13 @@ mod tests {
             .unwrap();
         assert_eq!(discard_selected["selection"], "caller_supplied");
         assert_eq!(discard_selected["max_cards"], 1);
-        let non_contiguous_discard = state["legal_actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|action| action["action_id"] == "discard_d")
-            .unwrap();
-        assert_eq!(non_contiguous_discard["card_indices"], json!([4]));
+        assert!(
+            state["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|action| action["action_id"] != "discard_d")
+        );
         assert!(
             state["legal_actions"]
                 .as_array()
@@ -1220,23 +1289,23 @@ mod tests {
                     "Straight":{"chips":100,"mult":100}
                 }}
             })),
-            20
+            120
         );
-        assert_eq!(analyze_hands(&[], &json!({})), json!({}));
+        assert_eq!(analyze_hands(&json!({"areas":{"hand":[]}})), json!({}));
         assert!(
-            analyze_hands(
-                &[json!({"base":{"rank":"A"},"suits":[{"key":"H"}]})],
-                &json!({"values":{"High Card":{"chips":7,"mult":3}}})
-            )["best_play"]["estimated_score"]
+            analyze_hands(&json!({
+                "areas":{"hand":[json!({"base":{"rank":"A"},"suits":[{"key":"H"}]})]},
+                "poker_hands":{"values":{"High Card":{"chips":7,"mult":3}}}
+            }))["best_play"]["estimated_score"]
                 .as_i64()
                 .unwrap()
                 > 0
         );
         assert!(
-            analyze_hands(
-                &[json!({"base":{"rank":"A"},"suits":[{}]})],
-                &json!({"values":{}}),
-            )["best_play"]["estimated_score"]
+            analyze_hands(&json!({
+                "areas":{"hand":[{"base":{"rank":"A"},"suits":[{}]}]},
+                "poker_hands":{"values":{}}
+            }))["best_play"]["estimated_score"]
                 .as_i64()
                 .is_some()
         );
@@ -1363,6 +1432,35 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|action| action["action"] == "choose_pack")
+        );
+
+        let smods_pack = json!({
+            "game": {"state": 999, "state_name": "SMODS_BOOSTER_OPENED"},
+            "areas": {"pack_cards": [
+                {"name":"one"}, {"name":"two"}, {"name":"three"},
+                {"name":"four"}, {"name":"five"}
+            ]}
+        });
+        let smods_actions = build_policy_state(&smods_pack, 40, 40, 40)["legal_actions"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(smods_actions.len(), 6);
+        assert_eq!(smods_actions[0]["action_id"], "pack_1");
+        assert_eq!(smods_actions[0]["card_index"], 1);
+        assert_eq!(smods_actions[4]["action_id"], "pack_5");
+        assert_eq!(smods_actions[4]["card_index"], 5);
+        assert_eq!(smods_actions[5]["button"], "skip_booster");
+
+        let unknown = json!({
+            "game": {"state": 1000, "state_name": "UNKNOWN_STATE"},
+            "areas": {"pack_cards": [{"name":"hidden"}]}
+        });
+        assert!(
+            build_policy_state(&unknown, 40, 40, 40)["legal_actions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
         );
 
         let mut blind = observation("BLIND_SELECT");

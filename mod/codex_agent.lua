@@ -926,7 +926,8 @@ local function available_actions()
     end
     if G.STATE == G.STATES.TAROT_PACK or G.STATE == G.STATES.PLANET_PACK or
        G.STATE == G.STATES.SPECTRAL_PACK or G.STATE == G.STATES.STANDARD_PACK or
-       G.STATE == G.STATES.BUFFOON_PACK then
+       G.STATE == G.STATES.BUFFOON_PACK or
+       (state_name() == "SMODS_BOOSTER_OPENED") then
         actions[#actions + 1] = "use"
         actions[#actions + 1] = "skip_booster"
     end

@@ -556,6 +556,10 @@ mod tests {
             (json!({"action":"next_round"}), "next_round"),
             (json!({"action":"choose_pack","card_index":1}), "use"),
             (
+                json!({"action":"ui_click","button":"skip_booster"}),
+                "ui_click",
+            ),
+            (
                 json!({"action":"safe_transition","transition":"cash_out"}),
                 "cash_out",
             ),
