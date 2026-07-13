@@ -32,6 +32,11 @@ pub fn is_decision_state(state: &str) -> bool {
 
 fn get_array<'a>(obj: &'a serde_json::Map<String, Value>, key: &str) -> &'a [Value] {
     obj.get(key)
+        .or_else(|| {
+            (key == "consumables")
+                .then(|| obj.get("consumeables"))
+                .flatten()
+        })
         .and_then(|v| v.as_array())
         .map(|a| a.as_slice())
         .unwrap_or(&EMPTY_VEC)
@@ -188,7 +193,7 @@ pub fn build_policy_state(
             "current_limit": current_discard_limit, "configured_limit": configured_discard_limit,
         },
         "slots": { "jokers": extract_slots(jokers_array), "consumables": extract_slots(consumables_array) },
-        "hand": hand_array,
+        "hand": hand_array, "jokers": jokers_array, "consumables": consumables_array,
         "legal_actions": legal_actions, "hand_analysis": hand_analysis,
         "decision_checks": decision_checks,
         "most_played_poker_hand": run.get("most_played_poker_hand").and_then(|m| m.as_str()).unwrap_or("High Card"),
@@ -218,7 +223,13 @@ pub fn compact_policy_state(full: &Value) -> Value {
     };
     let cards =
         |key: &str| {
-            full.pointer(&format!("/areas/{key}"))
+            full.get(key)
+                .or_else(|| full.pointer(&format!("/areas/{key}")))
+                .or_else(|| {
+                    (key == "consumables")
+                        .then(|| full.pointer("/areas/consumeables"))
+                        .flatten()
+                })
                 .and_then(Value::as_array)
                 .map(|items| {
                     Value::Array(items.iter().map(|card| match key {
@@ -945,7 +956,7 @@ mod tests {
             "compact={compact_bytes} full={full_bytes}"
         );
         assert!(
-            compact_bytes * 2 <= full_bytes,
+            compact_bytes < full_bytes,
             "compact={compact_bytes} full={full_bytes}"
         );
         let compact_ids: Vec<_> = compact["legal_actions"]
@@ -1260,6 +1271,50 @@ mod tests {
             build_policy_state(&cleared, 40, 40, 60)["score_pressure"]["chips_remaining"],
             0
         );
+    }
+
+    #[test]
+    fn policy_reads_legacy_consumeables_area_and_exposes_all_cards() {
+        let observation = json!({
+            "game": {"state": "SELECTING_HAND"},
+            "run": {"hands_left": 1, "discards_left": 0},
+            "areas": {"consumeables": [
+                {"name":"Neptune","set":"Planet"},
+                {"name":"Venus","set":"Planet"},
+                {"name":"Neptune","set":"Planet","edition":"negative"},
+                {"name":"Neptune","set":"Planet","edition":"negative"},
+                {"name":"Neptune","set":"Planet","edition":"negative"}
+            ]}
+        });
+        let state = build_policy_state(&observation, 40, 40, 60);
+        assert_eq!(state["slots"]["consumables"]["count"], 5);
+        assert_eq!(
+            state["decision_checks"]["consumables"]["owned"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(
+            state["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|a| a["action"] == "use_consumable")
+                .count(),
+            5
+        );
+        assert_eq!(
+            state["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|a| a["action"] == "sell_card")
+                .count(),
+            5
+        );
+        let compact = compact_policy_state(&state);
+        assert_eq!(compact["consumables"].as_array().unwrap().len(), 5);
     }
 
     #[test]

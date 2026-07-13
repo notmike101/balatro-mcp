@@ -150,7 +150,7 @@ fn compact_build(data: &Value) -> Value {
                 })
             }).collect::<Vec<_>>()
         }),
-        "consumables": areas.and_then(|a| a.get("consumables")).and_then(|c| c.as_array()).map(|arr| {
+        "consumables": areas.and_then(|a| a.get("consumables").or_else(|| a.get("consumeables"))).and_then(|c| c.as_array()).map(|arr| {
             arr.iter().map(|c| {
                 serde_json::json!({
                     "name": c.get("name"),
@@ -312,6 +312,12 @@ mod tests {
         );
         assert_eq!(primitive["jokers"][0]["edition"], "Foil");
         assert_eq!(primitive["jokers"][0]["seal"], "Blue");
+
+        let legacy = compact_observation(
+            &json!({"areas":{"consumeables":[{"name":"Neptune","type":"Planet"}]}}),
+            "build",
+        );
+        assert_eq!(legacy["consumables"][0]["name"], "Neptune");
     }
     #[test]
     fn test_compact_observation_blind() {
