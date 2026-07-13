@@ -894,13 +894,23 @@ fn build_decision_checks(
         .get("blind")
         .and_then(|b| b.as_object())
         .unwrap_or(&EMPTY_MAP);
-    let boss = blind.get("boss").and_then(|b| b.as_str()).unwrap_or("");
+    let is_boss = blind
+        .get("boss")
+        .and_then(|boss| {
+            boss.as_bool().or_else(|| {
+                boss.as_str().map(|value| {
+                    value.eq_ignore_ascii_case("true")
+                        || value.eq_ignore_ascii_case("boss")
+                        || value == "1"
+                })
+            })
+        })
+        .unwrap_or(false);
     let boss_effect = blind
         .get("effect")
         .and_then(|e| e.get("name"))
         .and_then(|n| n.as_str())
         .unwrap_or("");
-    let is_boss = !boss.is_empty() || !boss_effect.is_empty();
     json!({
         "ordering": { "required_before_close_play": joker_count > 1, "hand_order": hand_order, "joker_order": joker_order, "move_card_actions": move_card_actions, "move_joker_actions": move_joker_actions, "instruction": "Evaluate hand and Joker trigger order when a scoring effect can depend on sequence; do not move cards by default, but do not dismiss legal reorder actions.", "estimate_caveat": "Play estimates may not model every ordering interaction; verify relevant ordering when margin is tight." },
         "consumables": { "required": !owned_consumables.is_empty(), "owned": owned_consumables, "use_actions": use_actions, "sell_actions": sell_actions, "shop_purchase_actions": legal_actions.iter().filter(|action| action.get("action").and_then(Value::as_str) == Some("buy_card")).cloned().collect::<Vec<_>>(), "instruction": "Evaluate every owned use/sell action and every shop consumable purchase before exiting or advancing." },
@@ -1053,6 +1063,19 @@ mod tests {
                 .unwrap()
                 > 0
         );
+    }
+
+    #[test]
+    fn policy_does_not_classify_regular_blind_effects_as_bosses() {
+        let mut state = observation("SELECTING_HAND");
+        state["run"]["blind"] = json!({
+            "name": "Small Blind",
+            "boss": false,
+            "effect": {"name": "Small Blind"}
+        });
+        let checks = build_policy_state(&state, 40, 40, 60)["decision_checks"].clone();
+        assert_eq!(checks["boss_debuff"]["required"], false);
+        assert_eq!(checks["boss_debuff"]["current_blind"]["boss"], false);
     }
 
     #[test]
