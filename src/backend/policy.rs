@@ -304,7 +304,9 @@ pub fn compact_policy_state(full: &Value) -> Value {
             "required": checks.pointer("/consumables/required"),
             "owned": checks.pointer("/consumables/owned"),
             "use_action_ids": action_refs("/decision_checks/consumables/use_actions"),
-            "sell_action_ids": action_refs("/decision_checks/consumables/sell_actions")
+            "sell_action_ids": action_refs("/decision_checks/consumables/sell_actions"),
+            "instruction": checks.pointer("/consumables/instruction"),
+            "timing": checks.pointer("/consumables/timing")
         },
         "shop": {"required": checks.pointer("/shop/required")},
         "slots": checks.get("slots").cloned().unwrap_or(Value::Null),
@@ -323,6 +325,7 @@ pub fn compact_policy_state(full: &Value) -> Value {
         "slots": full.get("slots"),
         "hand": cards("hand"), "jokers": cards("jokers"), "consumables": cards("consumables"),
         "legal_actions": compact_actions("/legal_actions"),
+        "active_directives": full.get("active_directives"),
         "decision_checks": compact_checks,
         "most_played_poker_hand": full.get("most_played_poker_hand"),
         "run_phase": full.get("run_phase"),
@@ -766,7 +769,7 @@ fn generate_legal_actions(
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or("consumable");
-        actions.push(json!({"action_id":format!("use_consumable_{}", index + 1),"action":"use_consumable","card_index":index + 1,"target_limit":target_limit,"reason":format!("evaluate {} before advancing", name)}));
+        actions.push(json!({"action_id":format!("use_consumable_{}", index + 1),"action":"use_consumable","card_index":index + 1,"target_limit":target_limit,"target_index_base":1,"reason":format!("evaluate {} before any strategic action; consumables are usable during active play and transitions", name)}));
         actions.push(json!({"action_id":format!("sell_consumable_{}", index + 1),"action":"sell_card","area":"consumeables","card_index":index + 1,"reason":format!("sell {} if no useful target exists", name)}));
     }
     for (index, joker) in jokers_array.iter().enumerate() {
@@ -913,7 +916,7 @@ fn build_decision_checks(
         .unwrap_or("");
     json!({
         "ordering": { "required_before_close_play": joker_count > 1, "hand_order": hand_order, "joker_order": joker_order, "move_card_actions": move_card_actions, "move_joker_actions": move_joker_actions, "instruction": "Evaluate hand and Joker trigger order when a scoring effect can depend on sequence; do not move cards by default, but do not dismiss legal reorder actions.", "estimate_caveat": "Play estimates may not model every ordering interaction; verify relevant ordering when margin is tight." },
-        "consumables": { "required": !owned_consumables.is_empty(), "owned": owned_consumables, "use_actions": use_actions, "sell_actions": sell_actions, "shop_purchase_actions": legal_actions.iter().filter(|action| action.get("action").and_then(Value::as_str) == Some("buy_card")).cloned().collect::<Vec<_>>(), "instruction": "Evaluate every owned use/sell action and every shop consumable purchase before exiting or advancing." },
+        "consumables": { "required": !owned_consumables.is_empty(), "owned": owned_consumables, "use_actions": use_actions, "sell_actions": sell_actions, "shop_purchase_actions": legal_actions.iter().filter(|action| action.get("action").and_then(Value::as_str) == Some("buy_card")).cloned().collect::<Vec<_>>(), "timing": ["SELECTING_HAND", "BLIND_SELECT", "ROUND_EVAL", "SHOP", "other non-terminal states"], "instruction": "Evaluate every owned use/sell action before every strategic action. Consumables may be used during active hand play, before discarding, during round evaluation, blind selection, and shop decisions; only defer one deliberately after checking its effect, targets, score pressure, and upcoming blind." },
         "shop": shop_data,
         "slots": { "required": true, "jokers": joker_slots, "consumables": consumable_slots, "instruction": "Track joker and consumable slot counts (count/limit/open) across all purchases; do not buy if no slots remain without a voucher or other expansion." },
         "boss_debuff": { "required": is_boss, "current_blind": { "boss": is_boss, "name": blind.get("name").and_then(|n| n.as_str()), "effect": Some(boss_effect), "disabled": blind.get("disabled").and_then(|d| d.as_str()) }, "upcoming_boss": { "state": blind.get("state").and_then(|s| s.as_str()).unwrap_or("Upcoming") }, "debuffed_cards": observation.pointer("/areas/debuffed_cards").cloned().unwrap_or_else(|| json!([])), "debuffed_jokers": observation.pointer("/areas/debuffed_jokers").cloned().unwrap_or_else(|| json!([])), "reroll_actions": reroll_actions, "select_actions": pack_actions, "instruction": "Before selecting or playing a Boss Blind, inspect its live effect, lookup_rule details, debuffed cards/Jokers, and legal boss-reroll actions." },
@@ -1056,6 +1059,30 @@ mod tests {
             true
         );
         assert_eq!(state["decision_checks"]["consumables"]["required"], true);
+        assert!(
+            state["decision_checks"]["consumables"]["timing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|state| state == "SELECTING_HAND")
+        );
+        assert!(
+            state["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|action| action["action"] == "use_consumable")
+                .is_some()
+        );
+        assert_eq!(
+            state["legal_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|action| action["action"] == "use_consumable")
+                .unwrap()["target_index_base"],
+            1
+        );
         assert_eq!(state["decision_checks"]["boss_debuff"]["required"], true);
         assert!(
             state["score_pressure"]["best_play_estimated_score"]
@@ -1063,6 +1090,21 @@ mod tests {
                 .unwrap()
                 > 0
         );
+    }
+
+    #[test]
+    fn consumables_are_legal_across_non_terminal_gameplay_states() {
+        for state_name in ["SELECTING_HAND", "BLIND_SELECT", "ROUND_EVAL", "SHOP"] {
+            let state = build_policy_state(&observation(state_name), 40, 40, 60);
+            assert!(
+                state["legal_actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|action| action["action"] == "use_consumable"),
+                "missing consumable action in {state_name}"
+            );
+        }
     }
 
     #[test]

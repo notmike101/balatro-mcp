@@ -12,7 +12,7 @@ pub const GUIDE_TOPICS: &[&str] = &[
 pub fn guide(topic: &str) -> Option<&'static str> {
     match topic.to_ascii_lowercase().as_str() {
         "core" | "rules" | "ante8" => Some(
-            "Goal: clear blinds through Ante 8. Use game_status, then get_decision and execute one current legal action with its decision_id. Refresh on stale_decision; use play_selected/discard_selected with distinct 1-based card_indices. Page actions until legal_actions_next_offset is null. get_decision is compact by default; use detail=full for expanded checks. observe is read-only; all is verbose diagnostic state. In ROUND_EVAL use proceed_round, then next_round in SHOP. Never infer face-down cards.",
+            "Clear blinds through Ante 8. Start with game_status, then get_decision and execute one current legal action with its decision_id. Inspect consumables and replay_context before every strategic action; use_consumable actions are legal during active play, not only shop or blind selection. Refresh on stale_decision; use target_indices for targeted consumables and 1-based card_indices for hand actions. In ROUND_EVAL use proceed_round, then next_round in SHOP. Never infer face-down cards.",
         ),
         "hands" | "scoring" => Some(
             "Poker hands score Chips multiplied by Mult. Planet consumables level a named hand. Use the hand_values tool for the live poker-hand contract; controller scores are estimates unless explicitly exact. score_hand card_indices and score_analysis.scoring_cards use 1-based hand positions, matching play/discard actions. Select only the cards needed for the intended hand; play_selected and discard_selected accept any distinct valid positions up to the live play limit. Omitted score_hand indices use the live highlight or best five-card subset. score_analysis.hand_key describes the cards scored for that call, score_analysis.score_scope identifies current-hand versus selected-card scope, and score_analysis.run_chips plus score_analysis.blind_chips_remaining expose cumulative run progress. run_info.cards_played is cumulative by rank across the run; run_info.round_scores.cards_played.amt is the current round's count.",
@@ -33,7 +33,7 @@ pub fn guide(topic: &str) -> Option<&'static str> {
             "Playing cards may have one enhancement, edition, and seal. Face-down card identity is always unknown.",
         ),
         "consumables" | "vouchers" | "stakes" | "decks" | "tags" | "progression" => Some(
-            "Decks, Stakes, Vouchers, Tags, and consumables change run rules and resources. Evaluate every owned and shop consumable through decision_checks.consumables before exiting; look up unfamiliar effects before acting.",
+            "Decks, Stakes, Vouchers, Tags, and consumables change run rules and resources. Evaluate every owned consumable before every strategic action, including play and discard decisions during active hands; use or deliberately defer it only after checking its effect, target availability, score pressure, and upcoming blind. Look up unfamiliar effects before acting.",
         ),
         _ => None,
     }
