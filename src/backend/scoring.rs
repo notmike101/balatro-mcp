@@ -60,6 +60,18 @@ fn card_suit(card: &Value) -> Option<String> {
         })
 }
 
+fn card_nominal(card: &Value) -> Option<i64> {
+    card.pointer("/base/nominal")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            card_rank(card).map(|rank| match rank {
+                14 => 11,
+                11..=13 => 10,
+                value => i64::from(value),
+            })
+        })
+}
+
 fn text_field(value: &Value, key: &str) -> Option<String> {
     value
         .get(key)
@@ -238,8 +250,8 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
         contributions: Vec::new(),
     };
     for (position, card) in cards.iter().enumerate() {
-        if let Some(rank) = card_rank(card) {
-            result.chips += i64::from(rank.min(10));
+        if let Some(nominal) = card_nominal(card) {
+            result.chips += nominal;
         }
         let original_index = indices[position];
         add_modifier(&mut result, card, original_index);
@@ -528,8 +540,8 @@ mod tests {
     fn scores_contract_and_supported_modifiers() {
         let observation = json!({"areas":{"hand":[{"base":{"rank":"A","suit":"H"},"suits":[{"key":"H"}],"edition":"Foil"}]},"poker_hands":{"values":{"High Card":{"chips":10,"mult":2}}}});
         let result = score_hand(&observation, None);
-        assert_eq!(result.chips, 70);
-        assert_eq!(result.exact_score, Some(140));
+        assert_eq!(result.chips, 71);
+        assert_eq!(result.exact_score, Some(142));
         assert_eq!(result.score_scope, "current_hand");
         assert_eq!(result.run_most_played_hand, None);
     }
@@ -582,6 +594,36 @@ mod tests {
         assert_eq!(result.scoring_cards, vec![2, 3]);
         assert_eq!(result.score_scope, "selected_cards");
         assert_eq!(result.exact_score, Some(56));
+    }
+
+    #[test]
+    fn score_uses_live_nominal_chips_for_aces_and_faces() {
+        let observation = json!({
+            "areas": {"hand": [
+                {"base":{"rank":"A","nominal":11,"suit":"Hearts"}},
+                {"base":{"rank":"K","nominal":10,"suit":"Spades"}}
+            ]},
+            "poker_hands": {"values": {"High Card": {"chips": 5, "mult": 1}}}
+        });
+        let result = score_hand(&observation, Some(&[0, 1]));
+        assert_eq!(result.hand_name, "High Card");
+        assert_eq!(result.chips, 26);
+        assert_eq!(result.estimated_score, 26);
+    }
+
+    #[test]
+    fn score_pair_does_not_include_unselected_cards() {
+        let observation = json!({
+            "areas": {"hand": [
+                card("A", "H"), card("A", "S"), card("K", "D"), card("Q", "C")
+            ]},
+            "poker_hands": {"values": {"Pair": {"chips": 10, "mult": 2}}}
+        });
+        let result = score_hand(&observation, Some(&[0, 1]));
+        assert_eq!(result.hand_name, "Pair");
+        assert_eq!(result.scoring_cards, vec![1, 2]);
+        assert_eq!(result.chips, 32);
+        assert_eq!(result.estimated_score, 64);
     }
 
     #[test]
@@ -731,7 +773,7 @@ mod tests {
             None,
         );
         assert_eq!(fallback_hand_value.hand_name, "Pair");
-        assert_eq!(fallback_hand_value.chips, 7 + 20);
+        assert_eq!(fallback_hand_value.chips, 7 + 11 + 11);
     }
 
     #[test]
