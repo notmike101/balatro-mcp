@@ -236,54 +236,83 @@ pub fn build_policy_state(
 pub fn compact_policy_state(full: &Value) -> Value {
     let compact_card = |card: &Value| {
         if scoring::card_is_hidden(card) {
-            return json!({
-                "index": card.get("index"),
-                "instance_id": card.get("instance_id").or_else(|| card.get("id")),
-                "hidden": true
-            });
+            let mut compact = serde_json::Map::new();
+            if let Some(value) = card.get("index") {
+                compact.insert("index".into(), value.clone());
+            }
+            if let Some(value) = card.get("instance_id").or_else(|| card.get("id")) {
+                compact.insert("instance_id".into(), value.clone());
+            }
+            compact.insert("hidden".into(), Value::Bool(true));
+            return Value::Object(compact);
         }
-        json!({
-            "index": card.get("index"),
-            "instance_id": card.get("instance_id").or_else(|| card.get("id")),
-            "rank": card.get("rank").or_else(|| card.pointer("/base/rank")),
-            "suit": card.get("suit").or_else(|| card.pointer("/base/suit")),
-            "base": card.get("base").map(|base| json!({
-                "rank": base.get("rank"), "value": base.get("value"), "id": base.get("id"),
-                "suit": base.get("suit"), "nominal": base.get("nominal")
-            })),
-            "edition": card.get("edition"),
-            "seal": card.get("seal"),
-            "enhancement": card.get("enhancement"),
-            "face_down": card.get("face_down"),
-            "name": card.get("name"),
-            "type": card.get("type")
-        })
+
+        let mut compact = serde_json::Map::new();
+        for (key, value) in [
+            ("index", card.get("index")),
+            (
+                "instance_id",
+                card.get("instance_id").or_else(|| card.get("id")),
+            ),
+            (
+                "rank",
+                card.get("rank").or_else(|| card.pointer("/base/rank")),
+            ),
+            (
+                "suit",
+                card.get("suit").or_else(|| card.pointer("/base/suit")),
+            ),
+            ("edition", card.get("edition")),
+            ("seal", card.get("seal")),
+            ("enhancement", card.get("enhancement")),
+            ("face_down", card.get("face_down")),
+            ("name", card.get("name")),
+            ("type", card.get("type")),
+        ] {
+            if let Some(value) = value.filter(|value| !value.is_null()) {
+                compact.insert(key.into(), value.clone());
+            }
+        }
+        if let Some(base) = card.get("base").and_then(Value::as_object) {
+            let mut compact_base = serde_json::Map::new();
+            for key in ["rank", "value", "id", "suit", "nominal"] {
+                if let Some(value) = base.get(key).filter(|value| !value.is_null()) {
+                    compact_base.insert(key.into(), value.clone());
+                }
+            }
+            if !compact_base.is_empty() {
+                compact.insert("base".into(), Value::Object(compact_base));
+            }
+        }
+        Value::Object(compact)
     };
-    let cards =
-        |key: &str| {
-            full.get(key)
-                .or_else(|| full.pointer(&format!("/areas/{key}")))
-                .or_else(|| {
-                    (key == "consumables")
-                        .then(|| full.pointer("/areas/consumeables"))
-                        .flatten()
-                })
-                .and_then(Value::as_array)
-                .map(|items| {
-                    Value::Array(items.iter().map(|card| match key {
-                    "hand" => compact_card(card),
-                    "jokers" => json!({
-                        "name": card.get("name"), "edition": card.get("edition"),
-                        "seal": card.get("seal"), "enhancement": card.get("enhancement"),
-                        "slot_order": card.get("slot_order")
-                    }),
-                    _ => json!({"name": card.get("name"), "type": card.get("type")})
-                }).collect())
-                })
-                .unwrap_or_else(|| json!([]))
-        };
+    let cards = |key: &str| {
+        full.get(key)
+            .or_else(|| full.pointer(&format!("/areas/{key}")))
+            .or_else(|| {
+                (key == "consumables")
+                    .then(|| full.pointer("/areas/consumeables"))
+                    .flatten()
+            })
+            .and_then(Value::as_array)
+            .map(|items| {
+                Value::Array(
+                    items
+                        .iter()
+                        .map(|card| match key {
+                            "hand" => compact_card(card),
+                            "jokers" => compact_named_card(
+                                card,
+                                &["name", "edition", "seal", "enhancement", "slot_order"],
+                            ),
+                            _ => compact_named_card(card, &["name", "type"]),
+                        })
+                        .collect(),
+                )
+            })
+            .unwrap_or_else(|| json!([]))
+    };
     let compact_action = |action: &Value| {
-        let action_name = action.get("action").and_then(Value::as_str).unwrap_or("");
         let mut compact = serde_json::Map::new();
         if let Some(value) = action.get("action_id") {
             compact.insert("action_id".into(), value.clone());
@@ -291,11 +320,25 @@ pub fn compact_policy_state(full: &Value) -> Value {
         if let Some(value) = action.get("action") {
             compact.insert("action".into(), value.clone());
         }
-        if matches!(action_name, "play" | "discard") {
-            for key in ["selection", "card_index_base", "max_cards"] {
-                if let Some(value) = action.get(key) {
-                    compact.insert(key.into(), value.clone());
-                }
+        for key in [
+            "selection",
+            "card_index_base",
+            "max_cards",
+            "card_index",
+            "target_limit",
+            "target_index_base",
+            "area",
+            "card_id",
+            "ui_id",
+            "blind",
+            "name",
+            "button",
+            "transition",
+            "from_index",
+            "to_index",
+        ] {
+            if let Some(value) = action.get(key).filter(|value| !value.is_null()) {
+                compact.insert(key.into(), value.clone());
             }
         }
         Value::Object(compact)
@@ -306,56 +349,33 @@ pub fn compact_policy_state(full: &Value) -> Value {
             .map(|items| Value::Array(items.iter().map(&compact_action).collect()))
             .unwrap_or_else(|| json!([]))
     };
-    let action_refs = |pointer: &str| {
-        full.pointer(pointer)
-            .and_then(Value::as_array)
-            .map(|items| {
-                Value::Array(
-                    items
-                        .iter()
-                        .filter_map(|item| item.get("action_id"))
-                        .cloned()
-                        .collect(),
-                )
-            })
-            .unwrap_or_else(|| json!([]))
-    };
     let run = full.get("run").cloned().unwrap_or(Value::Null);
     let blind = run
         .get("blind")
-        .map(|b| {
-            json!({
-                "name": b.get("name"), "boss": b.get("boss"),
-                "chips_required": b.get("chips_required"), "effect": b.get("effect"),
-                "disabled": b.get("disabled")
-            })
-        })
+        .map(|b| compact_named_card(b, &["name", "boss", "chips_required", "effect", "disabled"]))
         .unwrap_or(Value::Null);
-    let checks = full.get("decision_checks").cloned().unwrap_or(Value::Null);
-    let compact_checks = json!({
-        "ordering": {
-            "required_before_close_play": checks.pointer("/ordering/required_before_close_play"),
-            "joker_order": checks.pointer("/ordering/joker_order"),
-            "move_joker_actions": checks.pointer("/ordering/move_joker_actions")
-        },
-        "consumables": {
-            "required": checks.pointer("/consumables/required"),
-            "owned": checks.pointer("/consumables/owned"),
-            "use_action_ids": action_refs("/decision_checks/consumables/use_actions"),
-            "sell_action_ids": action_refs("/decision_checks/consumables/sell_actions"),
-            "instruction": checks.pointer("/consumables/instruction"),
-            "timing": checks.pointer("/consumables/timing")
-        },
-        "shop": {"required": checks.pointer("/shop/required")},
-        "slots": checks.get("slots").cloned().unwrap_or(Value::Null),
-        "boss_debuff": {
-            "required": checks.pointer("/boss_debuff/required"),
-            "current_blind": checks.pointer("/boss_debuff/current_blind"),
-            "debuffed_cards": checks.pointer("/boss_debuff/debuffed_cards"),
-            "debuffed_jokers": checks.pointer("/boss_debuff/debuffed_jokers"),
-            "reroll_action_ids": action_refs("/decision_checks/boss_debuff/reroll_actions")
-        }
-    });
+    let compact_score = full
+        .get("score_pressure")
+        .and_then(Value::as_object)
+        .map(|score| {
+            let mut compact = serde_json::Map::new();
+            for key in [
+                "blind_chips_required",
+                "current_chips",
+                "hands_left",
+                "chips_remaining",
+                "best_play_estimated_score",
+                "best_play_clears_blind",
+                "best_play_surplus",
+                "estimated_best_plays_needed",
+            ] {
+                if let Some(value) = score.get(key).filter(|value| !value.is_null()) {
+                    compact.insert(key.into(), value.clone());
+                }
+            }
+            Value::Object(compact)
+        })
+        .unwrap_or_else(|| json!({}));
     let compact_hand_analysis = full
         .pointer("/hand_analysis/best_play")
         .map(|best_play| {
@@ -364,7 +384,6 @@ pub fn compact_policy_state(full: &Value) -> Value {
                     "hand_name": best_play.get("hand_name"),
                     "card_indices": best_play.get("card_indices"),
                     "card_ids": best_play.get("card_ids"),
-                    "cards": best_play.get("cards"),
                     "scoring_card_indices": best_play.get("scoring_card_indices"),
                     "estimated_score": best_play.get("estimated_score"),
                     "score_kind": best_play.get("score_kind"),
@@ -374,21 +393,27 @@ pub fn compact_policy_state(full: &Value) -> Value {
         })
         .unwrap_or_else(|| json!({}));
     json!({
-        "schema": "balatro-mcp/policy-compact/v1",
+        "schema": "balatro-mcp/decision-fast/v1",
         "game": {"state": full.pointer("/game/state"), "ante": run.get("ante"), "round": run.get("round"), "dollars": run.get("dollars"), "hands_left": run.get("hands_left"), "discards_left": run.get("discards_left"), "blind": blind},
-        "score_pressure": full.get("score_pressure"),
+        "score_pressure": compact_score,
         "hand_analysis": compact_hand_analysis,
         "slots": full.get("slots"),
         "hand": cards("hand"), "jokers": cards("jokers"), "consumables": cards("consumables"),
         "legal_actions": compact_actions("/legal_actions"),
-        "active_directives": full.get("active_directives"),
-        "durable_recall": full.get("durable_recall"),
-        "decision_checks": compact_checks,
         "most_played_poker_hand": full.get("most_played_poker_hand"),
         "run_phase": full.get("run_phase"),
-        "decision_id": full.get("decision_id"), "observation_id": full.get("observation_id"),
-        "estimate_quality": full.get("estimate_quality")
+        "decision_id": full.get("decision_id"), "observation_id": full.get("observation_id")
     })
+}
+
+fn compact_named_card(card: &Value, keys: &[&str]) -> Value {
+    let mut compact = serde_json::Map::new();
+    for key in keys {
+        if let Some(value) = card.get(*key).filter(|value| !value.is_null()) {
+            compact.insert((*key).into(), value.clone());
+        }
+    }
+    Value::Object(compact)
 }
 
 fn estimate_best_play(observation: &Value) -> i64 {
@@ -1125,8 +1150,27 @@ mod tests {
             compact["decision_id"],
             full.get("decision_id").cloned().unwrap_or(Value::Null)
         );
-        assert!(compact["decision_checks"].get("ordering").is_some());
-        assert!(compact["decision_checks"].get("consumables").is_some());
+        let play = compact["legal_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|action| action["action_id"] == "play_selected")
+            .unwrap();
+        assert_eq!(play["selection"], "caller_supplied");
+        assert_eq!(play["card_index_base"], 1);
+        assert!(play.get("reason").is_none());
+        let use_consumable = compact["legal_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|action| action["action"] == "use_consumable")
+            .unwrap();
+        assert_eq!(use_consumable["card_index"], 1);
+        assert_eq!(use_consumable["target_index_base"], 1);
+        assert_eq!(compact["schema"], "balatro-mcp/decision-fast/v1");
+        assert!(compact.get("decision_checks").is_none());
+        assert!(compact.get("durable_recall").is_none());
+        assert!(compact.get("replay_context").is_none());
     }
 
     #[test]

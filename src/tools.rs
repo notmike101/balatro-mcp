@@ -34,6 +34,7 @@ const CANONICAL_PLAY_LIMIT: usize = 40;
 const CANONICAL_DISCARD_LIMIT: usize = 40;
 const CANONICAL_TARGET_LIMIT: usize = 60;
 const MAX_ACTION_PAGE: usize = 256;
+const MAX_FAST_DECISION_BYTES: usize = 8 * 1024;
 const POLICY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REPLAY_CONTEXT_BYTES: usize = 24 * 1024;
 const MAX_REPLAY_STEP_SUMMARIES: usize = 4;
@@ -361,6 +362,94 @@ fn compact_replay_context(
     bounded
 }
 
+fn truncate_context_array(value: &mut Value, key: &str, limit: usize) {
+    if let Some(items) = value.get_mut(key).and_then(Value::as_array_mut) {
+        items.truncate(limit);
+    }
+}
+
+fn compact_context_checks(full: &Value) -> Value {
+    let checks = full.get("decision_checks").cloned().unwrap_or(Value::Null);
+    let action_refs = |pointer: &str| {
+        full.pointer(pointer)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("action_id"))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    json!({
+        "ordering": {
+            "required_before_close_play": checks.pointer("/ordering/required_before_close_play"),
+            "joker_order": checks.pointer("/ordering/joker_order"),
+            "move_joker_actions": checks.pointer("/ordering/move_joker_actions")
+        },
+        "consumables": {
+            "required": checks.pointer("/consumables/required"),
+            "owned": checks.pointer("/consumables/owned"),
+            "use_action_ids": action_refs("/decision_checks/consumables/use_actions"),
+            "sell_action_ids": action_refs("/decision_checks/consumables/sell_actions"),
+            "timing": checks.pointer("/consumables/timing")
+        },
+        "shop": {"required": checks.pointer("/shop/required")},
+        "slots": checks.get("slots").cloned().unwrap_or(Value::Null),
+        "boss_debuff": {
+            "required": checks.pointer("/boss_debuff/required"),
+            "current_blind": checks.pointer("/boss_debuff/current_blind"),
+            "debuffed_cards": checks.pointer("/boss_debuff/debuffed_cards"),
+            "debuffed_jokers": checks.pointer("/boss_debuff/debuffed_jokers"),
+            "reroll_action_ids": action_refs("/decision_checks/boss_debuff/reroll_actions")
+        }
+    })
+}
+
+fn decision_context(full: &Value, section: &str, requested_limit: u32) -> Value {
+    let limit = requested_limit.clamp(1, 16) as usize;
+    let compact = compact_policy_state(full);
+    let context = match section {
+        "recall" => {
+            let mut recall = full
+                .get("durable_recall")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            truncate_context_array(&mut recall, "lessons", limit);
+            truncate_context_array(&mut recall, "strategy_evidence", limit);
+            json!({
+                "durable_recall": recall,
+                "active_directives": full.get("active_directives").cloned().unwrap_or_else(|| json!([]))
+            })
+        }
+        "replay" => {
+            let mut replay = full
+                .get("replay_context")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            truncate_context_array(&mut replay, "matching_replays", limit);
+            truncate_context_array(&mut replay, "prior_decisions", limit);
+            truncate_context_array(&mut replay, "reasoning_comparisons", limit);
+            json!({"replay_context": replay})
+        }
+        "checks" => json!({"decision_checks": compact_context_checks(full)}),
+        "scoring" => json!({
+            "score_analysis": full.get("score_analysis").cloned().unwrap_or(Value::Null),
+            "hand_analysis": compact.get("hand_analysis").cloned().unwrap_or_else(|| json!({}))
+        }),
+        "all" => full.clone(),
+        _ => json!({"error": "section must be recall, replay, checks, scoring, or all"}),
+    };
+    json!({
+        "schema": "balatro-mcp/decision-context/v1",
+        "decision_id": full.get("decision_id"),
+        "observation_id": full.get("observation_id"),
+        "section": section,
+        "context": context
+    })
+}
+
 fn canonical_json(value: &Value) -> String {
     match value {
         Value::Null => "null".into(),
@@ -455,6 +544,8 @@ fn page_legal_actions(
     requested_offset: u32,
     requested_limit: u32,
 ) {
+    let fast_schema =
+        data.get("schema").and_then(Value::as_str) == Some("balatro-mcp/decision-fast/v1");
     let Some(object) = data.as_object_mut() else {
         return;
     };
@@ -477,18 +568,42 @@ fn page_legal_actions(
         requested_limit as usize
     };
     let page_limit = requested_limit.min(MAX_ACTION_PAGE);
-    let end = offset.saturating_add(page_limit).min(total);
-    let page = filtered[offset..end].to_vec();
+    let mut end = offset.saturating_add(page_limit).min(total);
+    let set_page = |object: &mut serde_json::Map<String, Value>, end: usize| {
+        object.insert(
+            "legal_actions".into(),
+            Value::Array(filtered[offset..end].to_vec()),
+        );
+        object.insert("legal_actions_total".into(), json!(total));
+        object.insert("legal_actions_offset".into(), json!(offset));
+        object.insert(
+            "legal_actions_limit".into(),
+            json!(end.saturating_sub(offset)),
+        );
+        object.insert("legal_actions_truncated".into(), json!(end < total));
+        object.insert(
+            "legal_actions_next_offset".into(),
+            if end < total { json!(end) } else { Value::Null },
+        );
+    };
 
-    object.insert("legal_actions".into(), Value::Array(page));
-    object.insert("legal_actions_total".into(), json!(total));
-    object.insert("legal_actions_offset".into(), json!(offset));
-    object.insert("legal_actions_limit".into(), json!(page_limit));
-    object.insert("legal_actions_truncated".into(), json!(end < total));
-    object.insert(
-        "legal_actions_next_offset".into(),
-        if end < total { json!(end) } else { Value::Null },
-    );
+    set_page(object, end);
+    if fast_schema {
+        while end > offset {
+            let candidate = envelope(true, Value::Object(object.clone()), "", "");
+            if serde_json::to_vec(&candidate)
+                .map(|bytes| bytes.len() <= MAX_FAST_DECISION_BYTES)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            end -= 1;
+            set_page(object, end);
+        }
+    }
+
+    // Reapply the metadata after any byte-budget trimming.
+    set_page(object, end);
 }
 
 fn resolve_hand_selection_action(
@@ -734,7 +849,8 @@ impl Server {
             CANONICAL_DISCARD_LIMIT,
             CANONICAL_TARGET_LIMIT,
         );
-        let decision_id = canonical_policy_decision_id(&observation);
+        let decision_id =
+            semantic_decision_id_for_with_session(&state, bridge_session_id(&observation));
         let observation_id = observation_id_for(&observation);
         let score = serde_json::to_value(score_hand(&observation, None)).unwrap_or(Value::Null);
         let directives = self
@@ -774,6 +890,25 @@ impl Server {
         object.insert("score_analysis".into(), score.clone());
         object.insert("estimate_quality".into(), score["estimate_quality"].clone());
         Ok(state)
+    }
+
+    async fn fast_policy(&self, limit: u32) -> Result<Value, String> {
+        let observation = self.read_observation()?;
+        let mut state = build_policy_state(
+            &observation,
+            (limit as usize).min(CANONICAL_PLAY_LIMIT),
+            CANONICAL_DISCARD_LIMIT,
+            CANONICAL_TARGET_LIMIT,
+        );
+        let decision_id =
+            semantic_decision_id_for_with_session(&state, bridge_session_id(&observation));
+        let observation_id = observation_id_for(&observation);
+        let object = state
+            .as_object_mut()
+            .expect("policy state must be an object");
+        object.insert("decision_id".into(), json!(decision_id));
+        object.insert("observation_id".into(), json!(observation_id));
+        Ok(compact_policy_state(&state))
     }
 
     async fn replay_context(&self, state: &Value) -> Value {
@@ -839,9 +974,13 @@ impl Server {
     }
 
     async fn compact_policy(&self, limit: u32) -> Result<Value, String> {
-        Ok(compact_policy_state(
-            &self.policy_with_timeout(limit).await?,
-        ))
+        Ok(self.fast_policy_with_timeout(limit).await?)
+    }
+
+    async fn fast_policy_with_timeout(&self, limit: u32) -> Result<Value, String> {
+        tokio::time::timeout(POLICY_TIMEOUT, self.fast_policy(limit))
+            .await
+            .map_err(|_| "decision generation timed out".to_string())?
     }
 
     async fn policy_with_timeout(&self, limit: u32) -> Result<Value, String> {
@@ -1304,7 +1443,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Read compact targeted state. Use summary, hand, build, blind, or hand_values for normal play; all is verbose diagnostic state. This is read-only; call get_decision for actions."
+        description = "Read compact state by section. Use get_decision for the current action and all only for diagnostics."
     )]
     async fn observe(
         &self,
@@ -1338,7 +1477,33 @@ impl Server {
     }
 
     #[tool(
-        description = "Return current decision_id, compact legal actions, hand context, score pressure, and safety flags. detail=full opts into expanded analysis. Page with action_offset/action_limit until legal_actions_next_offset is null; refresh on stale_decision."
+        description = "Return bounded recall, replay, checks, scoring, or full decision context for deliberate analysis."
+    )]
+    async fn decision_context(
+        &self,
+        Parameters(params): Parameters<DecisionContextParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if !["recall", "replay", "checks", "scoring", "all"].contains(&params.section.as_str()) {
+            return to_tool_result(envelope(
+                false,
+                Value::Null,
+                "invalid_arguments",
+                "section must be recall, replay, checks, scoring, or all",
+            ));
+        }
+        match self.policy_with_timeout(CANONICAL_PLAY_LIMIT as u32).await {
+            Ok(data) => to_tool_result(envelope(
+                true,
+                decision_context(&data, &params.section, params.limit),
+                "",
+                "",
+            )),
+            Err(error) => to_tool_result(envelope(false, Value::Null, "context_failed", &error)),
+        }
+    }
+
+    #[tool(
+        description = "Return the small action-loop snapshot. Use decision_context for deeper analysis. Page actions and refresh stale decisions."
     )]
     async fn get_decision(
         &self,
@@ -1371,7 +1536,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Execute exactly one current legal action using action_id and a non-empty decision_id. Strategic actions require concise why_this_action rationale, with optional alternatives_considered, expected_outcome, and confidence (0..1); routine safe transitions do not. For play/discard, use the legal play_selected or discard_selected action with distinct 1-based card_indices and, when available, matching card_ids from the same current hand. If the live state changes and stale_decision is returned, refresh and retry with the returned ids."
+        description = "Execute one current legal action with its decision_id. Use 1-based card_indices or target_indices when required, then refresh after stale_decision or mutation_busy."
     )]
     async fn take_action(
         &self,
@@ -2467,7 +2632,7 @@ impl rmcp::ServerHandler for Server {
                 .with_description("Rust stdio boundary for safe Balatro gameplay."),
         )
         .with_instructions(
-            "Use only these MCP tools. Start with game_status, recover seed 2K9H9HN with start_new_run when needed, then get_decision. Before every strategic action inspect durable_recall, decision_checks, and replay_context; call lesson_list or strategy_state when recall reports more history or the choice is uncertain. State why_this_action is preferred, and include alternatives_considered or expected_outcome when useful; missing rationale is rejected. use_consumable actions are legal during active hand play and other non-terminal states. Execute only current legal actions with decision_id; refresh on stale_decision. Use target_indices for targeted consumables and exact 1-based card_indices for play_selected/discard_selected. When hand_analysis.best_play is used, card_indices is the complete evaluated selection; use its aligned card_ids and cards from the same decision, and do not confuse scoring_card_indices with the full selection. Review prior reasoning and query matching replays before every blind; log the clear/failure immediately after resolution, then record only novel evidence-backed lessons or strategy evidence. get_decision is compact by default; detail=full is available for analysis. Page actions until legal_actions_next_offset is null. observe summary/hand/build/blind are compact; all is diagnostic. In ROUND_EVAL use proceed_round, then next_round in SHOP. Shared-runtime mutations may return mutation_busy: wait and reread state instead of retrying an old action. A successful action with decision_record.stored=false has only a nonfatal audit warning.",
+            "Fast loop: game_status, then get_decision, then one take_action. Use the current decision_id and action_id; page actions and refresh after stale_decision or mutation_busy. Use 1-based card_indices and target_indices. Call decision_context(section=recall|replay|checks|scoring) only when deeper analysis is needed; detail=full is the legacy expanded path. Strategic actions need concise why_this_action; routine transitions do not. Never infer hidden cards. In ROUND_EVAL use proceed_round, then next_round in SHOP.",
         )
     }
     #[cfg_attr(coverage_nightly, coverage(off))]
@@ -3297,7 +3462,7 @@ mod tests {
         assert_eq!(stale["data"]["decision_id"], new_decision_id);
         assert!(stale["data"]["legal_actions"].is_array());
         assert!(stale["data"].get("replay_context").is_none());
-        assert!(serde_json::to_vec(&stale).unwrap().len() < 50_000);
+        assert!(serde_json::to_vec(&stale).unwrap().len() <= MAX_FAST_DECISION_BYTES);
     }
 
     #[tokio::test]
@@ -3368,14 +3533,52 @@ mod tests {
             .structured_content
             .unwrap();
         assert!(serde_json::to_vec(&full).unwrap().len() < 50_000);
-        assert!(serde_json::to_vec(&compact).unwrap().len() < 50_000);
+        assert!(serde_json::to_vec(&compact).unwrap().len() <= MAX_FAST_DECISION_BYTES);
         assert!(
             serde_json::to_vec(&full["data"]["replay_context"])
                 .unwrap()
                 .len()
                 <= MAX_REPLAY_CONTEXT_BYTES
         );
+        assert_eq!(compact["data"]["schema"], "balatro-mcp/decision-fast/v1");
         assert!(compact["data"].get("replay_context").is_none());
+        assert!(compact["data"].get("durable_recall").is_none());
+        assert!(compact["data"].get("decision_checks").is_none());
+    }
+
+    #[tokio::test]
+    async fn decision_context_sections_are_selectable_and_current() {
+        let (_dir, server) = server();
+        write_fixture(&server);
+        let decision = server
+            .get_decision(Parameters(DecisionParams {
+                action_type: String::new(),
+                limit: 40,
+                action_limit: 16,
+                action_offset: 0,
+                detail: "compact".into(),
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        let decision_id = decision["data"]["decision_id"].clone();
+
+        for section in ["recall", "replay", "checks", "scoring", "all"] {
+            let result = server
+                .decision_context(Parameters(DecisionContextParams {
+                    section: section.into(),
+                    limit: 4,
+                }))
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+            assert_eq!(result["data"]["schema"], "balatro-mcp/decision-context/v1");
+            assert_eq!(result["data"]["section"], section);
+            assert_eq!(result["data"]["decision_id"], decision_id);
+            assert!(result["data"]["context"].is_object());
+        }
     }
 
     #[tokio::test]
@@ -3415,7 +3618,7 @@ mod tests {
                 .iter()
                 .any(|action| action["action_id"] == "discard_selected")
         );
-        assert!(decision["data"]["schema"] == "balatro-mcp/policy-compact/v1");
+        assert!(decision["data"]["schema"] == "balatro-mcp/decision-fast/v1");
         assert!(decision.get("legal_actions").is_none());
         let full_decision = server
             .get_decision(Parameters(DecisionParams {

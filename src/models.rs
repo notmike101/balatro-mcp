@@ -61,10 +61,26 @@ pub fn decision_limit() -> u32 {
     40
 }
 pub fn decision_action_limit() -> u32 {
-    256
+    16
 }
 pub fn decision_detail() -> String {
     "compact".into()
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DecisionContextParams {
+    /// Select one bounded analysis section instead of loading all strategic context.
+    #[serde(default = "decision_context_section")]
+    pub section: String,
+    /// Maximum number of lessons, evidence items, replay rows, or prior decisions.
+    #[serde(default = "decision_context_limit")]
+    pub limit: u32,
+}
+pub fn decision_context_section() -> String {
+    "recall".into()
+}
+pub fn decision_context_limit() -> u32 {
+    4
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -439,7 +455,7 @@ mod tests {
         let params: DecisionParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.action_type, "");
         assert_eq!(params.limit, 40);
-        assert_eq!(params.action_limit, 256);
+        assert_eq!(params.action_limit, 16);
         assert_eq!(params.action_offset, 0);
         assert_eq!(params.detail, "compact");
     }
@@ -453,6 +469,13 @@ mod tests {
         assert_eq!(params.action_limit, 12);
         assert_eq!(params.action_offset, 24);
         assert_eq!(params.detail, "full");
+    }
+
+    #[test]
+    fn decision_context_params_defaults() {
+        let params: DecisionContextParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(params.section, "recall");
+        assert_eq!(params.limit, 4);
     }
 
     #[test]
