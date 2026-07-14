@@ -606,6 +606,16 @@ fn page_legal_actions(
     set_page(object, end);
 }
 
+/// Return the same bounded action-loop shape used by `get_decision` when a
+/// mutation must be retried from a fresh decision.  In particular, do not
+/// return every generated move action in an error payload: callers only need
+/// the first page and the continuation metadata to recover safely.
+fn stale_decision_snapshot(policy: &Value) -> Value {
+    let mut snapshot = compact_policy_state(policy);
+    page_legal_actions(&mut snapshot, "", 0, decision_action_limit());
+    snapshot
+}
+
 fn resolve_hand_selection_action(
     policy: &Value,
     template: &Value,
@@ -1574,7 +1584,7 @@ impl Server {
         if params.decision_id != current_decision_id {
             return to_tool_result(envelope(
                 false,
-                compact_policy_state(&current),
+                stale_decision_snapshot(&current),
                 "stale_decision",
                 "decision_id is stale because the live state changed; use the returned current decision_id and legal_actions, and do not retry the previous action",
             ));
@@ -3400,6 +3410,23 @@ mod tests {
     async fn pre_restart_decision_is_rejected_with_compact_current_decision() {
         let (_dir, server) = server();
         write_fixture(&server);
+        let mut observation: Value =
+            serde_json::from_slice(&std::fs::read(&server.ipc.observation_path).unwrap()).unwrap();
+        observation["areas"]["hand"] = json!([
+            {"instance_id":"a", "base": {"rank": "A", "suit": "H"}},
+            {"instance_id":"b", "base": {"rank": "K", "suit": "D"}},
+            {"instance_id":"c", "base": {"rank": "Q", "suit": "C"}},
+            {"instance_id":"d", "base": {"rank": "J", "suit": "S"}},
+            {"instance_id":"e", "base": {"rank": "10", "suit": "H"}},
+            {"instance_id":"f", "base": {"rank": "9", "suit": "D"}},
+            {"instance_id":"g", "base": {"rank": "8", "suit": "C"}},
+            {"instance_id":"h", "base": {"rank": "7", "suit": "S"}}
+        ]);
+        std::fs::write(
+            &server.ipc.observation_path,
+            serde_json::to_vec(&observation).unwrap(),
+        )
+        .unwrap();
         *server.process_override.lock().await = Some(vec![json!({
             "pid": 1234,
             "name": "Balatro.exe"
@@ -3461,6 +3488,11 @@ mod tests {
         assert_eq!(stale["error"]["code"], "stale_decision");
         assert_eq!(stale["data"]["decision_id"], new_decision_id);
         assert!(stale["data"]["legal_actions"].is_array());
+        assert_eq!(stale["data"]["legal_actions_offset"], 0);
+        assert_eq!(stale["data"]["legal_actions_limit"], 16);
+        assert_eq!(stale["data"]["legal_actions_total"], 58);
+        assert_eq!(stale["data"]["legal_actions_next_offset"], 16);
+        assert_eq!(stale["data"]["legal_actions_truncated"], true);
         assert!(stale["data"].get("replay_context").is_none());
         assert!(serde_json::to_vec(&stale).unwrap().len() <= MAX_FAST_DECISION_BYTES);
     }
