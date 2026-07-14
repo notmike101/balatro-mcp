@@ -206,14 +206,39 @@ pub fn classify_hand(cards: &[Value]) -> String {
 }
 
 fn hand_value(contract: &Value, hand: &str) -> Option<(i64, i64)> {
+    hand_value_exact(contract, hand).or_else(|| hand_value_exact(contract, "High Card"))
+}
+
+fn hand_value_exact(contract: &Value, hand: &str) -> Option<(i64, i64)> {
     let values = contract.get("values").unwrap_or(contract);
-    let entry = match values.get(hand) {
-        Some(entry) => entry,
-        None => values.get("High Card")?,
-    };
+    let entry = values.get(hand)?;
     let chips = entry.get("chips")?.as_i64()?;
     let mult = entry.get("mult")?.as_i64()?;
     Some((chips, mult))
+}
+
+pub(crate) fn has_hand_value(contract: &Value, hand: &str) -> bool {
+    hand_value_exact(contract, hand).is_some()
+}
+
+pub(crate) fn poker_hand_rank(hand: &str) -> usize {
+    [
+        "High Card",
+        "Pair",
+        "Two Pair",
+        "Three of a Kind",
+        "Straight",
+        "Flush",
+        "Full House",
+        "Four of a Kind",
+        "Straight Flush",
+        "Five of a Kind",
+        "Flush House",
+        "Flush Five",
+    ]
+    .iter()
+    .position(|name| *name == hand)
+    .unwrap_or(0)
 }
 
 fn add_modifier(result: &mut ScoreResult, card: &Value, index: usize) {
@@ -327,8 +352,10 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
         };
     }
     let hand_name = classify_hand(&cards);
+    let hand_name_for_quality = hand_name.clone();
     let scoring_positions = scoring_card_positions(&cards, &hand_name);
-    let base = hand_value(contract, &hand_name);
+    let named_base = hand_value_exact(contract, &hand_name);
+    let base = named_base.or_else(|| hand_value_exact(contract, "High Card"));
     let (base_chips, mut mult) = base.unwrap_or((5, 1));
     let mut result = ScoreResult {
         hand_key: hand_name.clone(),
@@ -464,12 +491,18 @@ pub fn score_hand(observation: &Value, card_indices: Option<&[usize]>) -> ScoreR
     result.chips = chips;
     result.mult = mult;
     result.estimated_score = ((chips as f64) * (mult as f64) * result.x_mult).round() as i64;
-    if base.is_some() && result.unsupported_effects.is_empty() {
+    if named_base.is_some() && result.unsupported_effects.is_empty() {
         result.exact_score = Some(result.estimated_score);
         result.estimate_quality = "exact_contract_plus_supported_modifiers".into();
-    } else if base.is_some() {
+    } else if named_base.is_some() {
         result.estimate_quality = "partial_contract".into();
+    } else if base.is_some() {
+        result.estimate_quality = "missing_hand_contract".into();
+        result.unsupported_effects.push(format!(
+            "missing poker_hands entry: {hand_name_for_quality}"
+        ));
     } else {
+        result.estimate_quality = "missing_contract".into();
         result
             .unsupported_effects
             .push("missing poker_hands contract".into());
@@ -502,23 +535,7 @@ fn collect_best_subset(
             .filter_map(|index| hand.get(*index).cloned())
             .collect();
         let hand_name = classify_hand(&cards);
-        let hand_rank = [
-            "High Card",
-            "Pair",
-            "Two Pair",
-            "Three of a Kind",
-            "Straight",
-            "Flush",
-            "Full House",
-            "Four of a Kind",
-            "Straight Flush",
-            "Five of a Kind",
-            "Flush House",
-            "Flush Five",
-        ]
-        .iter()
-        .position(|name| *name == hand_name)
-        .unwrap_or(0);
+        let hand_rank = poker_hand_rank(&hand_name);
         let base_score = hand_value(contract, &hand_name)
             .map(|(chips, mult)| chips.saturating_mul(mult))
             .unwrap_or(0);
@@ -791,6 +808,50 @@ mod tests {
     }
 
     #[test]
+    fn score_full_house_includes_both_groups() {
+        let observation = json!({
+            "areas": {"hand": [
+                card("10", "H"), card("J", "S"), card("J", "C"),
+                card("10", "D"), card("10", "S")
+            ]},
+            "poker_hands": {"values": {
+                "High Card": {"chips": 5, "mult": 1},
+                "Three of a Kind": {"chips": 30, "mult": 3},
+                "Full House": {"chips": 40, "mult": 4}
+            }}
+        });
+        let result = score_hand(&observation, None);
+        assert_eq!(result.hand_name, "Full House");
+        assert_eq!(result.scoring_cards, vec![1, 2, 3, 4, 5]);
+        assert_eq!(result.estimated_score, 360);
+        assert_eq!(result.exact_score, Some(360));
+    }
+
+    #[test]
+    fn missing_named_hand_contract_is_degraded_not_exact() {
+        let observation = json!({
+            "areas": {"hand": [
+                card("10", "H"), card("J", "S"), card("J", "C"),
+                card("10", "D"), card("10", "S")
+            ]},
+            "poker_hands": {"values": {
+                "High Card": {"chips": 5, "mult": 1},
+                "Three of a Kind": {"chips": 30, "mult": 3}
+            }}
+        });
+        let result = score_hand(&observation, None);
+        assert_eq!(result.hand_name, "Full House");
+        assert_eq!(result.estimate_quality, "missing_hand_contract");
+        assert_eq!(result.exact_score, None);
+        assert!(
+            result
+                .unsupported_effects
+                .iter()
+                .any(|effect| effect == "missing poker_hands entry: Full House")
+        );
+    }
+
+    #[test]
     fn score_full_live_hand_chooses_best_five_card_subset() {
         let observation = json!({
             "areas": {"hand": [
@@ -891,6 +952,7 @@ mod tests {
         let result = score_hand(&observation, None);
         assert_eq!(result.hand_name, "High Card");
         assert!(result.exact_score.is_none());
+        assert_eq!(result.estimate_quality, "missing_contract");
         assert!(
             result
                 .unsupported_effects

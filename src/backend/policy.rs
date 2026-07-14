@@ -589,6 +589,45 @@ fn analyze_hands(source: &Value) -> Value {
     })
 }
 
+#[derive(Clone)]
+struct BestPlayCandidate {
+    indices: Vec<usize>,
+    score: i64,
+    hand_rank: usize,
+    named_contract: bool,
+}
+
+fn best_play_candidate_is_better(
+    candidate: &BestPlayCandidate,
+    current: Option<&BestPlayCandidate>,
+) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+
+    if candidate.named_contract && current.named_contract {
+        if candidate.score != current.score {
+            return candidate.score > current.score;
+        }
+        if candidate.hand_rank != current.hand_rank {
+            return candidate.hand_rank > current.hand_rank;
+        }
+    } else {
+        if candidate.hand_rank != current.hand_rank {
+            return candidate.hand_rank > current.hand_rank;
+        }
+        if candidate.named_contract != current.named_contract {
+            return candidate.named_contract;
+        }
+        if candidate.score != current.score {
+            return candidate.score > current.score;
+        }
+    }
+
+    candidate.indices.len() > current.indices.len()
+        || (candidate.indices.len() == current.indices.len() && candidate.indices < current.indices)
+}
+
 fn best_play_subset(observation: &Value) -> (Vec<usize>, i64) {
     let hand_len = observation
         .pointer("/areas/hand")
@@ -596,12 +635,13 @@ fn best_play_subset(observation: &Value) -> (Vec<usize>, i64) {
         .map(Vec::len)
         .unwrap_or(0);
     let max_cards = hand_len.min(5);
-    let mut best = (Vec::new(), 0);
+    let mut best: Option<BestPlayCandidate> = None;
     for size in 1..=max_cards {
         let mut selected = Vec::with_capacity(size);
         collect_best_play(observation, size, 0, &mut selected, &mut best);
     }
-    best
+    best.map(|candidate| (candidate.indices, candidate.score))
+        .unwrap_or_default()
 }
 
 fn collect_best_play(
@@ -609,7 +649,7 @@ fn collect_best_play(
     target_size: usize,
     start: usize,
     selected: &mut Vec<usize>,
-    best: &mut (Vec<usize>, i64),
+    best: &mut Option<BestPlayCandidate>,
 ) {
     let hand_len = observation
         .pointer("/areas/hand")
@@ -617,10 +657,16 @@ fn collect_best_play(
         .map(Vec::len)
         .unwrap_or(0);
     if selected.len() == target_size {
-        let score = score_hand(observation, Some(selected)).estimated_score;
-        if score > best.1 || (score == best.1 && selected.len() > best.0.len()) {
-            best.0 = selected.clone();
-            best.1 = score;
+        let score_result = score_hand(observation, Some(selected));
+        let contract = observation.get("poker_hands").unwrap_or(&Value::Null);
+        let candidate = BestPlayCandidate {
+            indices: selected.clone(),
+            score: score_result.estimated_score,
+            hand_rank: scoring::poker_hand_rank(&score_result.hand_name),
+            named_contract: scoring::has_hand_value(contract, &score_result.hand_name),
+        };
+        if best_play_candidate_is_better(&candidate, best.as_ref()) {
+            *best = Some(candidate);
         }
         return;
     }
@@ -1644,6 +1690,57 @@ mod tests {
             })),
             120
         );
+
+        let full_house_observation = json!({
+            "game": {"state": "SELECTING_HAND"},
+            "run": {"hands_left": 2, "discards_left": 1, "blind": {"chips_required": 300}},
+            "areas": {"hand": [
+                {"instance_id":"a", "base":{"rank":"10", "suit":"Hearts"}},
+                {"instance_id":"b", "base":{"rank":"J", "suit":"Spades"}},
+                {"instance_id":"c", "base":{"rank":"J", "suit":"Clubs"}},
+                {"instance_id":"d", "base":{"rank":"10", "suit":"Diamonds"}},
+                {"instance_id":"e", "base":{"rank":"10", "suit":"Spades"}}
+            ]},
+            "poker_hands": {"values": {
+                "High Card": {"chips": 5, "mult": 1},
+                "Three of a Kind": {"chips": 30, "mult": 3},
+                "Full House": {"chips": 40, "mult": 4}
+            }}
+        });
+        let full_house_state = build_policy_state(&full_house_observation, 40, 40, 60);
+        let full_house_best = &full_house_state["hand_analysis"]["best_play"];
+        assert_eq!(full_house_best["hand_name"], "Full House");
+        assert_eq!(full_house_best["card_indices"], json!([1, 2, 3, 4, 5]));
+        assert_eq!(
+            full_house_best["scoring_card_indices"],
+            json!([1, 2, 3, 4, 5])
+        );
+
+        let mut missing_full_house = full_house_observation.clone();
+        missing_full_house["poker_hands"]["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("Full House");
+        let missing_state = build_policy_state(&missing_full_house, 40, 40, 60);
+        let missing_best = &missing_state["hand_analysis"]["best_play"];
+        assert_eq!(missing_best["hand_name"], "Full House");
+        assert_eq!(missing_best["card_indices"], json!([1, 2, 3, 4, 5]));
+        assert_eq!(missing_best["estimate_quality"], "missing_hand_contract");
+
+        assert!(best_play_candidate_is_better(
+            &BestPlayCandidate {
+                indices: vec![0, 1, 2],
+                score: 500,
+                hand_rank: scoring::poker_hand_rank("Three of a Kind"),
+                named_contract: true,
+            },
+            Some(&BestPlayCandidate {
+                indices: vec![0, 1, 2, 3, 4],
+                score: 400,
+                hand_rank: scoring::poker_hand_rank("Full House"),
+                named_contract: true,
+            })
+        ));
         assert_eq!(analyze_hands(&json!({"areas":{"hand":[]}})), json!({}));
         assert!(
             analyze_hands(&json!({
