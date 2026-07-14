@@ -42,7 +42,7 @@ There are no Python, Node.js, or JavaScript subprocesses. Runtime files and the 
 - `observe` is read-only state and `wait_for_state` only confirms state; neither returns actionable legal actions or a decision ID. Call `get_decision` afterward. In `GAME_OVER`, `from_game_over` is a `ui_click`; `return_to_menu` is also a valid `safe_transition`.
 - If `stale_decision` is returned, refresh from the returned decision payload and retry with its current `decision_id`. `ROUND_EVAL` uses `proceed_round`; `SHOP` uses `next_round`. `score_hand` inputs and `score_analysis.scoring_cards` use 1-based hand positions.
 - `event_history` contains explicit Rust-owned checkpoints, newest first; call `run_state` with `kind=checkpoint` before reading it when current live state is needed. `hand_values` returns the live poker-hand contract.
-- `get_decision` includes a compact `durable_recall` summary. Review it before strategic actions; use `lesson_list` for paginated durable lessons and `strategy_state` for rules plus recorded evidence when the summary is incomplete or the choice is uncertain.
+- `get_decision` is a small action-loop snapshot. Use `decision_context(section=recall|replay|checks|scoring)` for deliberate strategic context, `lesson_list` for paginated durable lessons, and `strategy_state` for rules plus recorded evidence.
 - Treat `exact_score` and `estimated_score` separately; unsupported effects must remain visible in `unsupported_effects`.
 - Strategy, lessons, estimation feedback, current-run state, and event history are Rust-owned MCP capabilities backed by `agent/rust_state.db`.
 - Preserve hidden-card sanitization and never expose arbitrary filesystem contents.

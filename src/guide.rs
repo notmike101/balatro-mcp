@@ -12,28 +12,28 @@ pub const GUIDE_TOPICS: &[&str] = &[
 pub fn guide(topic: &str) -> Option<&'static str> {
     match topic.to_ascii_lowercase().as_str() {
         "core" | "rules" | "ante8" => Some(
-            "Clear blinds through Ante 8. Start with game_status, then get_decision and execute one legal action with its decision_id. Before strategic actions inspect durable_recall; use lesson_list or strategy_state when needed. Provide why_this_action and compare prior reasoning with results. use_consumable works during active play. Refresh on stale_decision; use exact 1-based card_indices and current card_ids. In ROUND_EVAL use proceed_round, then next_round in SHOP. Never infer face-down cards.",
+            "Clear blinds through Ante 8. Use game_status -> get_decision -> take_action. The default decision is compact; call decision_context for recall or strategy only when needed. Provide why_this_action for strategic actions, use exact 1-based indices, refresh on stale_decision, and never infer hidden cards.",
         ),
         "hands" | "scoring" => Some(
-            "Poker hands score Chips multiplied by Mult. Planet consumables level a named hand. Use the hand_values tool for the live poker-hand contract; controller scores are estimates unless explicitly exact. score_hand card_indices and score_analysis.scoring_cards use 1-based hand positions, matching play/discard actions. In hand_analysis.best_play, card_indices is the complete evaluated selection; scoring_card_indices is only the subset contributing rank scoring. Use the aligned card_ids and cards from that same decision, and never shift indices or replace a missing card. Select only the cards needed for the intended hand; play_selected and discard_selected accept any distinct valid positions up to the live play limit. Omitted score_hand indices use the live highlight or best five-card subset. score_analysis.hand_key describes the cards scored for that call, score_analysis.score_scope identifies current-hand versus selected-card scope, and score_analysis.run_chips plus score_analysis.blind_chips_remaining expose cumulative run progress. If a hand card is hidden or has incomplete identity, the hand and score are unknown; never infer them from nominal values, suits, positions, or prior observations. run_info.cards_played is cumulative by rank across the run; run_info.round_scores.cards_played.amt is the current round's count.",
+            "Poker hands score Chips multiplied by Mult. Use hand_values for the live contract and score_hand for explicit scoring. play_selected/discard_selected and score_hand use 1-based hand positions; select only the cards needed. Hidden or incomplete card identity means the hand and score are unknown.",
         ),
         "actions" | "discards" => Some(
-            "Hands score; discards redraw without scoring. Check discard_status.remaining, discard_status.used, and discard_status.configured_limit; current_limit is the configured capacity after recorded discard actions and does not include transient bridge lag. ROUND_EVAL exposes proceed_round, and SHOP exposes next_round. Use run_state(kind=checkpoint) to record a current observation before reading event_history; event_history is newest explicit checkpoint first. Consider all legal discard sizes and a specific draw goal. Use only legal actions.",
+            "Hands score; discards redraw. Check discard_status before discarding, choose a specific draw goal, and use only legal actions. ROUND_EVAL uses proceed_round; SHOP uses next_round.",
         ),
         "economy" | "shops" => Some(
             "Evaluate Joker slots, consumable slots, price, interest, and the next blind. Buy one item at a time, then reread decision state.",
         ),
         "blinds" | "bosses" | "debuffs" => Some(
-            "Boss blinds impose special rules and debuffs. Before selecting or playing one, inspect strategy.decision_checks.boss_debuff, lookup_rule details, debuffed cards/Jokers, score margin, and legal boss-reroll actions.",
+            "Boss blinds impose special rules and debuffs. When one matters, call decision_context(section=checks), lookup_rule, and inspect the live score margin before acting.",
         ),
         "jokers" | "editions" => Some(
-            "Jokers affect Chips, Mult, economy, and rules. Foil adds Chips, Holographic adds Mult, Polychrome adds X Mult, Negative adds a Joker slot. Stickers are separate constraints. Review decision_checks.ordering and legal move_joker actions when trigger order can matter.",
+            "Jokers affect Chips, Mult, economy, and trigger order. Foil, Holographic, and Polychrome editions change scoring. Call decision_context(section=checks) when ordering matters.",
         ),
         "cards" | "enhancements" | "seals" => Some(
             "Playing cards may have one enhancement, edition, and seal. Face-down or incompletely populated card identity is always unknown; use only explicit rank/value data from a fresh observation and never infer identity from nominal values, suits, positions, instance ids, or prior observations.",
         ),
         "consumables" | "vouchers" | "stakes" | "decks" | "tags" | "progression" => Some(
-            "Decks, Stakes, Vouchers, Tags, and consumables change run rules and resources. Evaluate every owned consumable before every strategic action, including play and discard decisions during active hands; use or deliberately defer it only after checking its effect, target availability, score pressure, and upcoming blind. Look up unfamiliar effects before acting.",
+            "Decks, Stakes, Vouchers, Tags, and consumables change run rules. Check owned consumables when a strategic choice is uncertain, verify targets and score pressure, and look up unfamiliar effects before acting.",
         ),
         _ => None,
     }
