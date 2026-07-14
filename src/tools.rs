@@ -1546,7 +1546,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Execute one current legal action with its decision_id. Use 1-based card_indices or target_indices when required, then refresh after stale_decision or mutation_busy."
+        description = "Execute one current legal action with its decision_id. Use 1-based card_indices or target_indices when required. After stale_decision or mutation_busy, discard the attempted action and call get_decision before choosing again."
     )]
     async fn take_action(
         &self,
@@ -1586,7 +1586,7 @@ impl Server {
                 false,
                 stale_decision_snapshot(&current),
                 "stale_decision",
-                "decision_id is stale because the live state changed; use the returned current decision_id and legal_actions, and do not retry the previous action",
+                "decision_id is stale because the live state changed; discard the attempted action, call get_decision for a fresh decision, and do not retry the previous action from this response",
             ));
         }
         let settle = params.settle_timeout.clamp(1.0, 30.0);
@@ -2642,7 +2642,7 @@ impl rmcp::ServerHandler for Server {
                 .with_description("Rust stdio boundary for safe Balatro gameplay."),
         )
         .with_instructions(
-            "Fast loop: game_status, then get_decision, then one take_action. Use the current decision_id and action_id; page actions and refresh after stale_decision or mutation_busy. Use 1-based card_indices and target_indices. Call decision_context(section=recall|replay|checks|scoring) only when deeper analysis is needed; detail=full is the legacy expanded path. Strategic actions need concise why_this_action; routine transitions do not. Never infer hidden cards. In ROUND_EVAL use proceed_round, then next_round in SHOP.",
+            "Fast loop: game_status, then get_decision, then one take_action. Use the current decision_id and action_id; SHOP buy/reroll actions carry visible names and costs. After stale_decision or mutation_busy, discard the attempted action and call get_decision before choosing again. Use 1-based card_indices and target_indices. Call decision_context(section=recall|replay|checks|scoring) only when deeper analysis is needed; detail=full is the legacy expanded path. Strategic actions need concise why_this_action; routine transitions do not. Never infer hidden cards. In ROUND_EVAL use proceed_round, then next_round in SHOP.",
         )
     }
     #[cfg_attr(coverage_nightly, coverage(off))]
