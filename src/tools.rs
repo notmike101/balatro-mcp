@@ -3019,6 +3019,32 @@ mod tests {
                 "missing registered tool {expected}"
             );
         }
+
+        let tool_schemas: std::collections::HashMap<_, _> = Server::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| {
+                let schema = serde_json::to_value(tool.input_schema.as_ref()).unwrap();
+                (tool.name.into_owned(), schema)
+            })
+            .collect();
+        let take_action_schema = &tool_schemas["take_action"];
+        assert_eq!(
+            take_action_schema["properties"]["card_ids"]["type"],
+            "array"
+        );
+        assert_eq!(
+            take_action_schema["properties"]["card_ids"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(
+            tool_schemas["strategy_add_rule"]["properties"]["conditions"]["type"],
+            "object"
+        );
+        assert_eq!(
+            tool_schemas["estimation_record"]["properties"]["context"]["type"],
+            "object"
+        );
     }
 
     #[tokio::test]
