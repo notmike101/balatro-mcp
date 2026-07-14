@@ -754,6 +754,22 @@ impl Server {
             "active_directives".into(),
             active_directives(&directives, &observation),
         );
+        let durable_recall = self
+            .state_db
+            .lock()
+            .await
+            .compact_recall(6)
+            .unwrap_or_else(|error| {
+                json!({
+                    "lessons": [],
+                    "lessons_has_more": false,
+                    "strategy_evidence": [],
+                    "strategy_evidence_has_more": false,
+                    "error": error,
+                    "instruction": "Durable recall could not be read; use an explicit strategy decision and record the outcome after resolution.",
+                })
+            });
+        object.insert("durable_recall".into(), durable_recall);
         object.insert("replay_context".into(), replay_context);
         object.insert("score_analysis".into(), score.clone());
         object.insert("estimate_quality".into(), score["estimate_quality"].clone());
@@ -2228,11 +2244,31 @@ impl Server {
         }
     }
 
-    #[tool(description = "Read Rust-owned strategy rules and directives.")]
+    #[tool(description = "Read Rust-owned strategy rules, directives, and recorded evidence.")]
     async fn strategy_state(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         match self.state_db.lock().await.strategy() {
             Ok(data) => to_tool_result(envelope(true, data, "", "")),
             Err(error) => to_tool_result(envelope(false, Value::Null, "strategy_failed", &error)),
+        }
+    }
+
+    #[tool(
+        description = "Read Rust-owned durable lessons. Use before recording a new lesson to avoid duplicating prior learning; paginate with offset when has_more is true."
+    )]
+    async fn lesson_list(
+        &self,
+        Parameters(params): Parameters<LessonQueryParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        match self
+            .state_db
+            .lock()
+            .await
+            .lessons(&params.category, params.limit, params.offset)
+        {
+            Ok(data) => to_tool_result(envelope(true, data, "", "")),
+            Err(error) => {
+                to_tool_result(envelope(false, Value::Null, "lesson_list_failed", &error))
+            }
         }
     }
 
@@ -2431,7 +2467,7 @@ impl rmcp::ServerHandler for Server {
                 .with_description("Rust stdio boundary for safe Balatro gameplay."),
         )
         .with_instructions(
-            "Use only these MCP tools. Start with game_status, recover seed 2K9H9HN with start_new_run when needed, then get_decision. Before every strategic action inspect decision_checks and replay_context, state why_this_action is preferred, and include alternatives_considered or expected_outcome when useful; missing rationale is rejected. use_consumable actions are legal during active hand play and other non-terminal states. Execute only current legal actions with decision_id; refresh on stale_decision. Use target_indices for targeted consumables and exact 1-based card_indices for play_selected/discard_selected. When hand_analysis.best_play is used, card_indices is the complete evaluated selection; use its aligned card_ids and cards from the same decision, and do not confuse scoring_card_indices with the full selection. Review prior reasoning before every blind; log the clear/failure immediately after resolution, then record durable lessons or strategy evidence when justified. get_decision is compact by default; detail=full is available for analysis. Page actions until legal_actions_next_offset is null. observe summary/hand/build/blind are compact; all is diagnostic. In ROUND_EVAL use proceed_round, then next_round in SHOP. Shared-runtime mutations may return mutation_busy: wait and reread state instead of retrying an old action. A successful action with decision_record.stored=false has only a nonfatal audit warning.",
+            "Use only these MCP tools. Start with game_status, recover seed 2K9H9HN with start_new_run when needed, then get_decision. Before every strategic action inspect durable_recall, decision_checks, and replay_context; call lesson_list or strategy_state when recall reports more history or the choice is uncertain. State why_this_action is preferred, and include alternatives_considered or expected_outcome when useful; missing rationale is rejected. use_consumable actions are legal during active hand play and other non-terminal states. Execute only current legal actions with decision_id; refresh on stale_decision. Use target_indices for targeted consumables and exact 1-based card_indices for play_selected/discard_selected. When hand_analysis.best_play is used, card_indices is the complete evaluated selection; use its aligned card_ids and cards from the same decision, and do not confuse scoring_card_indices with the full selection. Review prior reasoning and query matching replays before every blind; log the clear/failure immediately after resolution, then record only novel evidence-backed lessons or strategy evidence. get_decision is compact by default; detail=full is available for analysis. Page actions until legal_actions_next_offset is null. observe summary/hand/build/blind are compact; all is diagnostic. In ROUND_EVAL use proceed_round, then next_round in SHOP. Shared-runtime mutations may return mutation_busy: wait and reread state instead of retrying an old action. A successful action with decision_record.stored=false has only a nonfatal audit warning.",
         )
     }
     #[cfg_attr(coverage_nightly, coverage(off))]
@@ -2970,6 +3006,7 @@ mod tests {
             "strategy_state",
             "strategy_add_rule",
             "strategy_record_evidence",
+            "lesson_list",
             "lesson_add",
             "estimation_record",
             "estimation_report",
@@ -2982,6 +3019,32 @@ mod tests {
                 "missing registered tool {expected}"
             );
         }
+
+        let tool_schemas: std::collections::HashMap<_, _> = Server::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| {
+                let schema = serde_json::to_value(tool.input_schema.as_ref()).unwrap();
+                (tool.name.into_owned(), schema)
+            })
+            .collect();
+        let take_action_schema = &tool_schemas["take_action"];
+        assert_eq!(
+            take_action_schema["properties"]["card_ids"]["type"],
+            "array"
+        );
+        assert_eq!(
+            take_action_schema["properties"]["card_ids"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(
+            tool_schemas["strategy_add_rule"]["properties"]["conditions"]["type"],
+            "object"
+        );
+        assert_eq!(
+            tool_schemas["estimation_record"]["properties"]["context"]["type"],
+            "object"
+        );
     }
 
     #[tokio::test]
@@ -3039,6 +3102,18 @@ mod tests {
                 .await
                 .is_ok()
         );
+        let lessons = server
+            .lesson_list(Parameters(LessonQueryParams {
+                category: "test".into(),
+                limit: 20,
+                offset: 0,
+            }))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(lessons["ok"], true);
+        assert_eq!(lessons["data"]["lessons"][0]["lesson"], "lesson");
         assert!(
             server
                 .estimation_record(Parameters(EstimateParams {
@@ -3052,6 +3127,9 @@ mod tests {
         );
         assert!(server.estimation_report().await.is_ok());
         write_fixture(&server);
+        let decision = server.policy(1).await.unwrap();
+        assert!(decision["durable_recall"]["lessons"].is_array());
+        assert!(decision["durable_recall"]["strategy_evidence"].is_array());
         assert!(
             server
                 .run_state(Parameters(StateParams {

@@ -13,6 +13,8 @@ pub const MAX_DECISION_SNAPSHOT_BYTES: usize = 64 * 1024;
 
 type EventRow = (i64, String, Value, String);
 type StrategyRow = (String, String, Value, String, bool, bool);
+type EvidenceRow = (i64, String, String, String, String, String);
+type LessonRow = (i64, String, String, String, f64, String);
 type EstimateReportRow = (i64, f64);
 
 fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
@@ -32,6 +34,28 @@ fn read_strategy_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StrategyRow> {
         row.get(3)?,
         row.get::<_, i64>(4)? != 0,
         row.get::<_, i64>(5)? != 0,
+    ))
+}
+
+fn read_evidence_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
+fn read_lesson_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LessonRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
     ))
 }
 
@@ -275,12 +299,109 @@ impl StateDB {
         let mut stmt = state_sql(conn.prepare("SELECT id,kind,conditions,directive,absolute,active FROM strategy_rules ORDER BY id"), "prepare strategy")?;
         let rules = stmt
             .query_map([], read_strategy_row)
-            .expect("strategy query has no bind parameters");
-        Ok(json!({"rules": rules.filter_map(|row| {
-            row.ok().map(|(id, kind, conditions, directive, absolute, active)| {
+            .map_err(|error| format!("query strategy rules: {error}"))?;
+        let rules = rules
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read strategy rules: {error}"))?
+            .into_iter()
+            .map(|(id, kind, conditions, directive, absolute, active)| {
                 json!({"id": id, "kind": kind, "conditions": conditions, "directive": directive, "absolute": absolute, "active": active})
             })
-        }).collect::<Vec<_>>() }))
+            .collect::<Vec<_>>();
+        let evidence = self.strategy_evidence(500, 0)?;
+        Ok(
+            json!({"rules": rules, "evidence": evidence["evidence"], "evidence_has_more": evidence["has_more"]}),
+        )
+    }
+
+    fn strategy_evidence(&self, limit: u32, offset: u32) -> Result<Value, String> {
+        let conn = self.connection()?;
+        let mut stmt = state_sql(
+            conn.prepare(
+                "SELECT id,rule_id,outcome,event_id,note,created_at FROM strategy_evidence ORDER BY id DESC LIMIT ? OFFSET ?",
+            ),
+            "prepare strategy evidence",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![i64::from(limit.clamp(1, 500)) + 1, offset],
+                read_evidence_row,
+            )
+            .map_err(|error| format!("query strategy evidence: {error}"))?;
+        let mut rows = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read strategy evidence: {error}"))?;
+        let page_size = limit.clamp(1, 500) as usize;
+        let has_more = rows.len() > page_size;
+        rows.truncate(page_size);
+        let evidence = rows
+            .into_iter()
+            .map(|(id, rule_id, outcome, event_id, note, created_at)| {
+                json!({
+                    "id": id,
+                    "rule_id": rule_id,
+                    "outcome": outcome,
+                    "event_id": event_id,
+                    "note": note,
+                    "created_at": created_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({"evidence": evidence, "has_more": has_more}))
+    }
+
+    pub fn lessons(&self, category: &str, limit: u32, offset: u32) -> Result<Value, String> {
+        let conn = self.connection()?;
+        let page_size = limit.clamp(1, 500);
+        let mut stmt = state_sql(
+            conn.prepare(
+                "SELECT id,category,lesson,source,confidence,created_at FROM lessons WHERE (? = '' OR category = ?) ORDER BY id DESC LIMIT ? OFFSET ?",
+            ),
+            "prepare lessons",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![category, category, i64::from(page_size) + 1, offset],
+                read_lesson_row,
+            )
+            .map_err(|error| format!("query lessons: {error}"))?;
+        let mut rows = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read lessons: {error}"))?;
+        let has_more = rows.len() > page_size as usize;
+        rows.truncate(page_size as usize);
+        let lessons = rows
+            .into_iter()
+            .map(|(id, category, lesson, source, confidence, created_at)| {
+                json!({
+                    "id": id,
+                    "category": category,
+                    "lesson": lesson,
+                    "source": source,
+                    "confidence": confidence,
+                    "created_at": created_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        let next_offset = has_more.then_some(offset.saturating_add(page_size));
+        Ok(json!({
+            "lessons": lessons,
+            "offset": offset,
+            "next_offset": next_offset,
+            "has_more": has_more,
+        }))
+    }
+
+    pub fn compact_recall(&self, limit: u32) -> Result<Value, String> {
+        let lessons = self.lessons("", limit, 0)?;
+        let evidence = self.strategy_evidence(limit, 0)?;
+        Ok(json!({
+            "lessons": lessons["lessons"],
+            "lessons_has_more": lessons["has_more"],
+            "strategy_evidence": evidence["evidence"],
+            "strategy_evidence_has_more": evidence["has_more"],
+            "instruction": "Review these durable lessons and evidence before repeating a strategic choice; use lesson_list or strategy_state for deeper history.",
+        }))
     }
 
     pub fn record_evidence(
@@ -396,8 +517,20 @@ mod tests {
             .unwrap();
         assert_eq!(db.strategy().unwrap()["rules"].as_array().unwrap().len(), 1);
         db.record_evidence("r1", "success", "e1", "worked").unwrap();
+        let strategy = db.strategy().unwrap();
+        assert_eq!(strategy["evidence"].as_array().unwrap().len(), 1);
         db.add_lesson("scoring", "check hand values", "test", 0.8)
             .unwrap();
+        let lessons = db.lessons("scoring", 1, 0).unwrap();
+        assert_eq!(lessons["lessons"][0]["lesson"], "check hand values");
+        assert_eq!(lessons["has_more"], false);
+        assert_eq!(
+            db.compact_recall(6).unwrap()["lessons"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         db.record_estimate("Pair", 100, 120, &json!({})).unwrap();
         assert_eq!(db.estimation_report().unwrap()["count"], 1);
     }

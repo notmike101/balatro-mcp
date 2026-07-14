@@ -308,6 +308,20 @@ pub fn default_confidence() -> f64 {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct LessonQueryParams {
+    #[serde(default)]
+    pub category: String,
+    #[serde(default = "default_lesson_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub offset: u32,
+}
+
+pub fn default_lesson_limit() -> u32 {
+    20
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct EstimateParams {
     pub hand_type: String,
     pub estimated: i64,

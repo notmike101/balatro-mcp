@@ -382,6 +382,7 @@ pub fn compact_policy_state(full: &Value) -> Value {
         "hand": cards("hand"), "jokers": cards("jokers"), "consumables": cards("consumables"),
         "legal_actions": compact_actions("/legal_actions"),
         "active_directives": full.get("active_directives"),
+        "durable_recall": full.get("durable_recall"),
         "decision_checks": compact_checks,
         "most_played_poker_hand": full.get("most_played_poker_hand"),
         "run_phase": full.get("run_phase"),
