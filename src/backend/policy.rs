@@ -329,6 +329,7 @@ pub fn compact_policy_state(full: &Value) -> Value {
             "target_index_base",
             "area",
             "card_id",
+            "cost",
             "ui_id",
             "blind",
             "name",
@@ -874,13 +875,13 @@ fn generate_legal_actions(
                         .unwrap_or(&EMPTY_VEC);
                     for (i, c) in cards.iter().enumerate() {
                         if let Some(name) = c.get("name").and_then(|n| n.as_str()) {
-                            actions.push(json!({ "action_id": format!("buy_{}_{}", area, i), "action": "buy_card", "area": area, "card_index": i + 1, "card_id": card_id_value(c), "reason": format!("buy {} (slot available)", name) }));
+                            actions.push(json!({ "action_id": format!("buy_{}_{}", area, i), "action": "buy_card", "area": area, "card_index": i + 1, "card_id": card_id_value(c), "name": name, "cost": c.get("cost"), "reason": format!("buy {} (slot available)", name) }));
                         }
                     }
                 }
             }
             if run.get("reroll_cost").and_then(Value::as_i64).unwrap_or(0) > 0 {
-                actions.push(json!({"action_id":"reroll_shop","action":"reroll","reason":"reroll shop only when economy and score pressure justify it"}));
+                actions.push(json!({"action_id":"reroll_shop","action":"reroll","cost":run.get("reroll_cost"),"reason":"reroll shop only when economy and score pressure justify it"}));
             }
             actions.push(json!({"action_id":"next_round","action":"next_round","reason":"leave the shop and continue to the next blind"}));
         }
@@ -1171,6 +1172,40 @@ mod tests {
         assert!(compact.get("decision_checks").is_none());
         assert!(compact.get("durable_recall").is_none());
         assert!(compact.get("replay_context").is_none());
+    }
+
+    #[test]
+    fn compact_shop_actions_keep_visible_names_and_authoritative_costs() {
+        let mut source = observation("SHOP");
+        source["run"]["joker_slots"] = json!(5);
+        source["run"]["consumable_slots"] = json!(2);
+        source["run"]["reroll_cost"] = json!(3);
+        source["areas"]["shop_jokers"] = json!([{"instance_id": 101, "name": "Joker", "cost": 4}]);
+        source["areas"]["shop_vouchers"] =
+            json!([{"instance_id": 102, "name": "Voucher", "cost": 10}]);
+        source["areas"]["shop_booster"] = json!([{"instance_id": 103, "name": "Booster"}]);
+        source["areas"]["shop"] = json!([{"instance_id": 104, "name": "Tarot", "cost": 3}]);
+
+        let compact = compact_policy_state(&build_policy_state(&source, 40, 40, 60));
+        let actions = compact["legal_actions"].as_array().unwrap();
+        let action = |id: &str| {
+            actions
+                .iter()
+                .find(|action| action["action_id"] == id)
+                .unwrap()
+        };
+
+        assert_eq!(action("buy_shop_jokers_0")["name"], "Joker");
+        assert_eq!(action("buy_shop_jokers_0")["cost"], 4);
+        assert_eq!(action("buy_shop_jokers_0")["card_id"], 101);
+        assert_eq!(action("buy_shop_jokers_0")["card_index"], 1);
+        assert_eq!(action("buy_shop_vouchers_0")["name"], "Voucher");
+        assert_eq!(action("buy_shop_vouchers_0")["cost"], 10);
+        assert_eq!(action("buy_shop_booster_0")["name"], "Booster");
+        assert!(action("buy_shop_booster_0").get("cost").is_none());
+        assert_eq!(action("buy_consumeables_0")["name"], "Tarot");
+        assert_eq!(action("buy_consumeables_0")["cost"], 3);
+        assert_eq!(action("reroll_shop")["cost"], 3);
     }
 
     #[test]
